@@ -98,6 +98,13 @@ class Harness:
         # Last observed grip offset, used to detect the payload creeping out of
         # the pads (see the slip-trend block in run_episode).
         self._prev_gap: float | None = None
+        # Set when a `set_gripper close` actually closed ON something, cleared
+        # by `open`. MEASURED (P0a): without this flag the slip/"dropped"
+        # checks fire on pure proximity -- the gripper parked 5.5 cm above the
+        # untouched can was reported as "快滑脱" 7 times and "物体掉了" 5 times
+        # in one 60-turn run, and the model then hunted for a can that had never
+        # moved. A grasp is a fact about the GRIPPER, not about a distance.
+        self._grasped = False
 
     # -------------------------------------------------------------- episode
     def run_episode(
@@ -250,6 +257,17 @@ class Harness:
                         break
                     continue
 
+                # Track whether the pads actually closed on something. Only
+                # `close` reports this, and only the adapter knows the width.
+                if outcome.get("kind") == "set_gripper":
+                    _action = (outcome.get("requested") or {}).get("action")
+                    _note = str(outcome.get("note", ""))
+                    if _action == "open":
+                        self._grasped = False
+                    elif _action == "close":
+                        # "holding" is the adapter's verdict; "empty" is air.
+                        self._grasped = "holding" in _note
+
                 content: list[dict[str, Any]] = []
                 if outcome.get("image") is not None and self.attach_images:
                     content.append({"type": "image", "image": outcome["image"]})
@@ -264,7 +282,7 @@ class Harness:
                 # And the model cannot see the trend by itself -- history is
                 # capped at MAX_HISTORY_MESSAGES, so it only ever sees the most
                 # recent number. Compute the delta here and say it out loud.
-                gap = _hold_gap(obs)
+                gap = _hold_gap(obs) if self._grasped else None
                 slip = ""
                 if gap is None:
                     if self._prev_gap is not None:
@@ -296,7 +314,7 @@ class Harness:
                     self._prev_gap = gap
                 content.append({
                     "type": "text",
-                    "text": outcome["text"] + "\n" + format_state(obs) + slip,
+                    "text": outcome["text"] + "\n" + format_state(obs, self._grasped) + slip,
                 })
                 messages.append({"role": "user", "content": content})
                 transcript.append({"turn": turn, "result": outcome["text"] + slip})
@@ -407,7 +425,7 @@ class Harness:
             return {"obs": obs, "text": self._locate(args.get("name", ""), obs), "image": None, "done": False}
 
         if name == "get_state":
-            return {"obs": obs, "text": f"[get_state] {format_state(obs)}", "image": None, "done": False}
+            return {"obs": obs, "text": f"[get_state] {format_state(obs, self._grasped)}", "image": None, "done": False}
 
         if name in ("move", "rotate", "set_gripper"):
             if name == "move":
@@ -530,7 +548,11 @@ class Harness:
         # Two pieces of advice that contradict each other one line apart are
         # worse than none. Same rule as `format_state`'s 爪上： line, so the two
         # signals can never disagree.
-        holding = _carried_name(obs) == match and hold_gap < 0.06
+        holding = (
+            getattr(self, "_grasped", False)
+            and _carried_name(obs) == match
+            and hold_gap < 0.06
+        )
 
         if holding:
             # Height gate. MEASURED (v9/v10/v11 -- bit-identical because
@@ -704,11 +726,15 @@ def _hold_gap(obs: dict[str, Any]) -> float | None:
     return float(_np.linalg.norm(_np.asarray(pos, dtype=float) - _np.asarray(eef, dtype=float)))
 
 
-def format_state(obs: dict[str, Any]) -> str:
+def format_state(obs: dict[str, Any], grasped: bool = False) -> str:
     eef = obs.get("eef_pos", [0, 0, 0])
     width = max(abs(v) for v in obs.get("gripper_qpos", [0, 0]))
     grip = "张开" if width > 0.01 else "闭合"
-    held = _carried_name(obs)
+    # `grasped` comes from the last `set_gripper close` verdict. Do NOT infer it
+    # from distance: P0a showed the pads parked 5.5 cm above an untouched can
+    # being reported as holding it (7 "slip" + 5 "dropped" false alarms in one
+    # run). A grasp is a fact about the gripper.
+    held = _carried_name(obs) if grasped else None
     if held:
         # Report HOW FAR the payload sits from the gripper centre. MEASURED
         # (v12): it crept 2.8 -> 3.1 -> 4.3 cm across three `+y 15` carries and
