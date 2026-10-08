@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arm-agent"
+version = "0.1.0"
+description = "VLM tool-calling agent driving a LIBERO/robosuite arm"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+sim = ["robosuite==1.4.0", "mujoco==2.3.7", "bddl==1.0.1", "numpy==1.22.4"]
+agent = ["transformers>=5.12", "accelerate", "bitsandbytes", "pillow"]
+
+[tool.setuptools]
+# Deliberately NOT installed via pip in either conda env: the sim side runs in
+# the `libero` env (py3.9) and the agent side in the `qwen35` env (py3.11).
+# Both pick up the code through PYTHONPATH=src (see scripts/simenv.sh and
+# scripts/agentenv.sh) so there is exactly one source tree and no per-env
+# install step to drift.
+packages = ["arm_agent"]
