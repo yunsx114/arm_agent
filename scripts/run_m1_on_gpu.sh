@@ -27,7 +27,11 @@ mkdir -p "$LOG_DIR" "$IPC_DIR"
 
 RECORD_FLAG=""
 [ "${RECORD:-0}" = "1" ] && RECORD_FLAG="--record"
+#   PROMPT_MODE=full|plain  -> system prompt variant (default full)
+#     plain = P0a of the harness-stripping plan: task + frame + tool semantics,
+#     with all scene-specific patches (heights, radii, 7-step recipe) removed.
 MAXTURNS=${MAXTURNS:-60}
+PROMPT_MODE=${PROMPT_MODE:-full}
 
 # TCP transport (default) instead of the NFS file-drop.
 # WHY (measured 2026-10-08): the NFS file-drop costs 30 s PER CALL because NFS
@@ -88,6 +92,7 @@ srun --partition=rtx2080ti --account=gpulab02 --qos=rtx2080ti \
      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
      "$ROOT/miniconda3/envs/qwen35/bin/python" -u -m arm_agent.cli run \
      --ipc-dir "$IPC_DIR" --episodes "$EPISODES" --max-turns "$MAXTURNS" $RECORD_FLAG \
+     --prompt-mode "$PROMPT_MODE" \
      $RUN_TCP_ARGS \
      2>&1 | tee "$LOG_DIR/m1_episode.log"
 

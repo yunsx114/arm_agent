@@ -239,3 +239,56 @@ SYSTEM_PROMPT = """你是机械臂智能体的决策核心。你通过调用工�
 - **完成任务后一定要 declare_done**：系统才会判定成功；不调用就永远算未完成。
 - 你可以用 write_skill 记录经验，之后的任务里 read_skill 读取。
 """
+
+# ---------------------------------------------------------------------------
+# PLAIN prompt -- P0a of the harness-stripping plan.
+#
+# Rationale: the full prompt above accumulated ~1400 tokens of
+# SCENE-SPECIFIC PATCHES, each reverse-engineered from a single failed episode:
+# basket rim at z=0.115, can half-height 0.054, "centre z >= 0.17", "within 4 cm
+# of the basket centre", "z_offset < 12 cm", a 7-step recipe, plus citations of
+# past crashes. Those patches (a) overfit 5-10 observations, (b) have already
+# contradicted each other twice, and (c) do the model's planning for it -- so the
+# runs stopped measuring the model at all.
+#
+# This version keeps only what the model CANNOT discover on its own:
+#   - the task,
+#   - the world-frame convention and the camera mapping,
+#   - what each tool does.
+# Everything about HOW to do it (order of operations, heights, distances, danger
+# radii) is deliberately absent -- that is the thing under test.
+#
+# Selected with `--prompt-mode plain`.
+SYSTEM_PROMPT_PLAIN = """你是机械臂智能体的决策核心。任务是：把指定物体拿起来，放进篮子。
+
+## 工作方式
+- 每次回复只调用**恰好一个**工具。可以在工具调用前用一两句话说明判断，之后不要再加解释。
+- 工具执行后会返回：结果说明 + 机械爪的最新位置坐标 + 最新画面。用这些**真实数字**计划下一步。
+- 不确定就多观察、多小步试探；每步之后根据最新数字重新判断。
+
+## 坐标系（世界系，单位米）
+- z 轴向上：桌面大约 z≈0，+z 向上，-z 向下。
+- 相机在场景一侧俯视：x 越大越靠近相机（画面越靠下），y 越大越靠画面右侧。
+- 机械爪初始悬停在桌面上方 z≈0.25。
+
+## 工具
+- `look` / `get_state`：观察，不移动机械臂。
+- `locate`：报告某个物体当前的世界坐标。
+- `move` / `rotate`：沿世界坐标轴平移 / 旋转末端。
+- `descend_to` / `align_xy`：自动对准并下降到指定物体（服务端闭环，比手动小步移动准）。
+- `set_gripper`：开合夹爪。
+- `declare_done`：认为完成时调用；系统会用真值验证并告诉你结果。
+
+完成后调用 `declare_done`。
+"""
+
+
+PROMPT_MODES = {
+    "full": SYSTEM_PROMPT,
+    "plain": SYSTEM_PROMPT_PLAIN,
+}
+
+
+def get_system_prompt(mode: str = "full") -> str:
+    """Pick the system prompt. Unknown modes fall back to `full`."""
+    return PROMPT_MODES.get(str(mode).strip().lower(), SYSTEM_PROMPT)

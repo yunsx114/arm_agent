@@ -26,7 +26,7 @@ import numpy as np
 
 from arm_agent.agent.llm import prepare_for_model
 from arm_agent.agent.parser import ToolCall, as_float, parse_tool_calls, truncate_to_first_call
-from arm_agent.agent.prompts import SYSTEM_PROMPT, TOOL_SCHEMAS
+from arm_agent.agent.prompts import TOOL_SCHEMAS, get_system_prompt
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
 
 SKILLS_DIRNAME = "skills"
@@ -82,6 +82,7 @@ class Harness:
         max_turns: int = 60,
         attach_images: bool = True,
         log: bool = True,
+        prompt_mode: str = "full",
     ) -> None:
         self.client = client
         self.model = model
@@ -89,6 +90,9 @@ class Harness:
         self.max_turns = max_turns
         self.attach_images = attach_images
         self.log = log
+        # "full" = the accumulated scene-specific prompt; "plain" = task +
+        # frame + tool semantics only (see prompts.get_system_prompt).
+        self.prompt_mode = prompt_mode
         self.skills_dir = self.workspace / SKILLS_DIRNAME
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         # Last observed grip offset, used to detect the payload creeping out of
@@ -125,7 +129,7 @@ class Harness:
                 )
 
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": SYSTEM_PROMPT + self._skills_index()},
+                {"role": "system", "content": get_system_prompt(self.prompt_mode) + self._skills_index()},
                 {
                     "role": "user",
                     "content": [

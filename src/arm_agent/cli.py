@@ -88,6 +88,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         workspace=REPO,
         max_turns=args.max_turns,
         attach_images=not args.no_images,
+        prompt_mode=args.prompt_mode,
     )
 
     results = []
@@ -167,6 +168,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--timeout", type=float, default=600.0, help="per-IPC-call timeout")
     p.add_argument("--wait-server", type=float, default=120.0)
     p.add_argument("--no-images", action="store_true", help="text-only ablation")
+    p.add_argument(
+        "--prompt-mode",
+        default="full",
+        choices=["full", "plain"],
+        help="full = 累积了场景专用补丁的提示；plain = 只给任务/坐标系/工具语义（P0a 剩离实验）",
+    )
     p.add_argument("--record", action="store_true", help="record an mp4 per episode (cameras + model I/O)")
     p.add_argument("--video-fps", type=int, default=2)
     p.add_argument("--video-dir", default=str(REPO / "outputs" / "videos"))
