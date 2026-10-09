@@ -435,6 +435,15 @@ class Harness:
                 "image": images.get("agent"),
                 "images": images,
                 "done": False,
+                # Keep the raw outcome fields the episode loop needs in order to
+                # track grasp state. Without them `_grasped` NEVER became True:
+                # the loop tests `outcome.get("kind") == "set_gripper"`, which was
+                # always None, so the "它目前在夹爪里" fact never appeared in
+                # `locate` and the model could not tell it was already holding the
+                # can. P0c: it re-grasped 11 times and pushed the can 38 cm away.
+                "kind": outcome.get("kind"),
+                "note": outcome.get("note", ""),
+                "requested": outcome.get("requested", {}),
             }
 
         if name == "declare_done":
