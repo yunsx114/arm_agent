@@ -13,15 +13,16 @@
 #    (mesalib). See scripts/simenv.sh for the runtime env vars.
 set -euo pipefail
 
-ROOT=/lab/haoq_lab/cse12311731
-CONDA=$ROOT/miniconda3
-UV=$ROOT/.local/bin/uv
-ENV_NAME=libero
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/_common.sh
+source "$HERE/_common.sh"
 
-"$CONDA/bin/conda" create -n "$ENV_NAME" python=3.9 -y
+UV=${UV:-$HOME/.local/bin/uv}
+PY=$PY_SIM
+
+"$CONDA" create -n "$ENV_SIM" python=3.9 -y
 
 export UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=16
-PY="$CONDA/envs/$ENV_NAME/bin/python"
 
 # Core sim stack. numpy MUST stay in the 1.2x line for robosuite 1.4.0.
 "$UV" pip install --python "$PY" --index-url https://mirrors.aliyun.com/pypi/simple/ \
@@ -41,10 +42,9 @@ PY="$CONDA/envs/$ENV_NAME/bin/python"
 
 echo
 echo "Verifying imports (needs gl_sw EGL for the renderer import path)..."
-GL_SW=$ROOT/miniconda3/envs/gl_sw
 env PYTHONNOUSERSITE=1 \
-    LD_LIBRARY_PATH=$GL_SW/lib \
-    LIBGL_DRIVERS_PATH=$GL_SW/lib/dri \
+    LD_LIBRARY_PATH=$GL_LIB \
+    LIBGL_DRIVERS_PATH=$GL_DRI \
     MUJOCO_GL=egl \
     "$PY" -c "
 import numpy, mujoco, robosuite, bddl
@@ -56,5 +56,5 @@ print('OK: libero env ready')
 "
 
 echo
-echo "Next: pip install -e third_party/LIBERO  (after the clone completes)"
-echo "Then run with: bash scripts/simenv.sh python scripts/smoke_libero_e1.py"
+echo "Next: bash scripts/setup_env.sh --only libero   (clones + installs LIBERO)"
+echo "Then run with:  bash scripts/simenv.sh scripts/smoke_libero_e1.py"

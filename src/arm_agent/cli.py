@@ -11,13 +11,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent  # arm_agent/
 DEFAULT_IPC = REPO / "runtime" / "ipc"
-DEFAULT_MODEL = Path("/lab/haoq_lab/cse12311731/qwen35_demo/models/Qwen3.5-9B")
+# The 19GB weights live NEXT TO the repo, not inside it, so derive them from the
+# repo's parent (see the layout diagram in scripts/_common.sh). Overridable by
+# env var so the repo is not tied to one cluster layout.
+DEFAULT_MODEL = Path(
+    os.environ.get(
+        "ARM_AGENT_MODEL_DIR", REPO.parent / "qwen35_demo" / "models" / "Qwen3.5-9B"
+    )
+)
 
 
 def cmd_sim_server(args: argparse.Namespace) -> int:

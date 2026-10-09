@@ -18,8 +18,11 @@
 # IPC instead. Everything below is the glue for that.
 set -euo pipefail
 
-ROOT=/lab/haoq_lab/cse12311731
-DIR="$ROOT/arm_agent"
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/_common.sh
+source "$HERE/_common.sh"
+
+DIR=$ARM_AGENT_DIR
 EPISODES=${1:-1}
 IPC_DIR="$DIR/runtime/ipc"
 LOG_DIR="$DIR/outputs/logs"
@@ -63,10 +66,10 @@ rm -f "$IPC_DIR"/cmd_*.json "$IPC_DIR"/resp_*.json
 echo "==> starting sim server on login node (log: $LOG_DIR/m1_server.log)"
 setsid nohup env PYTHONNOUSERSITE=1 \
   PYTHONPATH="$DIR/src" \
-  LD_LIBRARY_PATH="$ROOT/miniconda3/envs/gl_sw/lib" \
-  LIBGL_DRIVERS_PATH="$ROOT/miniconda3/envs/gl_sw/lib/dri" \
+  LD_LIBRARY_PATH="$GL_LIB" \
+  LIBGL_DRIVERS_PATH="$GL_DRI" \
   MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=1 \
-  "$ROOT/miniconda3/envs/libero/bin/python" -u -m arm_agent.cli sim-server \
+  "$PY_SIM" -u -m arm_agent.cli sim-server \
   --ipc-dir "$IPC_DIR" --idle-exit 1800 $SERVER_TCP_ARGS \
   > "$LOG_DIR/m1_server.log" 2>&1 &
 echo "    server pid $!"
@@ -74,7 +77,7 @@ echo "    server pid $!"
 echo "==> waiting for the server to answer pings ..."
 for _ in $(seq 1 60); do
   if env PYTHONNOUSERSITE=1 PYTHONPATH="$DIR/src" \
-     "$ROOT/miniconda3/envs/libero/bin/python" -m arm_agent.cli ipc-ping \
+     "$PY_SIM" -m arm_agent.cli ipc-ping \
      --ipc-dir "$IPC_DIR" $PING_TCP_ARGS > /dev/null 2>&1; then
     echo "    server alive"
     break
@@ -90,7 +93,8 @@ srun --partition=rtx2080ti --account=gpulab02 --qos=rtx2080ti \
      --nodes=1 --gres=gpu:1 --time=02:00:00 --job-name=m1_episode \
      env PYTHONPATH="$DIR/src" TOKENIZERS_PARALLELISM=false \
      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-     "$ROOT/miniconda3/envs/qwen35/bin/python" -u -m arm_agent.cli run \
+     ARM_AGENT_MODEL_DIR="$ARM_AGENT_MODEL_DIR" \
+     "$PY_AGENT" -u -m arm_agent.cli run \
      --ipc-dir "$IPC_DIR" --episodes "$EPISODES" --max-turns "$MAXTURNS" $RECORD_FLAG \
      --prompt-mode "$PROMPT_MODE" \
      $RUN_TCP_ARGS \
@@ -99,7 +103,7 @@ srun --partition=rtx2080ti --account=gpulab02 --qos=rtx2080ti \
 echo "==> stopping sim server"
 env PYTHONNOUSERSITE=1 PYTHONPATH="$DIR/src" IPC_DIR="$IPC_DIR" \
   SVC_IP="$SVC_IP" TCP_PORT="$TCP_PORT" RUN_TCP_ARGS="$RUN_TCP_ARGS" \
-  "$ROOT/miniconda3/envs/libero/bin/python" - > /dev/null 2>&1 <<'PYEOF' || true
+  "$PY_SIM" - > /dev/null 2>&1 <<'PYEOF' || true
 import os, sys
 sys.path.insert(0, os.environ["PYTHONPATH"])
 from arm_agent.sim.client import SimClient

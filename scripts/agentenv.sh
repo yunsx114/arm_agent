@@ -9,10 +9,11 @@
 # is only useful for text-only dry runs.
 set -euo pipefail
 
-ROOT=/lab/haoq_lab/cse12311731
-PY=$ROOT/miniconda3/envs/qwen35/bin/python
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/_common.sh
+source "$HERE/_common.sh"
 
-export PYTHONPATH=$ROOT/arm_agent/src${PYTHONPATH:+:$PYTHONPATH}
+export_pythonpath
 export TOKENIZERS_PARALLELISM=false
 
-exec "$PY" "$@"
+exec "$PY_AGENT" "$@"

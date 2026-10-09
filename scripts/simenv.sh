@@ -22,15 +22,14 @@
 #                          at device 1 explicitly.
 set -euo pipefail
 
-ROOT=/lab/haoq_lab/cse12311731
-GL_SW=$ROOT/miniconda3/envs/gl_sw
-PY=$ROOT/miniconda3/envs/libero/bin/python
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/_common.sh
+source "$HERE/_common.sh"
 
-export PYTHONNOUSERSITE=1
-export PYTHONPATH=$ROOT/arm_agent/src${PYTHONPATH:+:$PYTHONPATH}
-export LD_LIBRARY_PATH=$GL_SW/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-export LIBGL_DRIVERS_PATH=$GL_SW/lib/dri
+export PYTHONPATH=$ARM_AGENT_DIR/src${PYTHONPATH:+:$PYTHONPATH}
+export LD_LIBRARY_PATH=$GL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export LIBGL_DRIVERS_PATH=$GL_DRI
 export MUJOCO_GL=egl
 export MUJOCO_EGL_DEVICE_ID=${MUJOCO_EGL_DEVICE_ID:-1}
 
-exec "$PY" "$@"
+exec "$PY_SIM" "$@"
