@@ -37,9 +37,13 @@ CASES = [
 
 
 def main() -> int:
+    h = object.__new__(Harness)  # bypass __init__: _locate needs only self._grasped
     failures = 0
     for label, obs, expect_warn in CASES:
-        text = Harness._locate(None, "alphabet_soup", obs)
+        # "in the pads" is now a fact about the GRIPPER (set by a successful
+        # `set_gripper close`), not about distance -- see the P0a false-alarm fix.
+        h._grasped = expect_warn
+        text = h._locate("alphabet_soup", obs)
         has = "它正被你的夹爪抓着" in text
         ok = has == expect_warn
         failures += 0 if ok else 1
@@ -65,7 +69,8 @@ def main() -> int:
             "objects": {"alphabet_soup_1": [0.0312, 0.2718, z], "basket_1": BASKET},
             "eef_pos": [0.0253, 0.2744, z + 0.02],
         }
-        text = Harness._locate(None, "alphabet_soup", obs)
+        h._grasped = True  # only meaningful while actually holding it
+        text = h._locate("alphabet_soup", obs)
         is_ok = "高度 OK" in text
         ok = is_ok == expect_ok
         failures += 0 if ok else 1
