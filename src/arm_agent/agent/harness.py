@@ -227,6 +227,21 @@ class Harness:
                             images=last_images,
                         )
                     continue
+                # Tag every outcome with the TOOL the model actually called, and
+                # key the bookkeeping below off THAT.
+                #
+                # Do NOT key it off `outcome["kind"]`. That string is echoed back
+                # by the action adapter and has already diverged from the names
+                # used here: the adapter reports `descend_to` (see
+                # action_adapter.ActionOutcome kind="descend_to") while the check
+                # below tested for `descend`. MEASURED (P0d AND P0e): the
+                # "你手里已经夹着它" warning fired **0 times** in both runs even
+                # though the model descended onto its own payload at t5 in both.
+                # The P0d commit added the missing `kind` key and still changed
+                # nothing, because the VALUE was wrong, not the key. The tool name
+                # is a string this module owns (it is the same name the model is
+                # shown), so it cannot drift with the adapter.
+                outcome.setdefault("tool", call.name)
                 obs = outcome["obs"]
                 if outcome.get("images"):
                     last_images = outcome["images"]
@@ -262,7 +277,7 @@ class Harness:
 
                 # Track whether the pads actually closed on something. Only
                 # `close` reports this, and only the adapter knows the width.
-                if outcome.get("kind") == "set_gripper":
+                if outcome.get("tool") == "set_gripper":
                     _action = (outcome.get("requested") or {}).get("action")
                     _note = str(outcome.get("note", ""))
                     if _action == "open":
@@ -282,13 +297,16 @@ class Harness:
                 # it crimps it. And descending onto the object in your own pads
                 # presses it against the table. Neither is visible in the numbers.
                 hurt = ""
-                _kind = outcome.get("kind")
-                if _kind == "set_gripper" and self._grasped and self._prev_grasped:
+                _tool = outcome.get("tool")
+                if _tool == "set_gripper" and self._grasped and self._prev_grasped:
                     hurt = (
                         "\n⚠ 你上一轮已经夹住它了——这次 close 让指垫又闭合了一点"
                         "（指宽变小 = 在挤压它，可能把它挤出去）。"
                     )
-                elif _kind == "descend" and self._prev_grasped:
+                elif _tool == "descend_to" and self._prev_grasped:
+                    # Fires on the TOOL NAME, not an adapter kind string. See the
+                    # note at the top of this loop: the previous test used
+                    # "descend" and never once matched.
                     hurt = "\n⚠ 你手里已经夹着它——这次下降是在把它往桌面上压，不是在抓它。"
 
                 content: list[dict[str, Any]] = []
@@ -474,10 +492,15 @@ class Harness:
                 "done": False,
                 # Keep the raw outcome fields the episode loop needs in order to
                 # track grasp state. Without them `_grasped` NEVER became True:
-                # the loop tests `outcome.get("kind") == "set_gripper"`, which was
-                # always None, so the "它目前在夹爪里" fact never appeared in
-                # `locate` and the model could not tell it was already holding the
-                # can. P0c: it re-grasped 11 times and pushed the can 38 cm away.
+                # the loop's grasp test was always seeing None, so the "它目前在
+                # 夹爪里" fact never appeared in `locate` and the model could not
+                # tell it was already holding the can. P0c: it re-grasped 11 times
+                # and pushed the can 38 cm away.
+                # NOTE: these two `kind` fields are for `format_outcome` only.
+                # The episode loop now dispatches on `outcome["tool"]` (the tool
+                # name) -- see the note in `run_episode`: the adapter's kind string
+                # is not the same vocabulary and comparing against it silently
+                # disabled a warning for two whole runs.
                 "kind": outcome.get("kind"),
                 "note": outcome.get("note", ""),
                 "requested": outcome.get("requested", {}),
