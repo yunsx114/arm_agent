@@ -35,6 +35,8 @@ class QwenAgentModel:
         max_new_tokens: int = 256,
         temperature: float = 0.0,
         image_max_side: int = 160,
+        image_min_pixels: int | None = None,
+        attn_impl: str | None = None,
         n_gpu: int = 1,
     ) -> None:
         self.model_dir = str(model_dir)
@@ -45,7 +47,22 @@ class QwenAgentModel:
         # Image tokens and vision-tower activations scale with pixel count:
         # 256px frames measured OOM at turn 12-17 on the 10.57 GiB card, 160px
         # is ~2.6x cheaper and still legible for a 3D scene (see probe_gpu_memory).
+        #
+        # CORRECTION (probe_vram_vs_context + a processor sweep, both measured):
+        # `image_max_side=160` on its own saves NOTHING on token count. The
+        # shipped preprocessor_config.json sets shortest_edge=65536 (= 256x256),
+        # and the processor UPSCALES anything smaller back to 256x256: a 64px,
+        # 160px, 224px and 256px frame all render as grid_thw=[1,16,16] = 64
+        # image tokens. Only frames LARGER than 256 get cheaper (384 -> 144 tok).
+        # The 2.56x saving the comment above claimed is only realised when
+        # `image_min_pixels` is set (160px -> [1,10,10] = 25 tokens at 4096).
         self.image_max_side = image_max_side
+        self.image_min_pixels = image_min_pixels
+        # Which attention path runs decides whether the N x N score matrix is
+        # materialised, and that matrix is the dominant prefill allocation on
+        # this unfused-SDPA card -- so it must be selectable and logged, not
+        # left to the config default. None = leave the checkpoint's choice.
+        self.attn_impl = attn_impl
         self.n_gpu = max(1, int(n_gpu))
         self._tokenizer = None
         self._model = None
@@ -67,6 +84,8 @@ class QwenAgentModel:
             "max_memory": max_memory,
             "trust_remote_code": True,
         }
+        if self.attn_impl:
+            kwargs["attn_implementation"] = self.attn_impl
         if self.load == "4bit":
             from transformers import BitsAndBytesConfig
 
@@ -135,7 +154,17 @@ class QwenAgentModel:
         )
 
         if images and self._processor is not None:
-            inputs = self._processor(text=[text], images=images, return_tensors="pt")
+            # `size=` must be forced here, not just passed to `_collect_images`:
+            # the checkpoint's preprocessor_config.json pins
+            # shortest_edge=65536, which silently upscales smaller frames back to
+            # 256x256 and makes the downscale a no-op (measured).
+            pk = {}
+            if getattr(self, "image_min_pixels", None):
+                pk["size"] = {
+                    "shortest_edge": int(self.image_min_pixels),
+                    "longest_edge": 262144,
+                }
+            inputs = self._processor(text=[text], images=images, return_tensors="pt", **pk)
         else:
             inputs = self._tokenizer(text, return_tensors="pt")
 
