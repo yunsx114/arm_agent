@@ -98,17 +98,25 @@ processor(images=..., size={"shortest_edge": 4096, "longest_edge": 262144})
 
 ## 6. 建议的放宽阶梯（32 GiB）
 
-不要一次拉到上限：12,240 是**显存**上限，而每轮 prefill 的 N² 算力是真实成本，
-且在 Turing 上 N² 项会随 N² 涨（拟合给出 12k 时单次 generate ≈ 10.8 s，现状 2.4k 是 2.8 s）。
+不要一次拉到上限：12,238 是**显存**上限，而每轮 prefill 的 N² 算力是真实成本。
 
-| 档 | 配置 | 约合 token | 显存占用 | 说明 |
-|---|---|---|---|---|
-| 保守 | `MAX_HISTORY_MESSAGES=16`、`HISTORY_IMAGE_KEEP=2` | ~5.1k | 3.0 GiB | 覆盖"下降→挤压→掉落"这种跨 3~4 步的因果 |
-| 推荐 | `MAX_HISTORY_MESSAGES=32`、`HISTORY_IMAGE_KEEP=4` | ~7.4k | 4.2 GiB | 整个 episode 到中段基本都在窗口里 |
-| 激进 | `MAX_HISTORY_MESSAGES=64`、`HISTORY_IMAGE_KEEP=6` | ~11.8k | 8.0 GiB | 接近上限，留 2/3 显存余量给波动 |
+换算用的实测系数（全部来自上面）：固定开销 2089、1 个 pair 180、1 帧图 66
+（`min_pixels=4096` 时是 27）。`MAX_HISTORY_MESSAGES` 数的是**消息**，1 pair = 2 条。
 
-推荐档只用到 32 GiB 的约 4.2/24 GiB，离上限还很远 —— 这与"尽量用满"相反，是故意的：
-episode 里 token 数会抖动（工具结果长度不一），而 OOM 是**一次就毁掉整场**的失败。
+| 档 | 配置 | N (token) | 显存增量 | 总显存 | 32 GiB 剩余 | gen_s |
+|---|---|---|---|---|---|---|
+| 现状 | `MSG=4`、`IMG_KEEP=1` | 2,269 | 1.08 GiB | 8.42 GiB | 23.6 GiB | 2.2 s |
+| 保守 | `MSG=16`、`IMG_KEEP=2` | 3,661 | 2.38 GiB | 9.72 GiB | 22.3 GiB | 2.7 s |
+| **推荐** | `MSG=32`、`IMG_KEEP=4` | **5,233** | 4.60 GiB | 11.94 GiB | 20.1 GiB | 3.5 s |
+| 激进 | `MSG=64`、`IMG_KEEP=6` | 8,245 | 11.06 GiB | 18.40 GiB | 13.6 GiB | 5.9 s |
+| 上限 | 56 pair ≈ 107 条消息 | 12,238 | 24.06 GiB | 31.4 GiB | ~0.6 GiB | 10.8 s |
+
+推荐档只用到 32 GiB 的 20 GiB 余量里的 4.6 GiB —— 这与"尽量用满"相反，是故意的：
+episode 里 token 数会抖动（工具结果长度差异很大），而 OOM 是**一次就毁掉整场**的失败，
+并且 12k 档的 gen_s 已经接近 11 s，60 轮就是 11 分钟纯 prefill。
+
+顺带一个比例上的事实：现状 `MAX_HISTORY_MESSAGES=4` 只值 **360 token**，
+占 2.4k 窗口的 15%。**不是没地方放历史，是从来没给过历史。**
 
 ## 7. 更根本的做法
 
