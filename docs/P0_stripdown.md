@@ -69,13 +69,19 @@ P0f 三条提示**全部按预期触发**（`你手里已经夹着它` t5、`你
 
 ## 4. 上下文预算（10GB 显存的硬约束）
 
-| 配置 | token | attention 矩阵 ≈ |
+| 配置 | token | **analytic** attention 矩阵 ≈ |
 |---|---|---|
 | full（system+tools+task） | 2815 | 242 MiB |
 | plain | 1843 | 104 MiB |
 | plain + 4 条历史 + 短结果（P0b） | 2498 | 190 MiB |
 
-sm_75 上 SDPA 没有融合核 → N×N fp16 矩阵要**实体化**（16 头）→ **显存 ∝ N²**。
+⚠️ 上表的"矩阵 ≈"是 `N²×16头×2字节` 的**公式预测**（就是 `llm.py` 打印的那个），
+**实测低估 5.3 倍**。实测定律见 [`context_budget.md`](context_budget.md)：
+`peak_extra(N) = 256 MiB + 170.7 B × N²`，成因见 [`arch_levers.md`](arch_levers.md)。
+下面这段当时的推理方向是对的（开销 ∝ N²），但把成因归给了"sm_75 无融合核"——
+现在测清楚了，是 **GQA 挡掉了融合核**，memory-efficient 本身在 sm_75 上可用。
+
+N×N 要**实体化** → **显存 ∝ N²**。
 这是 `MAX_HISTORY_MESSAGES = 4`、`HISTORY_IMAGE_KEEP = 1` 的由来，
 也是"模型遗忘太快"的直接原因：历史只剩 2 轮对话，跨阶段的因果（t5 下降 → t7 掉落）
 根本不在上下文里。

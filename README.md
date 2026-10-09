@@ -110,8 +110,11 @@ src/arm_agent/
 | robosuite 须 `ignore_done=True` | horizon 后拒 step | `libero_env.py` |
 | 渲染 = 单步 90% | 245ms→24ms renderless | `libero_env.set_render` |
 | 4bit 下生成须显式 eos_token_id | 248046≠config 的 248044 | `llm.py` |
-| 256px 图像预算：keep=2 | 15 轮 OOM 实测 | `llm.py` / `harness.py` |
-| sm_75 无融合 SDPA，attn ∝ N² | 2.4k tok → 176MiB 矩阵 | `MAX_HISTORY_MESSAGES` |
+| 图像预算：keep 越大越早 OOM | 256px/keep=4 在 15 轮 OOM | `llm.py` / `harness.py` |
+| **上下文开销 ∝ N²，实测 170.7 B/tok²** | 10.57GiB 卡上限 ~3,870 tok | `MAX_HISTORY_MESSAGES` |
+| `attn_matrix≈` 是**公式预测**，低估 5.3 倍 | 2.4k tok 打印 176MiB，实测已用 1.2GiB | `llm.py` / `docs/context_budget.md` |
+| GQA 挡掉两个融合注意力核 | q16/kv4 头 → 落到 math 路径，实体化三份 N×N | `docs/arch_levers.md` |
+| `image_max_side` **不省 token** | ≤256px 都被上采样回 256×256 = 64 tok | `llm.py` (`image_min_pixels`) |
 
 ## 文档
 
@@ -120,3 +123,11 @@ src/arm_agent/
   实验日志：九次 run 的失败→修复链条、六个 harness 自身 bug（全部实测）、
   以及 10GB 显存下上下文预算的实测数字。
   最重要的一条结论：**「提示能到达模型」≠「提示能改变模型的行为」**。
+- [`docs/context_budget.md`](docs/context_budget.md) —— 上下文预算实测：
+  `peak_extra(N) = 256 MiB + 170.7 B × N²`（5 点拟合，最大偏差 0.6%）、
+  各显存档位的 token 上限、以及放宽阶梯的换算表；
+  并更正两处错误假设：`attn_matrix≈` 低估 5.3 倍、`image_max_side` 一 token 都没省。
+- [`docs/arch_levers.md`](docs/arch_levers.md) —— 架构层面的优化空间与**验证状态**：
+  170.7 B/tok² 的成因（GQA 挡掉融合核 → 落到 math 路径，实测因果链闭合）、
+  试过但失败的修法（K/V 展开补丁，逐位无效）、7.35 GiB 权重里有一半是未量化的
+  embed/lm_head、以及换 5090（sm_120 在 flash 支持范围内）的确定项与外推项。

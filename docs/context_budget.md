@@ -46,15 +46,24 @@ llm.py:  matrix_mib = n_tok² × 16 heads × 2 B   ← 假设 fp16 且只算一�
 `attn_matrix≈176MiB`（ctx=2400）读起来像"还有 3 GiB 富余"，实际当时已经用掉 1.2 GiB。
 这是把**推导量当成测量量**的典型后果：它是按公式算出来的预测，从来不是实测值。
 
-成因（**假设**，尚未独立验证）：sm_75 上 SDPA 的 flash / memory-efficient 后端都需要
-sm_80+，落到 math 回退路径后会**以 fp32 实体化** score 与 softmax 输出，再加一次转 fp16。
-16 heads × 4 B（fp32）× 2~3 份 ≈ 128~192 B/tok²，与实测 170.7 吻合。
-注：24 个线性注意力层是 chunked Gated DeltaNet（`torch_chunk_gated_delta_rule`，
-chunk=64），**是 O(N) 不是 N²**，所以不是它的锅。
+成因：**已实测确定，见 [`arch_levers.md`](arch_levers.md)**。一句话：两个融合核
+（flash / memory-efficient）都被 **GQA 的头数不匹配**（q 16 头 / kv 4 头）挡掉，
+SDPA 只能落到 math 路径，而 math 路径会实体化**三份** N×N
+（fp32 scores + fp32 softmax 输出 + fp16 转换）。
+实测：N=4096 / 16 头，math 峰值 2560 MiB，内存高效核只要 96 MiB。
+2560 MiB @ 4096 ≈ 160 B/tok²，与这里的 170.7 B/tok² 对得上。
 
-如果这条假设成立，那么换一个不落 fp32 的注意力实现可以把 B 从 170.7 降到 ~32，
-**上下文上限提高约 5 倍**（32 GiB 上从 12k 到 ~28k）。这是"想继续放宽时该动的地方"，
-但在被测出来之前只能算线索。
+（本节先前写的是"sm_75 上 flash 与 memory-efficient 后端都需要 sm_80+"。
+**那句话是错的**：memory-efficient 在 sm_75 上可用，我当时的测试用例用了全 16 头，
+所以它能跑 —— 测试用例没复现真实形状。已更正。）
+
+注：24 个线性注意力层是 chunked Gated DeltaNet（`torch_chunk_gated_delta_rule`，
+chunk=64），**是 O(N) 不是 N²**，所以不是它的锅 —— 这条是查源码得到的。
+
+**在当前卡上无法用一个 wrapper 绕开**：实测把 K/V 扩成 16 头 + 去掉 `enable_gqa`
+之后，显存曲线与不加补丁**逐位相同**，关掉 math 后端时仍报 `No available kernel`。
+所以下面第 6 节的阶梯是**在当前约束下**的建议；想真正抬高上限，需要换注意力实现 /
+推理引擎，或换卡（见 `arch_levers.md`）。
 
 ## 4. 另一个实测更正：`image_max_side` 根本没有省 token
 
