@@ -98,6 +98,9 @@ class Harness:
         # Last observed grip offset, used to detect the payload creeping out of
         # the pads (see the slip-trend block in run_episode).
         self._prev_gap: float | None = None
+        # Grasp state as of the PREVIOUS turn, so the loop can tell a first
+        # `close` from a repeat one (the latter squeezes an already-held object).
+        self._prev_grasped = False
         # Set when a `set_gripper close` actually closed ON something, cleared
         # by `open`. MEASURED (P0a): without this flag the slip/"dropped"
         # checks fire on pure proximity -- the gripper parked 5.5 cm above the
@@ -268,6 +271,26 @@ class Harness:
                         # "holding" is the adapter's verdict; "empty" is air.
                         self._grasped = "holding" in _note
 
+                # Facts about SELF-INFLICTED harm -- the kind the model cannot
+                # infer from a width or a z error.
+                #
+                # MEASURED (P0c' t3-t7): the model gripped the can (width 0.0230),
+                # lifted it, then ran `descend_to(can, 1.2)` and a SECOND `close`
+                # (width went 0.0230 -> 0.0206, i.e. the pads closed further and
+                # SQUEEZED the payload), and the can fell out on the next lift.
+                # Closing again on an object you already hold is not idempotent:
+                # it crimps it. And descending onto the object in your own pads
+                # presses it against the table. Neither is visible in the numbers.
+                hurt = ""
+                _kind = outcome.get("kind")
+                if _kind == "set_gripper" and self._grasped and self._prev_grasped:
+                    hurt = (
+                        "\n⚠ 你上一轮已经夹住它了——这次 close 让指垫又闭合了一点"
+                        "（指宽变小 = 在挤压它，可能把它挤出去）。"
+                    )
+                elif _kind == "descend" and self._prev_grasped:
+                    hurt = "\n⚠ 你手里已经夹着它——这次下降是在把它往桌面上压，不是在抓它。"
+
                 content: list[dict[str, Any]] = []
                 if outcome.get("image") is not None and self.attach_images:
                     content.append({"type": "image", "image": outcome["image"]})
@@ -304,10 +327,11 @@ class Harness:
                     self._prev_gap = gap
                 content.append({
                     "type": "text",
-                    "text": outcome["text"] + "\n" + format_state(obs, self._grasped) + slip,
+                    "text": outcome["text"] + "\n" + format_state(obs, self._grasped) + slip + hurt,
                 })
                 messages.append({"role": "user", "content": content})
-                transcript.append({"turn": turn, "result": outcome["text"] + slip})
+                transcript.append({"turn": turn, "result": outcome["text"] + slip + hurt})
+                self._prev_grasped = self._grasped
 
         except Exception as exc:  # noqa: BLE001 - keep episode artifacts even on crash
             result.error = result.error or f"episode failed: {type(exc).__name__}: {exc}"
