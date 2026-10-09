@@ -44,38 +44,25 @@ def main() -> int:
         # `set_gripper close`), not about distance -- see the P0a false-alarm fix.
         h._grasped = expect_warn
         text = h._locate("alphabet_soup", obs)
-        has = "它正被你的夹爪抓着" in text
+        has = "它目前在夹爪里" in text
         ok = has == expect_warn
         failures += 0 if ok else 1
         print(f"[{'PASS' if ok else 'FAIL'}] {label}: held-warning={has} (expected {expect_warn})")
 
-        # The v9 failure mode: the reply offered BOTH "下一步建议: 先 move +x …"
-        # (derived from the object riding the pads -- pure noise) AND a warning
-        # to ignore those numbers. The model obeyed the first line and drove
-        # away from the basket. The two must never coexist.
-        contradicts = expect_warn and ("下一步建议" in text or "抓取高度" in text)
-        ok2 = not contradicts
+        # P0b contract: a tool result may carry MEASUREMENTS, never PRESCRIPTIONS.
+        # Both halves were observed live:
+        #   - v9: "下一步建议: 先 move +x 1.6cm" (computed from the object riding
+        #     the pads) ordered a move while the can was already in the hand;
+        #   - P0a' t11: "x 轴已对齐；y 轴已对齐" announced alignment was finished
+        #     while dz was still -5.5cm, so the model never descended.
+        prescribed = [w for w in ("下一步", "建议", "不要", "先 move", "抬到", "篮口") if w in text]
+        ok2 = not prescribed
         failures += 0 if ok2 else 1
-        print(f"[{'PASS' if ok2 else 'FAIL'}]   self-consistent (no 下一步建议/抓取高度 when held): "
-              f"contradicts={contradicts}")
+        print(f"[{'PASS' if ok2 else 'FAIL'}]   no prescriptions in the reply: found={prescribed}")
         if has:
             for line in text.splitlines():
                 print(f"        {line.strip()}")
     print()
-    print("=== height gate (carry high enough to clear the rim?) ===")
-    for label, z, expect_ok in [("low: centre z=0.028", 0.028, False),
-                                ("high: centre z=0.20", 0.20, True)]:
-        obs = {
-            "objects": {"alphabet_soup_1": [0.0312, 0.2718, z], "basket_1": BASKET},
-            "eef_pos": [0.0253, 0.2744, z + 0.02],
-        }
-        h._grasped = True  # only meaningful while actually holding it
-        text = h._locate("alphabet_soup", obs)
-        is_ok = "高度 OK" in text
-        ok = is_ok == expect_ok
-        failures += 0 if ok else 1
-        print(f"[{'PASS' if ok else 'FAIL'}] {label}: height_ok={is_ok} (expected {expect_ok})")
-
     print()
     print(f"{failures} failure(s)")
     return 1 if failures else 0

@@ -295,22 +295,12 @@ class Harness:
                         # v12 only looked detectable because that run happened to
                         # dawdle at 4.3 cm for a turn.
                         # Detect the DISAPPEARANCE, not just the drift.
-                        slip = (
-                            "\n⛔ **物体掉了**（上一轮还在指间）。先 `locate` 看它掉在哪："
-                            "够得到就重新抓；若报“够不到”，用爪子在它侧面轻推（move ±x 5~10cm）挪到够得到的区域。"
-                        )
+                        slip = "\n⛔ **物体掉了**（上一轮还在夹爪里）。"
                     self._prev_gap = None  # nothing held: reset the trend
                 else:
-                    if self._prev_gap is not None and gap > self._prev_gap + 0.003:
-                        slip = (
-                            f"\n⚠ **正在往外滑**（离爪心 {self._prev_gap * 100:.1f}→{gap * 100:.1f}cm）。"
-                            "**别再横移**：到篮子附近就立刻投放，否则先放回桌面重抓。"
-                            "（close 无效——指垫已闭到底）"
-                        )
-                    elif gap > 0.038:
-                        slip = (
-                            f"\n⚠ **快滑脱了**（离爪心 {gap * 100:.1f}cm）。**别再横移**：到篮子附近立刻投放，否则放回桌面重抓。"
-                        )
+                    # P0b: only the DISAPPEARANCE event is reported (a fact).
+                    # The drift thresholds (3mm / 3.8cm) were numbers I fitted to
+                    # v12/v14, and their messages prescribed what to do.
                     self._prev_gap = gap
                 content.append({
                     "type": "text",
@@ -376,13 +366,8 @@ class Harness:
                 return {
                     "obs": resp.obs,
                     "text": (
-                        f"[descend_to {object_name} +{z_offset}cm] ⚠ **够不到**：xy 已对准，"
-                        f"但爪子只降到 z={end[2]:.4f}，离目标还差 {z_err * 100:.1f}cm"
-                        "（这是工作空间限制，不是没对准）。\n"
-                        "  在同一个位置**再试 descend_to 也不会更低**。可选做法：\n"
-                        "  ① 用爪子在物体侧面轻推，把它挪到别处（例如 move ±x 5~10cm），再 locate 重新对准；\n"
-                        "  ② 从物体的另一侧靠近再试。\n"
-                        "  **不要**直接 set_gripper close —— 够不到，一定夹空。"
+                        f"[descend_to {object_name} +{z_offset}cm] 未到达：xy 已对准，"
+                        f"终点 z={end[2]:.4f}，离目标还差 {z_err * 100:.1f}cm"
                     ),
                     "image": images.get("agent"),
                     "images": images,
@@ -393,7 +378,7 @@ class Harness:
                 "text": (
                     f"[descend_to {object_name} +{z_offset}cm] 已对准并下降到 "
                     f"({end[0]:.4f}, {end[1]:.4f}, {end[2]:.4f})（{note}，"
-                    f"{outcome.get('steps', 0)} ticks）。下一步用 set_gripper 操作夹爪。"
+                    f"{outcome.get('steps', 0)} ticks）。"
                 ),
                 "image": images.get("agent"),
                 "images": images,
@@ -414,7 +399,6 @@ class Harness:
                 "text": (
                     f"[align_xy {object_name}] 已把机械爪 x/y 对准物体正上方（{outcome.get('note', '')}）；"
                     f"当前位置 ({end[0]:.4f}, {end[1]:.4f}, {end[2]:.4f})，用时 {outcome.get('steps', 0)} ticks。"
-                    "下一步可以 move -z 下降到抓取高度（目标 z 见 locate 的提示）。"
                 ),
                 "image": images.get("agent"),
                 "images": images,
@@ -458,10 +442,7 @@ class Harness:
             if success:
                 text = f"[declare_done] 验证通过，任务完成！说明：{args.get('answer_note', '')}"
             else:
-                text = (
-                    "[declare_done] 任务完成检查**未通过**：目标物体还没有按要求放好。"
-                    "请继续观察和调整（可以先 look 或 get_state 确认现状）。"
-                )
+                text = "[declare_done] 任务完成检查**未通过**：目标物体还没有按要求放好。"
             return {"obs": obs, "text": text, "image": None, "done": True, "success": success}
 
         if name == "write_skill":
@@ -521,19 +502,10 @@ class Harness:
         eef = obs.get("eef_pos", [0.0, 0.0, 0.0])
         dx, dy, dz = pos[0] - eef[0], pos[1] - eef[1], pos[2] - eef[2]
 
-        def hint(axis_letter: str, value: float) -> str:
-            if abs(value) < 0.005:
-                return f"{axis_letter} 轴已对齐"
-            direction = ("+" if value > 0 else "-") + axis_letter
-            cm = abs(value) * 100
-            # Single-call limit, kept in sync with adapter.MOVE_MAX_DISTANCE_CM.
-            # One long move is safer than several short ones (each move has a
-            # small chance of shaking the payload loose).
-            if cm > 15.0:
-                repeats = int(cm // 15) + 1
-                return f"需要 move {direction} 15.0cm 约 {repeats} 次（共 {cm:.0f}cm）"
-            return f"move {direction} {cm:.1f}cm"
-
+        # P0b: the `hint()` helper that translated a deviation into a ready-made
+        # move command is gone. It is what told the model "x 轴已对齐；y 轴已对齐"
+        # while dz was still -5.5cm (P0a' t11) -- the model obeyed it and never
+        # descended. Turning measurements into commands is the model's job.
         hold_gap = float(
             np.linalg.norm(np.asarray(pos, dtype=float) - np.asarray(eef, dtype=float))
         )
@@ -567,40 +539,32 @@ class Harness:
             lines = [
                 f"[locate] {match}: ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}) m",
                 f"  机械爪当前: ({eef[0]:+.4f}, {eef[1]:+.4f}, {eef[2]:+.4f}) m",
-                f"  ⚠ **它正被你的夹爪抓着**（离爪心 {hold_gap * 100:.1f}cm）——上面三个数字只是说明它贴着你，"
-                "**不要**按它们的差值移动，也**不要**再 descend_to / close 去“重新抓”。",
+                # P0b: state the FACT and stop. The old wording continued with
+                # "不要按它们的差值移动…也不要再 descend_to / close" and then
+                # prescribed a scene-specific height rule (rim 0.115, centre
+                # >=0.17). Facts belong in the result; prescriptions do not.
+                f"  （它目前在夹爪里，离爪心 {hold_gap * 100:.1f}cm）",
             ]
-            if pos[2] < CARRY_SAFE_CENTRE_Z:
-                lines.append(
-                    f"  ⛔ **高度不够：现在横移会把篮子撞飞。** 它的中心 z={pos[2]:.4f}，"
-                    f"底部大约 z={pos[2] - 0.054:.4f}，而**篮口在 z≈{BASKET_RIM_Z:.3f}**——底部比篮口低，"
-                    "贴着它扫过去就会被刮掉（这就是前几次掉在篮子附近的原因）。\n"
-                    f"    先 `move +z` 把它抬到**中心 z ≥ {CARRY_SAFE_CENTRE_Z:.2f}**"
-                    f"（即再抬 {(CARRY_SAFE_CENTRE_Z - pos[2]) * 100:.0f}cm 以上），locate 确认 z 够了再横移。\n"
-                    "    **不要超过 z≈0.30**（再高会接近工作空间上限）。"
-                )
-            else:
-                lines.append(
-                    f"  ✓ 高度 OK（中心 z={pos[2]:.4f}，底部高于篮口 {BASKET_RIM_Z:.3f}），可以横移。"
-                )
-            if hold_gap > 0.038:
-                lines.append(
-                    f"  ⚠ **它在往外滑**（离爪心 {hold_gap * 100:.1f}cm，健康 <3cm）。"
-                    "**别再横移**：到篮子附近立刻投放，否则放回桌面重抓。（close 无效）"
-                )
-            lines.append(
-                "  下一步：locate basket，按**篮子那一条**给出的方向移动；"
-                "到篮子正上方后 descend_to(basket, 15) → set_gripper open → declare_done。"
-            )
-            lines.append("  （除非画面显示它其实已经掉了，那时才按掉的流程处理。）")
+            # P0b: no height gate, no slip threshold, no next-step recipe.
+            # All three were scene constants I had fitted to past crashes
+            # (rim 0.115 / centre 0.17 / 3.8cm) and all three prescribe action.
         else:
+            # P0b: measurements ONLY.
+            #
+            # What the old text appended, and what it cost (P0a', t9-t24):
+            #   "下一步建议: 先 move +x 0.3cm；再 y 轴已对齐"
+            #   "抓取高度: x/y 对齐后降到 z≈0.050 m"
+            # With the pads 5.5 cm ABOVE the can (dz=-5.5cm) the advice line
+            # announced "x 轴已对齐；y 轴已对齐", so the model believed alignment
+            # was finished and spent 12 turns nudging x/y back and forth (t12-t23)
+            # instead of descending -- then its next descent slid 11 cm sideways
+            # and shoved the can away. The advice never once mentioned the axis
+            # that was actually wrong. A hint that silently ignores the one
+            # mismatched dimension is worse than no hint.
             lines = [
                 f"[locate] {match}: ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}) m",
                 f"  机械爪当前: ({eef[0]:+.4f}, {eef[1]:+.4f}, {eef[2]:+.4f}) m",
                 f"  偏差（物体 - 机械爪）: dx={dx * 100:+.1f}cm, dy={dy * 100:+.1f}cm, dz={dz * 100:+.1f}cm",
-                f"  下一步建议: 先 {hint('x', dx)}；再 {hint('y', dy)}（一次只做一个，做完复查）",
-                f"  抓取高度: x/y 对齐后降到 z≈{pos[2] + 0.012:.3f} m",
-                "  注意: 单次 move 可走 0.1~15cm，尽量一次走完；偏差小于 5cm 时按实际偏差移动，别固定用 5cm（会过冲震荡）。",
             ]
         # Proximity warning. MEASURED (probe_descend_near_basket): descending
         # within 4 cm of the basket shoves it 10-37 mm, while at >=6 cm it is
@@ -611,16 +575,10 @@ class Harness:
                 continue
             d_xy = float(np.linalg.norm(np.asarray(other_pos, dtype=float)[:2] - np.asarray(pos, dtype=float)[:2]))
             if d_xy < 0.07:
-                if holding:
-                    lines.append(
-                        f"  ⚠ 注意避让: {other_name} 距它只有 {d_xy * 100:.1f}cm，搬着它横移时别撞到。"
-                    )
-                else:
-                    lines.append(
-                        f"  ⚠ 危险邻近: {other_name} 距它只有 {d_xy * 100:.1f}cm，"
-                        "4cm 以内下降必把它推开 10~37mm。别在这个距离上下降/横移；"
-                        "先把物体推离到 >10cm 再抓。"
-                    )
+                # P0b: report the neighbour and its distance -- a measurement.
+                # Dropped the 4cm/6cm thresholds, the "10-37mm" figure and the
+                # "push it away first" recipe: all scene constants or recipes.
+                lines.append(f"  附近还有 {other_name}，距它 {d_xy * 100:.1f}cm")
         return "\n".join(lines)
 
     def _skills_index(self) -> str:
@@ -667,13 +625,8 @@ class Harness:
 # than imported so the agent side never pulls in a MuJoCo-importing module.
 GRIPPER_OPEN_WIDTH = 0.034  # at/above this the pads are still open (no grasp)
 GRIPPER_EMPTY_WIDTH = 0.006  # at/below this they are fully shut on air
-# Basket rim height, measured by probe_basket_geometry (the pads cannot descend
-# below it). Anything carried lower than this sweeps the rim when translating.
-BASKET_RIM_Z = 0.115
-# Centre height a carried object needs so that its BOTTOM clears the rim. The
-# can is ~10.7 cm tall (half = 0.054), so centre >= 0.115 + 0.054 = 0.169; use a
-# round 0.17 and let the message state the reasoning.
-CARRY_SAFE_CENTRE_Z = 0.17
+# (P0b removed BASKET_RIM_Z / CARRY_SAFE_CENTRE_Z: scene constants fitted to
+# past crashes, no longer referenced by any code path.)
 
 
 def _fmt3(vec: Any) -> str:
@@ -749,12 +702,8 @@ def format_state(obs: dict[str, Any], grasped: bool = False) -> str:
                 np.linalg.norm(np.asarray(pos, dtype=float) - np.asarray(eef, dtype=float))
             )
             hold = f"爪上：{held}（离爪心 {gap * 100:.1f}cm）"
-            if gap > 0.038:
-                # Do NOT advise "close to re-tighten": the pads are already shut
-                # (close is idempotent), so that can only squeeze the payload
-                # further out. MEASURED (v14 t17): the very turn that ran
-                # `set_gripper close` is the turn the can had already left.
-                hold += " ⚠ 快滑脱了，别再横移。"
+            # P0b: report the offset (a measurement) and drop both the 3.8cm
+            # threshold and the "don't translate" instruction.
             return f"机械爪位置 {_fmt3(eef)} m；夹爪：{grip}；{hold}"
         hold = f"爪上：{held}"
     else:
@@ -789,11 +738,9 @@ def format_outcome(outcome: dict[str, Any]) -> str:
             f"实测位移 {_fmt3(delta)} m（{ticks} ticks）；机械爪现在位于 {_fmt3(end)}"
         )
         if want > 0.005 and got < want * 0.5:
-            text += (
-                f" ⚠ **只走了 {got * 100:.1f}cm（要求 {want * 100:.1f}cm）**"
-                "——被挡住，或这个方向已经到极限。不要重复同一个方向；换个方向，"
-                "或先抬高再横移绕开。"
-            )
+            # Fact (the shortfall) only. The old text added "don't repeat the
+            # same direction; try another, or lift first" -- that is planning.
+            text += f" ⚠ 只走了 {got * 100:.1f}cm（要求 {want * 100:.1f}cm）"
             if note:
                 text += f" [{note}]"
         return text
@@ -828,20 +775,17 @@ def format_outcome(outcome: dict[str, Any]) -> str:
                 # MEASURED (v6 t20): that negative-offset descend scraped the can
                 # sideways and pushed it 5.4 cm -- straight toward the basket,
                 # which was then knocked over at t21. Lift first, then re-align.
-                verdict = (
-                    " ⚠ 夹空了（两指完全闭合）。重试：先 move +z 5 抬起，再 align_xy，再 descend_to(name, 1.2)；"
-                    "别用负 z_offset 硬压（会把物体横向推开）。"
-                )
+                verdict = " 夹空了（两指完全闭合）"
             elif width >= GRIPPER_OPEN_WIDTH:
-                verdict = " ⚠ 夹爪没有闭合（仍在张开位置）——请确认已对准物体再 close。"
+                verdict = " 夹爪未闭合（仍在张开位置）"
             else:
-                verdict = " ✓ 指间有物体（夹住了）。下一步可以提起并运送到篮子。"
+                verdict = " 指间有物体（夹住了）"
         elif action == "open":
             # Tell the model what an open means RIGHT HERE, every time. The v4
             # episode failed because it read `爪上：空` after releasing the can
             # into the basket, concluded "it fell out", and spent 36 turns
             # chasing it. `爪上：空` is EXPECTED after a deliberate release.
-            verdict = " ✓ 已张开（物体已脱手）。如果你是把它放进容器，这就是正常的，请接着调用 declare_done 让系统验证，不要再去抓它。"
+            verdict = " 已张开（指间无物体）"
         return (
             f"[set_gripper {action}] {note}（{ticks} ticks）；"
             f"机械爪位于 {_fmt3(end)}{verdict}"
