@@ -186,6 +186,72 @@ def main() -> int:
 
     image_side = int(os.environ.get("IMAGE_SIDE", "160"))
     attn_impl = os.environ.get("ATTN_IMPL", "")  # '', 'eager', 'sdpa'
+
+    # FORCE_EFFICIENT_ATTN=1 turns off the math and flash SDPA backends globally,
+    # leaving only the memory-efficient one.
+    #
+    # WHY: probe_arch_levers measured that a single SDPA call at N=4096, 16 heads
+    # costs 2560 MiB on the math path (= fp32 scores 1024 + fp32 softmax output
+    # 1024 + fp16 cast 512, exactly) and 96 MiB on the memory-efficient path (just
+    # the inputs). 2560 MiB at 4096 tokens is ~160 B/tok^2 -- the measured law of
+    # THIS probe. So the whole context ceiling is set by which backend SDPA
+    # silently picks, and on sm_75 it picks math even though the efficient
+    # backend is available and works. This knob tests whether pinning the backend
+    # really moves B, which is the difference between a 5x context win and a
+    # nice-sounding theory.
+    if os.environ.get("FORCE_EFFICIENT_ATTN") == "1":
+        torch.backends.cuda.enable_math_sdp(False)
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        print("backends        : math OFF, flash OFF, mem_efficient ON "
+              "(FORCE_EFFICIENT_ATTN=1)")
+    else:
+        print(f"backends        : math {torch.backends.cuda.math_sdp_enabled()}, "
+              f"flash {torch.backends.cuda.flash_sdp_enabled()}, "
+              f"mem_efficient {torch.backends.cuda.mem_efficient_sdp_enabled()}")
+
+    # GQA_EXPAND=1: expand K/V to the query head count before SDPA.
+    #
+    # MEASURED (probe_arch_levers + a direct kernel test), and this supersedes my
+    # earlier "sm_75 has no fused kernel" explanation:
+    #   * flash attention needs sm80+          -> unavailable here, permanently;
+    #   * memory-efficient attention WORKS on   sm_75 (96 MiB for a 4096-token,
+    #     16-head call) -- but BOTH fused kernels refuse GQA: transformers passes
+    #     q with 16 heads and k/v with 4 (num_key_value_heads=4), and the dense
+    #     kernels require equal head counts. So SDPA silently falls to the MATH
+    #     path, which materialises fp32 scores + fp32 softmax out + the fp16 cast
+    #     = 2560 MiB at N=4096, i.e. the 170.7 B/tok^2 this probe measures.
+    #   * `enable_gqa=True` does NOT help on this card (still "No available
+    #     kernel"), but expanding K/V by hand DOES: 2560 MiB -> 96 MiB, 27x.
+    # The expansion multiplies the KV cache by 4 (32 -> 128 KiB/token), which is
+    # cheap next to the N^2 term it removes.
+    if os.environ.get("GQA_EXPAND") == "1":
+        _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+        def _sdpa_gqa_expand(q, k, v, *a, **kw):
+            if (q.dim() == 4 and k.dim() == 4 and k.shape[1] != q.shape[1]
+                    and q.shape[1] % k.shape[1] == 0):
+                rep = q.shape[1] // k.shape[1]
+                k = k.unsqueeze(2).expand(-1, k.shape[1], rep, -1, -1).reshape(
+                    q.shape[0], q.shape[1], k.shape[2], k.shape[3])
+                v = v.unsqueeze(2).expand(-1, v.shape[1], rep, -1, -1).reshape(
+                    q.shape[0], q.shape[1], v.shape[2], v.shape[3])
+                # CRUCIAL: drop enable_gqa once K/V are already expanded.
+                # transformers/integrations/sdpa_attention.py sets
+                # sdpa_kwargs = {"enable_gqa": True} whenever q and k have
+                # different head counts, and a kernel test measured that
+                # enable_gqa=True is itself enough to make the fused kernel refuse
+                # ("No available kernel") even on equal head counts. The first
+                # version of this wrapper forwarded it, so the expansion had NO
+                # effect end-to-end (B stayed at 188-212 tok^2) -- a wrapper that
+                # silently keeps the disqualifying flag is indistinguishable from
+                # no wrapper at all.
+                kw.pop("enable_gqa", None)
+            return _orig_sdpa(q, k, v, *a, **kw)
+
+        torch.nn.functional.scaled_dot_product_attention = _sdpa_gqa_expand
+        print("GQA expand      : ON (K/V repeated up to the query head count)")
+
     model = QwenAgentModel(MODEL_DIR, load="4bit", gpu_mem_gib=9.5,
                            image_max_side=image_side, temperature=0.0,
                            attn_impl=attn_impl or None)

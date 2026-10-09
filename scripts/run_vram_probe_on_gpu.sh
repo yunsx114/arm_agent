@@ -8,6 +8,7 @@
 # Long: the upper sweep points cost a quadratic prefill, and the sweep runs until
 # it OOMs (that OOM is the measurement, not a failure). Budget 30-45 minutes and
 # a 2h srun.
+#   FORCE_EFFICIENT_ATTN=1 bash scripts/run_vram_probe_on_gpu.sh   # pin SDPA backend
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -25,5 +26,7 @@ srun --partition=rtx2080ti --account=gpulab02 --qos=rtx2080ti \
      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
      ARM_AGENT_MODEL_DIR="$ARM_AGENT_MODEL_DIR" \
      IMAGE_SIDE="${IMAGE_SIDE:-160}" \
+     FORCE_EFFICIENT_ATTN="${FORCE_EFFICIENT_ATTN:-0}" \
+     GQA_EXPAND="${GQA_EXPAND:-0}" \
      TARGETS="${TARGETS:-2500,5000,8000,12000,16000,22000,30000,40000,55000,70000}" \
      "$PY_AGENT" -u "$DIR/scripts/probe_vram_vs_context.py" 2>&1 | tee "$LOG"
