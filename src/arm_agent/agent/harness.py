@@ -319,7 +319,15 @@ class Harness:
                         # dawdle at 4.3 cm for a turn.
                         # Detect the DISAPPEARANCE, not just the drift.
                         slip = "\n⛔ **物体掉了**（上一轮还在夹爪里）。"
-                    self._prev_gap = None  # nothing held: reset the trend
+                    self._prev_gap = None
+                    # The grip is gone: stop calling it a grasp. Without this the
+                    # episode loop kept `_grasped=True` for the rest of the run,
+                    # so any moment the (now stationary) object happened to be
+                    # within 6 cm of the pads re-armed `_prev_gap` and produced
+                    # another "物体掉了" -- MEASURED (P0d): 8 such false alarms,
+                    # and the model spent the episode "looking for the can" it
+                    # was actually standing next to.
+                    self._grasped = False
                 else:
                     # P0b: only the DISAPPEARANCE event is reported (a fact).
                     # The drift thresholds (3mm / 3.8cm) were numbers I fitted to
@@ -404,6 +412,11 @@ class Harness:
                     f"({end[0]:.4f}, {end[1]:.4f}, {end[2]:.4f})（{note}，"
                     f"{outcome.get('steps', 0)} ticks）。"
                 ),
+                # `kind` must travel with the result: the episode loop keys the
+                # self-harm checks off it, and without this field the
+                # "you are descending onto the object in your own pads" warning
+                # could never fire (P0d: 0 occurrences while it applied at t5).
+                "kind": outcome.get("kind"),
                 "image": images.get("agent"),
                 "images": images,
                 "done": False,
