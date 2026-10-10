@@ -84,6 +84,11 @@ RECORD_ARGS=()
 BUDGET_ARGS=()
 [ -n "${HISTORY_MESSAGES:-}" ] && BUDGET_ARGS+=(--history-messages "$HISTORY_MESSAGES")
 [ -n "${IMAGE_KEEP:-}" ] && BUDGET_ARGS+=(--image-keep "$IMAGE_KEEP")
+# Two-role release gate (same weights, fresh verifier context). VERIFIER=1 on,
+# VERIFIER_THINKING=1 additionally gives ONLY the verifier call a reasoning block.
+GATE_ARGS=()
+[ "${VERIFIER:-0}" = "1" ] && GATE_ARGS+=(--verifier)
+[ "${VERIFIER_THINKING:-0}" = "1" ] && GATE_ARGS+=(--verifier-thinking)
 
 echo "==> running $EPISODES episode(s) with $LOAD model (log: $AGENT_LOG)"
 set +e
@@ -95,6 +100,7 @@ ARM_AGENT_MODEL_DIR="$MODEL_DIR" \
     --model-dir "$MODEL_DIR" --load "$LOAD" --gpu-mem-gib "$GPU_MEM_GIB" \
     --max-new-tokens "$MAX_NEW_TOKENS" --prompt-mode "$PROMPT_MODE" \
     "${BUDGET_ARGS[@]}" \
+    "${GATE_ARGS[@]}" \
     "${RECORD_ARGS[@]}" 2>&1 | tee "$AGENT_LOG"
 status=${PIPESTATUS[0]}
 set -e

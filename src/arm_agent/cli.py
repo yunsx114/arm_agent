@@ -99,6 +99,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         attach_images=not args.no_images,
         prompt_mode=args.prompt_mode,
         tool_protocol=args.tool_protocol,
+        verifier=args.verifier,
+        verifier_thinking=True if args.verifier_thinking else None,
         history_messages=args.history_messages,
         image_keep=args.image_keep,
     )
@@ -106,7 +108,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"[run] history_messages={harness.history_messages} "
         f"image_keep={harness.image_keep} prompt_mode={harness.prompt_mode} "
         f"tool_protocol={harness.tool_protocol} "
-        f"thinking={model.enable_thinking} max_new_tokens={model.max_new_tokens}",
+        f"thinking={model.enable_thinking} max_new_tokens={model.max_new_tokens} "
+        f"verifier={harness.verifier_enabled} verifier_thinking={harness.verifier_thinking}",
         flush=True,
     )
 
@@ -230,6 +233,17 @@ def main(argv: list[str] | None = None) -> int:
         help="turn on the chat template's reasoning block. Off by default: it costs "
         "1-3k tokens/turn (~30-70 s here) and can eat max-new-tokens before the "
         "tool call is emitted. Raise --max-new-tokens when using it.",
+    )
+    p.add_argument(
+        "--verifier",
+        action="store_true",
+        help="two-role release gate: a fresh-context verifier (same weights) must "
+        "approve every `gripper open` issued while carrying a payload.",
+    )
+    p.add_argument(
+        "--verifier-thinking",
+        action="store_true",
+        help="give ONLY the verifier call the reasoning block (executor stays off)",
     )
     p.add_argument("--video-fps", type=int, default=2)
     p.add_argument("--video-dir", default=str(REPO / "outputs" / "videos"))

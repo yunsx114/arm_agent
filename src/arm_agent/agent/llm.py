@@ -146,23 +146,38 @@ class QwenAgentModel:
             return transformers.AutoModelForCausalLM
 
     # ------------------------------------------------------------------ chat
-    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> str:
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        *,
+        thinking: bool | None = None,
+        max_new_tokens: int | None = None,
+    ) -> str:
         """One assistant turn. `messages` follow the chat-template schema.
 
         Image content items must be {"type": "image", "image": PIL.Image};
         they are flattened out for the processor and re-referenced positionally,
         which is the order the chat template emits vision placeholders in.
+
+        `thinking` / `max_new_tokens` override the instance defaults for THIS call
+        only. That is what makes a two-role loop affordable: the executor keeps the
+        reasoning block off and a 384-token budget, while a rare verifier call can
+        turn it on with its own budget -- same weights, different context, no
+        reload and no second copy of the model.
         """
         import torch
 
         assert self._tokenizer is not None and self._model is not None
 
+        enable_thinking = self.enable_thinking if thinking is None else bool(thinking)
+        budget = self.max_new_tokens if max_new_tokens is None else int(max_new_tokens)
         images = _collect_images(messages, max_side=self.image_max_side)
         text = self._tokenizer.apply_chat_template(
             messages,
             tools=tools,
             tokenize=False,
-            enable_thinking=self.enable_thinking,
+            enable_thinking=enable_thinking,
             add_generation_prompt=True,
         )
 
@@ -202,7 +217,7 @@ class QwenAgentModel:
         inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
 
         gen_kwargs: dict[str, Any] = {
-            "max_new_tokens": self.max_new_tokens,
+            "max_new_tokens": budget,
             "eos_token_id": self._tokenizer.eos_token_id,  # E5: 248046, not the config's 248044
             "stop_strings": ["</tool_call>"],
             "tokenizer": self._tokenizer,

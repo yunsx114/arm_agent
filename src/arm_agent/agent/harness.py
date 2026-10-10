@@ -28,7 +28,12 @@ from arm_agent.agent.llm import prepare_for_model
 from arm_agent.agent.parser import (
     ToolCall, as_float, parse_tool_calls, truncate_to_first_call, validate_calls,
 )
-from arm_agent.agent.prompts import get_system_prompt, get_tool_schemas
+from arm_agent.agent.prompts import (
+    get_system_prompt,
+    get_tool_schemas,
+    get_verifier_prompt,
+    get_verifier_tools,
+)
 from arm_agent.agent.tool_protocol import canonical_name, structured_result
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
 
@@ -39,6 +44,11 @@ SKILLS_DIRNAME = "skills"
 # (keeping 1 would silently throw away half of the newest pair). Tokens: 2 x
 # 66 = 133 per turn, and only for the newest turn.
 HISTORY_IMAGE_KEEP = 2
+# The verifier replies with one `release` call and a one-sentence reason; with the
+# reasoning block off it needs ~120 tokens. Kept small on purpose: the format rule
+# for the verifier has no preamble, so anything larger only invites a monologue
+# that could get truncated before the call closes.
+VERIFIER_MAX_NEW_TOKENS = 512
 # Conversation cap. MEASURED (probe_gpu_memory.py): the OOM allocation was
 # exactly one full-attention N x N matrix (2900^2 * 16 heads * 2 bytes = 266 MiB)
 # — on this Turing card SDPA has no mem-efficient kernel, so attention memory
@@ -101,6 +111,8 @@ class Harness:
         tool_protocol: str = "v1",
         history_messages: int | None = None,
         image_keep: int | None = None,
+        verifier: bool = False,
+        verifier_thinking: bool | None = None,
     ) -> None:
         self.client = client
         self.model = model
@@ -139,6 +151,85 @@ class Harness:
         # that has already produced one false alarm that cost a whole episode
         # (a deliberate `open` reported as "物体掉了", 2026-10-10).
         self._grasped = False
+        # Two-role release gate. Same weights, DIFFERENT context: when the
+        # executor asks to open the gripper while carrying a payload, the harness
+        # suspends that context and asks a verifier (fresh message list, its own
+        # system prompt, one tool: `release`) whether the action is safe.
+        #
+        # Why a separate role instead of a prompt rule: measured 2026-10-10, the
+        # executor asserts arrival without checking (5/5 releases proceeded on a
+        # false "已到达篮子正上方"; 0/80 turns doubted the release position), and
+        # when the executor is asked the same question directly it answers
+        # correctly (8/8 single-turn, 4/4 at full run context with the reasoning
+        # block on, 3/4 with it off). The gate moves the question into the loop.
+        # Only `gripper open` while `_grasped` is gated -- an `open` on an empty
+        # hand is just part of a re-grasp cycle (22 of them in the last run).
+        self.verifier_enabled = bool(verifier)
+        self.verifier_thinking = verifier_thinking
+        self.verifier_schemas = get_verifier_tools()
+        self.verifier_prompt = get_verifier_prompt()
+        self.verifier_calls = 0
+        self._task_text = ""
+
+    # ------------------------------------------------------------- verifier
+    def _release_verdict(
+        self, executor_reply: str, images: dict[str, Any] | None
+    ) -> tuple[bool, str]:
+        """Ask the verifier role whether the pending `gripper open` may proceed.
+
+        Fresh context on purpose: the verifier sees the task, the two current
+        camera frames and the executor's own words -- and NOT the executor's
+        history, so it cannot inherit the executor's "already close enough"
+        narrative. Same weights, so this costs one prefill plus a short reply.
+
+        Fail-closed: a missing/garbled verdict rejects. Rejecting only costs one
+        more move; releasing wrongly drops the payload and ends the attempt.
+        """
+        pair = images or {}
+        content: list[dict[str, Any]] = []
+        for cam in ("agent", "wrist"):
+            frame = pair.get(cam)
+            if frame is not None:
+                content.append({"type": "image", "image": frame})
+        content.append(
+            {
+                "type": "text",
+                "text": (
+                    f"任务目标：{self._task_text}\n"
+                    "执行者现在请求执行的动作：张开夹爪（gripper open）放下物体。\n"
+                    "以下是执行者这一轮的完整自述（可能不准，以画面为准）：\n"
+                    "<执行者自述>\n"
+                    f"{executor_reply.strip()}\n"
+                    "</执行者自述>\n\n"
+                    "请按系统提示词里的唯一标准裁决，并只调用 release 工具一次。"
+                ),
+            }
+        )
+        messages = [
+            {"role": "system", "content": self.verifier_prompt},
+            {"role": "user", "content": content},
+        ]
+        self.verifier_calls += 1
+        try:
+            reply = self.model.chat(
+                messages,
+                tools=self.verifier_schemas,
+                thinking=self.verifier_thinking,
+                max_new_tokens=VERIFIER_MAX_NEW_TOKENS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"核验者调用失败（{type(exc).__name__}: {exc}），按最保守处理"
+        parsed = parse_tool_calls(reply)
+        for call in parsed:
+            if call.name == "release":
+                verdict = str((call.args or {}).get("verdict", "")).strip().lower()
+                reason = str((call.args or {}).get("reason", "")).strip()
+                if verdict == "approve":
+                    return True, reason
+                if verdict == "reject":
+                    return False, reason or "核验者未给出理由"
+                return False, f"核验者给出了无法识别的裁决 {verdict!r}：{reason}"
+        return False, f"核验者没有给出 release 调用（原文：{reply.strip()[:120]}）"
 
     # -------------------------------------------------------------- episode
     def run_episode(
@@ -158,6 +249,10 @@ class Harness:
             last_images = images
             result.task = obs.get("task", "")
             result.language = obs.get("language", "")
+            # The verifier role is told the goal in words, not by replaying the
+            # episode: its whole point is a context that does NOT inherit the
+            # executor's narrative.
+            self._task_text = result.language or result.task
             if recorder is not None:
                 recorder.task = result.language or result.task
                 recorder.record(
@@ -255,6 +350,44 @@ class Harness:
                 call = calls[0]
                 result.tool_calls += 1
                 self._say(f"[turn {turn}] {call.name} {call.args}")
+
+                # ---- release gate (two-role: executor context -> verifier) ----
+                # Runs BEFORE the tool is dispatched: a rejected release must not
+                # touch the arm. The executor's own context is untouched while the
+                # verifier runs, so it resumes exactly where it left off.
+                _pending = canonical_name(str(call.name))
+                if (
+                    self.verifier_enabled
+                    and _pending == "gripper"
+                    and str((call.args or {}).get("action", "")).strip().lower() == "open"
+                    and self._grasped
+                ):
+                    t_v0 = time.time()
+                    approved, reason = self._release_verdict(reply, last_images)
+                    self._say(
+                        f"[turn {turn}] gate: {'放行' if approved else '拒绝'} "
+                        f"({time.time() - t_v0:.1f}s) {reason[:80]}"
+                    )
+                    if not approved:
+                        note = (
+                            "[释放被否决] 核验者没有放行这次 gripper open，动作**未执行**。"
+                            f"理由：{reason}\n"
+                            "物体还在夹爪上。请先按上面的理由修正位置，"
+                            "确认容器开口在夹爪正下方后再请求放行。"
+                        )
+                        messages.append({"role": "user", "content": note})
+                        transcript.append({"turn": turn, "gate_reject": reason})
+                        if recorder is not None:
+                            recorder.record(
+                                turn,
+                                reply=reply,
+                                tool_call=f"{_fmt_call(call)} → 被核验者否决",
+                                result=note,
+                                status="释放被否决",
+                                status_color=RED,
+                                images=last_images,
+                            )
+                        continue
 
                 try:
                     t_tool0 = time.time()
