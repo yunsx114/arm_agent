@@ -119,29 +119,25 @@ class Harness:
         self.legacy_tools = str(tool_protocol).lower() != "v2"
         self.skills_dir = self.workspace / SKILLS_DIRNAME
         self.skills_dir.mkdir(parents=True, exist_ok=True)
-        # Last observed grip offset, used to detect the payload creeping out of
-        # the pads (see the slip-trend block in run_episode).
-        self._prev_gap: float | None = None
-        # Grasp state as of the PREVIOUS turn, so the loop can tell a first
-        # `close` from a repeat one (the latter squeezes an already-held object).
-        self._prev_grasped = False
-        # Set when a `set_gripper close` actually closed ON something, cleared
-        # by `open`. MEASURED (P0a): without this flag the slip/"dropped"
-        # checks fire on pure proximity -- the gripper parked 5.5 cm above the
-        # untouched can was reported as "快滑脱" 7 times and "物体掉了" 5 times
-        # in one 60-turn run, and the model then hunted for a can that had never
-        # moved. A grasp is a fact about the GRIPPER, not about a distance.
+        # Grasp state, taken from the gripper's own verdict ("holding" in the
+        # adapter note) and NEVER inferred from distance. MEASURED (P0a): the
+        # proximity rule reported the pads parked 5.5 cm above an untouched can
+        # as holding it -- 7 "slip" + 5 "dropped" false alarms in one run.
+        #
+        # This is the loop's ONLY piece of cross-turn state, and it stays because
+        # the observation carries no contact sensor: `format_state` needs it to
+        # decide whether to look for an object in the pads at all.
+        #
+        # DELETED 2026-10-10: `_prev_gap` (grip-slip trend / "物体掉了" event),
+        # `_prev_grasped` (the two self-harm warnings) and `_last_width` (the
+        # "you closed on already-shut pads" fact). Each derived an event the
+        # model can now read straight out of its own history -- and each was
+        # justified in its comment by "the model cannot see this by itself,
+        # because history is capped at MAX_HISTORY_MESSAGES". That cap is 32
+        # now, so the premise is gone; what is left is cross-turn bookkeeping
+        # that has already produced one false alarm that cost a whole episode
+        # (a deliberate `open` reported as "物体掉了", 2026-10-10).
         self._grasped = False
-        # Finger width as of the previous gripper call, so a `close` issued onto
-        # an ALREADY shut pair can be reported as the empty gesture it is.
-        self._last_width: float | None = None
-        # Per-turn flag: this turn's `close` was issued onto already-shut pads.
-        self._closed_on_air = False
-        # Per-turn flag: this turn deliberately opened the gripper. An `open`
-        # releases the payload ON PURPOSE, so it must NOT raise the "dropped"
-        # event -- otherwise the harness tells the model it lost the object and
-        # the model goes back to re-grasp something it just put down.
-        self._released = False
 
     # -------------------------------------------------------------- episode
     def run_episode(
@@ -302,8 +298,6 @@ class Harness:
                 # Same class of bug as P0d (a value from another vocabulary), found
                 # this time by reading, before it could mislead a run.
                 _tool = canonical_name(str(outcome.get("tool", "")))
-                self._closed_on_air = False
-                self._released = False
                 obs = outcome["obs"]
                 if outcome.get("images"):
                     last_images = outcome["images"]
@@ -345,124 +339,60 @@ class Harness:
                 if _tool == "gripper":
                     _action = (outcome.get("requested") or {}).get("action")
                     _note = str(outcome.get("note", ""))
-                    _width = _grip_width(_note)
                     if _action == "open":
                         self._grasped = False
-                        self._released = True
                     elif _action == "close":
                         # "holding" is the adapter's verdict; "empty" is air.
                         self._grasped = "holding" in _note
-                        # A `close` issued while the pads were ALREADY shut cannot
-                        # grasp anything by construction -- it can only push. This
-                        # is a measurement difference the width alone does not
-                        # show, so state it as a fact (no advice).
-                        # MEASURED 2026-10-10: 25 of 26 closes came back
-                        # "empty (0.0005)" and the model re-issued close every
-                        # time; the shut pads shoved the can 4-6 cm per descend
-                        # until it left the arm's reach, for 80 turns.
-                        if (
-                            _width is not None
-                            and _width <= GRIPPER_EMPTY_WIDTH
-                            and self._last_width is not None
-                            and self._last_width <= GRIPPER_EMPTY_WIDTH
-                        ):
-                            self._closed_on_air = True
-                    if _width is not None:
-                        self._last_width = _width
 
-                # Facts about SELF-INFLICTED harm -- the kind the model cannot
-                # infer from a width or a z error.
-                #
-                # MEASURED (P0c' t3-t7): the model gripped the can (width 0.0230),
-                # lifted it, then ran `descend_to(can, 1.2)` and a SECOND `close`
-                # (width went 0.0230 -> 0.0206, i.e. the pads closed further and
-                # SQUEEZED the payload), and the can fell out on the next lift.
-                # Closing again on an object you already hold is not idempotent:
-                # it crimps it. And descending onto the object in your own pads
-                # presses it against the table. Neither is visible in the numbers.
-                hurt = ""
-                if _tool == "gripper" and self._grasped and self._prev_grasped:
-                    hurt = (
-                        "\n⚠ 你上一轮已经夹住它了——这次 close 让指垫又闭合了一点"
-                        "（指宽变小 = 在挤压它，可能把它挤出去）。"
-                    )
-                elif _tool == "approach" and self._prev_grasped:
-                    # Fires on the TOOL NAME, not an adapter kind string. See the
-                    # note at the top of this loop: the previous test used
-                    # "descend" and never once matched.
-                    hurt = "\n⚠ 你手里已经夹着它——这次下降是在把它往桌面上压，不是在抓它。"
-
+                # Deleted 2026-10-10: two cross-turn "self-inflicted harm"
+                # warnings (you are squeezing your own payload / you are pressing
+                # it into the table). Their stated justification was "the model
+                # cannot infer this from the numbers" -- true while history was
+                # capped at 4 messages, false now that it holds 32: the previous
+                # turn's `close` verdict and the model's own last action are both
+                # still in the conversation. They were also the most prescriptive
+                # text in the loop ("可能把它挤出去"), which is exactly what v2 is
+                # supposed to leave to the model. The FACTS they depended on
+                # (open before close; do not descend onto your own payload) now
+                # live in the system prompt instead.
                 content: list[dict[str, Any]] = []
                 if outcome.get("image") is not None and self.attach_images:
                     content.append({"type": "image", "image": outcome["image"]})
 
-                # Grip-slip TREND, not just the current value.
+                # Deleted 2026-10-10: the grip-slip TREND tracker and its
+                # "⛔ 物体掉了" event (`_prev_gap` + `_hold_gap`).
                 #
-                # MEASURED (v12/v13): the can crept 2.8 -> 3.1 -> 4.3 cm off the
-                # gripper centre across three `+y 15` carries and fell off on the
-                # fourth (the basket is 48 cm from the pick point and one `move`
-                # is capped at 15 cm, so the carry is necessarily 4 pushes).
-                # A static threshold cannot catch this: 3.1 cm looks harmless.
-                # And the model cannot see the trend by itself -- history is
-                # capped at MAX_HISTORY_MESSAGES, so it only ever sees the most
-                # recent number. Compute the delta here and say it out loud.
-                gap = _hold_gap(obs) if self._grasped else None
-                slip = ""
-                if gap is None:
-                    if self._prev_gap is not None and not self._released:
-                        # THE event that matters. MEASURED (v14 t16): the can was
-                        # in the pads on t13 (gap 3.1 cm) and simply gone on t16.
-                        # The distance-trend check below can NEVER fire for this:
-                        # the moment the payload leaves the pads it also leaves
-                        # `_carried_name`'s 6 cm radius, so `gap` jumps to None
-                        # and there is no sample between "3.1 cm" and "gone".
-                        # v12 only looked detectable because that run happened to
-                        # dawdle at 4.3 cm for a turn.
-                        # Detect the DISAPPEARANCE, not just the drift.
-                        #
-                        # `and not self._released` is the fix for a false alarm
-                        # that costs whole episodes: MEASURED (2026-10-10) the
-                        # model opened the gripper over the table (a deliberate
-                        # release) and the harness answered "⛔ 物体掉了", so the
-                        # model turned around and spent the remaining 70 turns
-                        # re-grasping what it had just put down. v4 in
-                        # docs/P0_stripdown.md died the same way.
-                        slip = "\n⛔ **物体掉了**（上一轮还在夹爪里）。"
-                    self._prev_gap = None
-                    # The grip is gone: stop calling it a grasp. Without this the
-                    # episode loop kept `_grasped=True` for the rest of the run,
-                    # so any moment the (now stationary) object happened to be
-                    # within 6 cm of the pads re-armed `_prev_gap` and produced
-                    # another "物体掉了" -- MEASURED (P0d): 8 such false alarms,
-                    # and the model spent the episode "looking for the can" it
-                    # was actually standing next to.
-                    self._grasped = False
-                else:
-                    # P0b: only the DISAPPEARANCE event is reported (a fact).
-                    # The drift thresholds (3mm / 3.8cm) were numbers I fitted to
-                    # v12/v14, and their messages prescribed what to do.
-                    self._prev_gap = gap
+                # It was built because "the model cannot see the trend by itself --
+                # history is capped at MAX_HISTORY_MESSAGES, so it only ever sees
+                # the most recent number". With 32 messages of history the model
+                # can compare this turn's `爪上：` line with the previous one
+                # itself, and `format_state` still reports the raw fact
+                # (爪上：空 / 爪上：<物体>（离爪心 Xcm）) every single turn, so
+                # nothing becomes unobservable.
+                #
+                # What it cost: a DELIBERATE `open` measured as a lost payload
+                # (`open` clears `_grasped` -> gap None -> `_prev_gap` still set),
+                # so the harness answered "物体掉了" to a model that had just put
+                # the can down on purpose -- and the model spent the remaining 70
+                # turns re-grasping it instead of walking to the basket
+                # (MEASURED 2026-10-10; v4 in docs/P0_stripdown.md died the same
+                # way). Cross-turn inference that the model can do itself is a
+                # liability, not a safety net.
                 content.append({
                     "type": "text",
                     "text": (
                         outcome["text"] + "\n"
                         + json.dumps(outcome["result"], ensure_ascii=False, separators=(",", ":"))
-                        + "\n" + format_state(obs, self._grasped) + slip + hurt
-                        + (
-                            "\n（本次 close 之前两指就已经完全闭合 —— 空夹，指间没有物体；"
-                            "这种状态下下降只会把物体推开。）"
-                            if self._closed_on_air
-                            else ""
-                        )
+                        + "\n" + format_state(obs, self._grasped)
                     ),
                 })
                 messages.append({"role": "user", "content": content})
                 transcript.append({
                     "turn": turn,
-                    "result": outcome["text"] + slip + hurt,
+                    "result": outcome["text"],
                     "structured_result": outcome["result"],
                 })
-                self._prev_grasped = self._grasped
 
         except Exception as exc:  # noqa: BLE001 - keep episode artifacts even on crash
             result.error = result.error or f"episode failed: {type(exc).__name__}: {exc}"
@@ -825,19 +755,13 @@ class Harness:
                 f"  机械爪当前: ({eef[0]:+.4f}, {eef[1]:+.4f}, {eef[2]:+.4f}) m",
                 f"  偏差（物体 - 机械爪）: dx={dx * 100:+.1f}cm, dy={dy * 100:+.1f}cm, dz={dz * 100:+.1f}cm",
             ]
-        # Proximity warning. MEASURED (probe_descend_near_basket): descending
-        # within 4 cm of the basket shoves it 10-37 mm, while at >=6 cm it is
-        # untouched -- i.e. a re-grasp next to the basket reliably knocks it over
-        # (that is what killed the v5/v6 runs). Tell the model BEFORE it descends.
-        for other_name, other_pos in (obs.get("objects") or {}).items():
-            if other_name == match:
-                continue
-            d_xy = float(np.linalg.norm(np.asarray(other_pos, dtype=float)[:2] - np.asarray(pos, dtype=float)[:2]))
-            if d_xy < 0.07:
-                # P0b: report the neighbour and its distance -- a measurement.
-                # Dropped the 4cm/6cm thresholds, the "10-37mm" figure and the
-                # "push it away first" recipe: all scene constants or recipes.
-                lines.append(f"  附近还有 {other_name}，距它 {d_xy * 100:.1f}cm")
+        # Deleted 2026-10-10: the "附近还有 <物体>，距它 Xcm" proximity warning.
+        # It compared the queried object against every OTHER object in the scene
+        # and reported pairs closer than a fitted 7 cm. The model can ask for any
+        # object's coordinates itself (`observe` with that target), so this was
+        # the harness doing a second query and a distance subtraction on its
+        # behalf -- i.e. the same "derive what the model can derive" pattern as
+        # the slip/hurt trackers, with a scene constant (0.07 m) thrown in.
         return "\n".join(lines)
 
     def _skills_index(self) -> str:
@@ -923,25 +847,6 @@ def _carried_name(obs: dict[str, Any], tol_m: float = 0.06) -> str | None:
         if d < best_d:
             best, best_d = name, d
     return best if best_d < tol_m else None
-
-
-def _hold_gap(obs: dict[str, Any]) -> float | None:
-    """Distance from the gripper centre to the object riding in the pads.
-
-    This is the grip-slip indicator. None when nothing is held.
-    """
-    import numpy as _np
-
-    held = _carried_name(obs)
-    if not held:
-        return None
-    pos = (obs.get("objects") or {}).get(held)
-    if pos is None:
-        return None
-    eef = obs.get("eef_pos")
-    if eef is None:
-        return None
-    return float(_np.linalg.norm(_np.asarray(pos, dtype=float) - _np.asarray(eef, dtype=float)))
 
 
 def format_state(obs: dict[str, Any], grasped: bool = False) -> str:
