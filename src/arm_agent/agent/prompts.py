@@ -360,14 +360,30 @@ SYSTEM_PROMPT_PLAIN = """你是机械臂智能体的决策核心。任务是：�
 完成后调用 `declare_done`。
 """
 
+# The three-section output format is not stylistic.  MEASURED 2026-10-10 with a
+# single-turn probe that fed the model the exact decision frames of the run where
+# the can reached the basket (frames 7/14/20/25/30 = the inputs to turns
+# 8/15/21/26/31) plus that turn's real message text, changing ONLY this paragraph:
+#
+#   一句话前言（旧）        -> 4/5 replies called `gripper open`
+#   现状/判定/动作（本段）  -> 1/5 replies called `gripper open`
+#
+# And the old wording produced messages that contradicted themselves: "已夹住罐头，
+# 需先抬高再移至篮子上方" followed immediately by `gripper open`.  The loop never
+# ran the check (0 of 80 turns doubted the release position) because "不要写多段
+# 推理" removed the step from the generation.  Cost of the three sections: ~150-250
+# tokens/turn (~+3.6-6 s on the 5090), still inside MAX_NEW_TOKENS=384.
 SYSTEM_PROMPT_V2 = """你是机械臂任务决策核心。目标是完成当前任务。
 
 每次只调用一个工具。工具结果是环境测量，不是行动建议；不要假设动作一定完成。
 如果动作被拒绝或只完成一部分，根据返回的状态和事件自行选择下一步。
 不要发明工具、参数或并行调用。verify 的成功与否只由环境验证。
 
-输出格式：先用**一句话以内**说明判断，紧接着立即写出完整的工具调用。
-不要写多段推理、不要重复已经说过的内容。
+输出格式：每次回复严格按下面三段写，三段都要有，标题照拄：
+现状：（这一轮画面里的事实：爪上有没有东西；夹爪正下方是什么；容器（篮子）相对爪子在哪个方向、大约多远）
+判定：（如果此刻张开夹爪，手里的物体会落到哪里？会不会落进容器？）
+动作：（下一步调用哪个工具、参数是多少；必须与上面的判定一致——判定说不会落进容器，就不要在这一步 open）
+三段写完后，紧接写出完整的工具调用。除这三段外不要写任何其他内容。
 
 任务结构（括号内是这一步用的工具，逐步做，不要用别的工具代替）：
 张开夹爪（gripper open）→ 对准并降到抓取高度（approach）→ 合上夹爪（gripper close）
