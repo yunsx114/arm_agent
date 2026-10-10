@@ -87,7 +87,8 @@ if want libero; then
     fi
 
     if env_exists "$ENV_SIM"; then
-        if PYTHONNOUSERSITE=1 "$PY_SIM" -c "import libero, robosuite, mujoco" 2>/dev/null; then
+        if PYTHONNOUSERSITE=1 PYTHONPATH="$ARM_AGENT_DIR/third_party/LIBERO" \
+           MUJOCO_GL=egl "$PY_SIM" -c "import libero, robosuite, mujoco" 2>/dev/null; then
             v=$("$PY_SIM" -c "import mujoco, robosuite; print(f'mujoco {mujoco.__version__}, robosuite {robosuite.__version__}')")
             report "sim env imports" 0 "$v"
         else
@@ -95,8 +96,8 @@ if want libero; then
             # the EGL library paths, `import mujoco` raises
             # "Cannot initialize a EGL device display", which reads like a broken
             # GPU stack and is really just a missing LD_LIBRARY_PATH.
-            if LD_LIBRARY_PATH=$GL_LIB LIBGL_DRIVERS_PATH=$GL_DRI \
-               MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=1 \
+            if PYTHONPATH="$ARM_AGENT_DIR/third_party/LIBERO" \
+               MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 \
                PYTHONNOUSERSITE=1 "$PY_SIM" -c "import libero, robosuite, mujoco" 2>/dev/null; then
                 report "sim env imports" 0 "OK with EGL env (must run via scripts/simenv.sh)"
             else

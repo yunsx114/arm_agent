@@ -73,6 +73,29 @@ RECORD=1 bash scripts/run_m1_on_gpu.sh 1        # 每个 episode 生成一个 mp
 RECORD=1 MAXTURNS=6 bash scripts/run_m1_on_gpu.sh 1   # 短冒烟
 ```
 
+### 单节点运行（RTX 5090）
+
+当前机器可以让 LIBERO 模拟器和 Qwen3.5 推理在同一节点运行，使用本机
+TCP，避免 Slurm、跨节点通信和 NFS 文件轮询：
+
+```bash
+# 创建或更新 qwen35 环境（包含 FLA 和 causal-conv1d fast path）
+bash scripts/setup_agent_env.sh
+
+# 默认使用 4bit；模型目录可通过 ARM_AGENT_MODEL_DIR 覆盖
+bash scripts/run_single_node.sh 1
+
+# 32GB 显存下使用 BF16
+LOAD=bf16 GPU_MEM_GIB=29 bash scripts/run_single_node.sh 1
+
+# 短冒烟并保存视频
+RECORD=1 MAXTURNS=6 bash scripts/run_single_node.sh 1
+```
+
+日志位于 `outputs/logs/single_node_server.log` 和
+`outputs/logs/single_node_agent.log`。默认使用硬件 EGL；旧环境需要 Mesa
+软件 EGL 时可设置 `SIM_EGL_MODE=software`。
+
 画面布局：左侧上=agentview、下=wrist 双相机；右侧为本轮模型输出文字、解析出的工具调用、工具执行结果（含实测数字）与状态。
 **成功 / 失败 / OOM / 崩溃都会录制**：录制器每轮先把合成帧写成 PNG（硬崩溃也不丢），finalize 时才编码 mp4，成功编码后清理 PNG。
 若进程被强杀导致没有 mp4，可用帧目录补编码：

@@ -26,10 +26,25 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/_common.sh
 source "$HERE/_common.sh"
 
-export PYTHONPATH=$ARM_AGENT_DIR/src${PYTHONPATH:+:$PYTHONPATH}
-export LD_LIBRARY_PATH=$GL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-export LIBGL_DRIVERS_PATH=$GL_DRI
+export PYTHONPATH=$ARM_AGENT_DIR/src:$ARM_AGENT_DIR/third_party/LIBERO${PYTHONPATH:+:$PYTHONPATH}
+# The original cluster needed Mesa software EGL on its login node.  A local
+# NVIDIA node should use the driver's EGL implementation instead; prepending
+# Mesa here makes MuJoCo select the wrong platform and fail on RTX 5090.
+SIM_EGL_MODE=${SIM_EGL_MODE:-hardware}
+if [ "$SIM_EGL_MODE" = "software" ]; then
+    export LD_LIBRARY_PATH=$GL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    export LIBGL_DRIVERS_PATH=$GL_DRI
+    export MUJOCO_EGL_DEVICE_ID=${MUJOCO_EGL_DEVICE_ID:-1}
+elif [ "$SIM_EGL_MODE" = "hardware" ]; then
+    unset LIBGL_DRIVERS_PATH
+    export MUJOCO_EGL_DEVICE_ID=${MUJOCO_EGL_DEVICE_ID:-0}
+else
+    echo "SIM_EGL_MODE must be 'hardware' or 'software', got: $SIM_EGL_MODE" >&2
+    exit 2
+fi
 export MUJOCO_GL=egl
-export MUJOCO_EGL_DEVICE_ID=${MUJOCO_EGL_DEVICE_ID:-1}
+# LIBERO stores trusted NumPy-backed init states as legacy torch pickles.
+# PyTorch >=2.6 defaults torch.load to weights_only=True, which rejects them.
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 
 exec "$PY_SIM" "$@"
