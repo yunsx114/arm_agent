@@ -42,7 +42,11 @@ class QwenAgentModel:
         self.model_dir = str(model_dir)
         self.load = load
         self.gpu_mem_gib = gpu_mem_gib
-        self.max_new_tokens = max_new_tokens
+        # Coerce here as well as in argparse: a str reaching generate() fails
+        # deep inside with "'<=' not supported between instances of 'str' and
+        # 'int'". Cost one whole run on 2026-10-10 -- a missing `type=int` on
+        # --max-new-tokens shipped the string "384" all the way down.
+        self.max_new_tokens = int(max_new_tokens)
         self.temperature = temperature
         # Image tokens and vision-tower activations scale with pixel count:
         # 256px frames measured OOM at turn 12-17 on the 10.57 GiB card, 160px

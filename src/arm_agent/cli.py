@@ -187,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--max-new-tokens",
+        type=int,
         default=384,
         help="per-turn reply budget. 160 was too small: the model's Chinese "
         "preamble ate it and the tool call was cut off mid-XML (18 of 19 "
