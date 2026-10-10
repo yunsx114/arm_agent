@@ -185,7 +185,13 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="shard the model across N GPUs via device_map=auto (gpu026 offers >=2)",
     )
-    p.add_argument("--max-new-tokens", type=int, default=160)
+    p.add_argument(
+        "--max-new-tokens",
+        default=384,
+        help="per-turn reply budget. 160 was too small: the model's Chinese "
+        "preamble ate it and the tool call was cut off mid-XML (18 of 19 "
+        "retries in one 80-turn run).",
+    )
     p.add_argument("--timeout", type=float, default=600.0, help="per-IPC-call timeout")
     p.add_argument("--wait-server", type=float, default=120.0)
     p.add_argument("--no-images", action="store_true", help="text-only ablation")

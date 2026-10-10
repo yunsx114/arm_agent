@@ -213,6 +213,16 @@ class Harness:
                 call_errors = validate_calls(calls, legacy=self.legacy_tools)
                 if call_errors:
                     result.protocol_retries += 1
+                    # Tell a CUT-OFF reply apart from one that simply has no tool
+                    # call. MEASURED (2026-10-10, 80-turn run): 18 of 19 retries
+                    # were truncations at `--max-new-tokens 160` -- the model's
+                    # Chinese preamble consumed the budget and the XML never
+                    # reached `</tool_call>`. `got_0` alone hid that.
+                    if not calls and "</tool_call>" not in reply:
+                        call_errors = [
+                            "reply_cut_off_before_tool_call_closed:"
+                            "raise --max-new-tokens or write less preamble"
+                        ]
                     note = (
                         f"工具协议错误：{', '.join(call_errors)}。"
                         "请只输出一个合法工具调用，并修正参数。"
