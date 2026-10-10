@@ -392,9 +392,9 @@ class Harness:
                         note = (
                             "[释放被否决] 核验者没有放行这次 gripper open，动作**未执行**。"
                             f"理由：{reason}\n"
-                            "物体还在夹爪上。请优先执行理由里建议的那个工具（若它给了 "
-                            "`approach(容器, 15)` 就照做一次，不要用一连串 move 去凑两轴位置）；"
-                            "对准之后再请求放行。"
+                            "物体还在夹爪上。请优先执行理由里建议的那个工具（若它建议「先 `move +z`"
+                            "抬高、再 `approach(容器, 20)`」就照做：抬高是为了让物体底部越过容器口沿 "
+                            "z≈0.115，否则下一次 approach 还会把容器推走）；对准之后再请求放行。"
                         )
                         messages.append({"role": "user", "content": note})
                         transcript.append({"turn": turn, "gate_reject": reason})
