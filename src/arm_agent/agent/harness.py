@@ -132,6 +132,11 @@ class Harness:
         # in one 60-turn run, and the model then hunted for a can that had never
         # moved. A grasp is a fact about the GRIPPER, not about a distance.
         self._grasped = False
+        # Finger width as of the previous gripper call, so a `close` issued onto
+        # an ALREADY shut pair can be reported as the empty gesture it is.
+        self._last_width: float | None = None
+        # Per-turn flag: this turn's `close` was issued onto already-shut pads.
+        self._closed_on_air = False
 
     # -------------------------------------------------------------- episode
     def run_episode(
@@ -292,6 +297,7 @@ class Harness:
                 # Same class of bug as P0d (a value from another vocabulary), found
                 # this time by reading, before it could mislead a run.
                 _tool = canonical_name(str(outcome.get("tool", "")))
+                self._closed_on_air = False
                 obs = outcome["obs"]
                 if outcome.get("images"):
                     last_images = outcome["images"]
@@ -333,11 +339,29 @@ class Harness:
                 if _tool == "gripper":
                     _action = (outcome.get("requested") or {}).get("action")
                     _note = str(outcome.get("note", ""))
+                    _width = _grip_width(_note)
                     if _action == "open":
                         self._grasped = False
                     elif _action == "close":
                         # "holding" is the adapter's verdict; "empty" is air.
                         self._grasped = "holding" in _note
+                        # A `close` issued while the pads were ALREADY shut cannot
+                        # grasp anything by construction -- it can only push. This
+                        # is a measurement difference the width alone does not
+                        # show, so state it as a fact (no advice).
+                        # MEASURED 2026-10-10: 25 of 26 closes came back
+                        # "empty (0.0005)" and the model re-issued close every
+                        # time; the shut pads shoved the can 4-6 cm per descend
+                        # until it left the arm's reach, for 80 turns.
+                        if (
+                            _width is not None
+                            and _width <= GRIPPER_EMPTY_WIDTH
+                            and self._last_width is not None
+                            and self._last_width <= GRIPPER_EMPTY_WIDTH
+                        ):
+                            self._closed_on_air = True
+                    if _width is not None:
+                        self._last_width = _width
 
                 # Facts about SELF-INFLICTED harm -- the kind the model cannot
                 # infer from a width or a z error.
@@ -409,6 +433,12 @@ class Harness:
                         outcome["text"] + "\n"
                         + json.dumps(outcome["result"], ensure_ascii=False, separators=(",", ":"))
                         + "\n" + format_state(obs, self._grasped) + slip + hurt
+                        + (
+                            "\n（本次 close 之前两指就已经完全闭合 —— 空夹，指间没有物体；"
+                            "这种状态下下降只会把物体推开。）"
+                            if self._closed_on_air
+                            else ""
+                        )
                     ),
                 })
                 messages.append({"role": "user", "content": content})
