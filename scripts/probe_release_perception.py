@@ -84,6 +84,27 @@ NEUTRAL_SYSTEM = (
     "你是一个机器人视觉助手。你只能依据给出的画面来回答，画面里看不出来的事情就直接说看不到，不要臆测。"
 )
 
+# --- CoT experiment ---------------------------------------------------------
+# v2's system prompt currently FORBIDS multi-part reasoning:
+#     "输出格式：先用**一句话以内**说明判断，紧接着立即写出完整的工具调用。
+#      不要写多段推理、不要重复已经说过的内容。"
+# The single-turn probes showed the model CAN judge "容器不在正下方" when asked --
+# but in the loop it never runs that check (0/80 turns doubted the release
+# alignment) and instead emits a one-line preamble that contradicts the judgment.
+# So the test is whether forcing a written 判定 section makes the call follow it.
+V2_FORMAT_OLD = (
+    "输出格式：先用**一句话以内**说明判断，紧接着立即写出完整的工具调用。\n"
+    "不要写多段推理、不要重复已经说过的内容。"
+)
+
+V2_FORMAT_COT = (
+    "输出格式：每次回复严格按下面三段写，三段都要有，标题照拄：\n"
+    "现状：（这一轮画面里的事实：爪上有没有东西；夹爪正下方是什么；容器（篮子）相对爪子在哪个方向、大约多远）\n"
+    "判定：（如果此刻张开夹爪，手里的物体会落到哪里？会不会落进容器？）\n"
+    "动作：（下一步调用哪个工具、参数是多少；必须与上面的判定一致——判定说不会落进容器，就不要在这一步 open）\n"
+    "三段写完后，紧接写出完整的工具调用。除这三段外不要写其他内容。"
+)
+
 # The `leading` wording above contains "是否就在夹爪的正下方？如果不在，请说明方位",
 # which presupposes "not below" as a live answer -- and the t32 control shows the
 # model will say "not below" even when it IS below, so that wording cannot by
@@ -138,6 +159,127 @@ def measured() -> dict[int, str]:
     return out
 
 
+def loop_action(turn: int) -> str:
+    """What the 80-turn run actually called at `turn` (for the A/B comparison)."""
+    import json as _json
+    import re as _re
+
+    d = _json.load(open(EPISODE))
+    for e in d["transcript"]:
+        if e.get("turn") != turn or "assistant" not in e:
+            continue
+        m = _re.search(r"<function=(\w+)>", e["assistant"])
+        params = dict(_re.findall(r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", e["assistant"], _re.S))
+        return f"{m.group(1) if m else '?'} {params}"
+    return "-"
+
+
+def turn_result_text(turn: int) -> str:
+    """The user-visible tool result the model read when it decided the NEXT turn."""
+    import json as _json
+
+    d = _json.load(open(EPISODE))
+    out = ""
+    for e in d["transcript"]:
+        if e.get("turn") == turn and "result" in e:
+            out = e["result"]
+    return out
+
+
+_GRIP_OPEN, _GRIP_EMPTY = 0.034, 0.006
+_WIDTH_RE = None
+
+
+def _width(turn: int, keep: dict | None = None) -> float | None:
+    import json as _json
+    import re as _re
+
+    txt = turn_result_text(turn)
+    m = _re.search(r"finger width ([\d.]+)", txt)
+    return float(m.group(1)) if m else None
+
+
+def width_timeline() -> dict[int, float | None]:
+    """Finger width per turn, carrying the last gripper reading forward.
+
+    Only gripper actions print "finger width"; the live `format_state` line prints
+    it every turn from the current qpos, so the value has to be carried forward or
+    move/approach turns read as 未知.
+    """
+    import json as _json
+
+    d = _json.load(open(EPISODE))
+    last: float | None = None
+    out: dict[int, float | None] = {}
+    for e in sorted((x for x in d["transcript"] if "turn" in x), key=lambda x: x["turn"]):
+        w = _width(e["turn"])
+        if w is not None:
+            last = w
+        out[e["turn"]] = last
+    return out
+
+
+def grasp_timeline() -> dict[int, bool]:
+    """Reproduce harness `_grasped`: set by a `close` that bit something, cleared by `open`."""
+    import json as _json
+
+    d = _json.load(open(EPISODE))
+    state = False
+    out: dict[int, bool] = {}
+    entries = sorted((e for e in d["transcript"] if "turn" in e), key=lambda e: e["turn"])
+    for e in entries:
+        # `verify` turns carry no structured_result, so the state has to be
+        # carried forward across them rather than dropped.
+        sr = e.get("structured_result") or {}
+        action = (sr.get("requested") or {}).get("action")
+        w = _width(e["turn"])
+        if sr.get("tool") == "gripper" and action == "close":
+            state = bool(w is not None and _GRIP_EMPTY < w < _GRIP_OPEN)
+        elif sr.get("tool") == "gripper" and action == "open":
+            state = False
+        out[e["turn"]] = state
+    return out
+
+
+def reconstructed_message(turn: int, grasped: bool) -> str:
+    """Rebuild harness lines 408-415 verbatim: result text + json + format_state.
+
+    The episode transcript stores only `result` (the human sentence), so the other
+    two parts have to be rebuilt from the measurements; without this the probe
+    feeds a message that never says 爪上：<物体>, and the model reasonably concludes
+    "手里没有东西" -- which is an artefact of the probe, not of the model.
+    """
+    import json as _json
+
+    d = _json.load(open(EPISODE))
+    result_json = "{}"
+    eef = None
+    entry = None
+    for e in d["transcript"]:
+        if e.get("turn") == turn and "result" in e:
+            entry = e
+    if entry is not None:
+        sr = entry.get("structured_result") or {}
+        result_json = _json.dumps(sr, ensure_ascii=False, separators=(",", ":"))
+        eef = (sr.get("measurement") or {}).get("eef_end") or (sr.get("measurement") or {}).get("eef_start")
+
+    w = width_timeline().get(turn)
+    if w is None:
+        grip = "未知"
+    elif w >= _GRIP_OPEN:
+        grip = "张开"
+    elif w <= _GRIP_EMPTY:
+        grip = "闭合（空）"
+    else:
+        grip = "半闭（指间有物体）"
+    # The real line also carries the payload's distance from the gripper centre;
+    # that needs the live object pose, which the transcript does not store, so it
+    # is omitted (the load-bearing part is 爪上：<name> vs 爪上：空).
+    hold = "爪上：alphabet_soup" if grasped else "爪上：空（没有物体跟着手）"
+    where = f"({eef[0]:.4f}, {eef[1]:.4f}, {eef[2]:.4f})" if eef else "(未知)"
+    return f"{turn_result_text(turn)}\n{result_json}\n机械爪位置 {where} m；夹爪：{grip}；{hold}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--condition", choices=["neutral", "v2", "both"], default="both")
@@ -148,6 +290,15 @@ def main() -> int:
     # leading = the wording with "如果不在" (presupposes not-below);
     # open    = same three facts asked without presupposition.
     ap.add_argument("--question", choices=["leading", "open"], default="leading")
+    # input=question : images + an explicit question (labelled perception probe)
+    # input=result   : images + that turn's REAL tool-result text, no question at
+    #                  all -- this is what the loop actually feeds the model, so
+    #                  the only variable left is the output-format rule.
+    ap.add_argument("--input", choices=["question", "result"], default="question")
+    # Faithfulness: rebuild the full harness message (result + json + format_state)
+    # instead of the bare result sentence the transcript stores.
+    ap.add_argument("--no-state", action="store_true", help="omit the rebuilt format_state line")
+    ap.add_argument("--format", choices=["v2", "cot", "both"], default="v2")
     ap.add_argument("--load", default=os.environ.get("LOAD", "bf16"))
     ap.add_argument("--gpu-mem-gib", type=float, default=float(os.environ.get("GPU_MEM_GIB", 29)))
     args = ap.parse_args()
@@ -167,7 +318,12 @@ def main() -> int:
     if args.condition in ("v2", "both"):
         from arm_agent.agent.prompts import get_system_prompt
 
-        systems["v2"] = get_system_prompt("v2")
+        base = get_system_prompt("v2")
+        if V2_FORMAT_OLD not in base:
+            raise SystemExit("v2 format paragraph changed; update V2_FORMAT_OLD")
+        formats = ["v2", "cot"] if args.format == "both" else [args.format]
+        for fmt in formats:
+            systems[f"v2/{fmt}"] = base.replace(V2_FORMAT_OLD, V2_FORMAT_COT) if fmt == "cot" else base
 
     model = QwenAgentModel(
         model_dir=model_dir,
@@ -179,10 +335,19 @@ def main() -> int:
     )
     model.load_model()
 
+    if args.input == "result":
+        timeline = grasp_timeline()
     for name, system in systems.items():
         for turn in sorted(TURNS):
             agent, wrist = frames[turn]
-            question = QUESTION_OPEN if args.question == "open" else QUESTION
+            if args.input == "result":
+                user_text = (
+                    turn_result_text(turn) or "（无工具结果）"
+                    if args.no_state
+                    else reconstructed_message(turn, timeline.get(turn, False))
+                )
+            else:
+                user_text = QUESTION_OPEN if args.question == "open" else QUESTION
             messages = [
                 {"role": "system", "content": system},
                 {
@@ -190,14 +355,17 @@ def main() -> int:
                     "content": [
                         {"type": "image", "image": agent},
                         {"type": "image", "image": wrist},
-                        {"type": "text", "text": question},
+                        {"type": "text", "text": user_text},
                     ],
                 },
             ]
             reply = model.chat(messages, None)
             print("=" * 100)
-            print(f"[{name}/{args.question}] turn {turn}  {TURNS[turn]}")
+            print(f"[{name}/{args.question}/{args.input}/{args.format}] turn {turn}  {TURNS[turn]}")
             print(f"  实测: {truth.get(turn, '-')}")
+            print(f"  循环里 t{turn + 1} 实际动作: {loop_action(turn + 1)}")
+            if args.input == "result" and not args.no_state:
+                print(f"  喂入的状态行: …{user_text.splitlines()[-1]}")
             print("-" * 100)
             print(reply.strip())
             print()
