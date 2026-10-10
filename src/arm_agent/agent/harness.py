@@ -38,6 +38,8 @@ from arm_agent.agent.tool_protocol import canonical_name, structured_result
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
 
 SKILLS_DIRNAME = "skills"
+# The shared skill file, injected into the executor AND the verifier prompts.
+SHARED_SKILL_FILE = "scene_tools.md"
 # Feed-back images: the newest N frames stay as pixels, the rest become text
 # stubs. Was 1 while only the agent view was attached; the loop now attaches the
 # agent AND wrist cameras each step, so 2 keeps exactly one whole frame pair
@@ -132,6 +134,20 @@ class Harness:
         self.legacy_tools = str(tool_protocol).lower() != "v2"
         self.skills_dir = self.workspace / SKILLS_DIRNAME
         self.skills_dir.mkdir(parents=True, exist_ok=True)
+        # SHARED SKILL, injected into BOTH roles' system prompts.
+        #
+        # It lives on disk (not inline in prompts.py) so it can be edited /
+        # self-iterated without touching code. Read once here: the system prompt
+        # string is rebuilt every turn, and re-reading a file each turn would be
+        # pure I/O overhead.
+        #
+        # Why both roles need it: the executor had the axis convention in its own
+        # prompt while the verifier did not, and the verifier's picture-relative
+        # hints ("篮子在右侧") made the executor march in +x while the real
+        # deficit was +y -- 40/40 moves in the wrong axis, measured. One shared
+        # vocabulary is the fix.
+        skill_path = self.skills_dir / SHARED_SKILL_FILE
+        self.shared_skill = f"\n\n{skill_path.read_text().strip()}" if skill_path.exists() else ""
         # Grasp state, taken from the gripper's own verdict ("holding" in the
         # adapter note) and NEVER inferred from distance. MEASURED (P0a): the
         # proximity rule reported the pads parked 5.5 cm above an untouched can
@@ -167,7 +183,7 @@ class Harness:
         self.verifier_enabled = bool(verifier)
         self.verifier_thinking = verifier_thinking
         self.verifier_schemas = get_verifier_tools()
-        self.verifier_prompt = get_verifier_prompt()
+        self.verifier_prompt = get_verifier_prompt() + self.shared_skill
         self.verifier_calls = 0
         self._task_text = ""
 
@@ -265,7 +281,7 @@ class Harness:
                 )
 
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": get_system_prompt(self.prompt_mode) + self._skills_index()},
+                {"role": "system", "content": get_system_prompt(self.prompt_mode) + self.shared_skill + self._skills_index()},
                 {
                     "role": "user",
                     "content": [
