@@ -59,7 +59,18 @@ HISTORY_IMAGE_KEEP = 1
 # probe_token_budget2 measured 5 messages + the long warnings at 4219 tokens
 # (543 MiB matrix) versus the 4446/603 MiB that OOM'd, i.e. only 60 MiB of slack
 # -- not enough. 4 messages = 3992 tokens = 486 MiB.
-MAX_HISTORY_MESSAGES = 4
+#
+# 2026-10-10, RE-MEASURED ON THE 32 GiB CARD (RTX 5090, single node, v2 tools):
+# the cap was still 4, and `ctx` sat FLAT at 1263-1285 tokens for all 80 turns
+# while the peak was 7.62 GiB of 32 GiB. The run never came near the ceiling --
+# and still could not see its own history: the same 4-beat loop repeated for 80
+# turns because every cross-turn cause had been trimmed away. A cap that is
+# never reached is not a safety margin, it is a blindfold. Raised to the tier
+# docs/context_budget.md recommends for 32 GiB (MSG=32). The 10 GiB tier is
+# still one flag away (`--history-messages 4`). Note that on sm_120
+# (RTX 5090) flash-attention IS available, so the B/tok^2 term is ~4x smaller
+# than the 170.7 measured on sm_75; N^2 is not the binding constraint here.
+MAX_HISTORY_MESSAGES = 32
 
 
 @dataclass
@@ -87,6 +98,8 @@ class Harness:
         log: bool = True,
         prompt_mode: str = "full",
         tool_protocol: str = "v1",
+        history_messages: int | None = None,
+        image_keep: int | None = None,
     ) -> None:
         self.client = client
         self.model = model
@@ -94,6 +107,10 @@ class Harness:
         self.max_turns = max_turns
         self.attach_images = attach_images
         self.log = log
+        # Both budgets are overridable per run: the right cap depends on the
+        # card (see MAX_HISTORY_MESSAGES). None = use the module default.
+        self.history_messages = int(history_messages) if history_messages else MAX_HISTORY_MESSAGES
+        self.image_keep = int(image_keep) if image_keep is not None else HISTORY_IMAGE_KEEP
         # "full" = the accumulated scene-specific prompt; "plain" = task +
         # frame + tool semantics only (see prompts.get_system_prompt).
         self.prompt_mode = "v2" if tool_protocol == "v2" and prompt_mode == "full" else prompt_mode
@@ -174,7 +191,10 @@ class Harness:
                 t_llm0 = time.time()
                 try:
                     reply = self.model.chat(
-                        prepare_for_model(compact_history(messages), HISTORY_IMAGE_KEEP),
+                        prepare_for_model(
+                            compact_history(messages, self.history_messages),
+                            self.image_keep,
+                        ),
                         tools=self.tool_schemas,
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -251,6 +271,17 @@ class Harness:
                 # is a string this module owns (it is the same name the model is
                 # shown), so it cannot drift with the adapter.
                 outcome.setdefault("tool", call.name)
+                # ONE vocabulary for all the bookkeeping below: the CANONICAL tool
+                # name. The model calls `gripper`/`approach` under v2 while the
+                # legacy surface calls the same actions `set_gripper`/`descend_to`.
+                # Comparing the raw name made the grasp-state update and both
+                # self-harm warnings DEAD CODE under v2: a `gripper close` that
+                # reported "holding" still left `_grasped` False, so `format_state`
+                # would keep saying 爪上：空 while the object was in the pads --
+                # i.e. the model would believe it had dropped what it was holding.
+                # Same class of bug as P0d (a value from another vocabulary), found
+                # this time by reading, before it could mislead a run.
+                _tool = canonical_name(str(outcome.get("tool", "")))
                 obs = outcome["obs"]
                 if outcome.get("images"):
                     last_images = outcome["images"]
@@ -289,7 +320,7 @@ class Harness:
 
                 # Track whether the pads actually closed on something. Only
                 # `close` reports this, and only the adapter knows the width.
-                if outcome.get("tool") == "set_gripper":
+                if _tool == "gripper":
                     _action = (outcome.get("requested") or {}).get("action")
                     _note = str(outcome.get("note", ""))
                     if _action == "open":
@@ -309,13 +340,12 @@ class Harness:
                 # it crimps it. And descending onto the object in your own pads
                 # presses it against the table. Neither is visible in the numbers.
                 hurt = ""
-                _tool = outcome.get("tool")
-                if _tool == "set_gripper" and self._grasped and self._prev_grasped:
+                if _tool == "gripper" and self._grasped and self._prev_grasped:
                     hurt = (
                         "\n⚠ 你上一轮已经夹住它了——这次 close 让指垫又闭合了一点"
                         "（指宽变小 = 在挤压它，可能把它挤出去）。"
                     )
-                elif _tool == "descend_to" and self._prev_grasped:
+                elif _tool == "approach" and self._prev_grasped:
                     # Fires on the TOOL NAME, not an adapter kind string. See the
                     # note at the top of this loop: the previous test used
                     # "descend" and never once matched.
@@ -473,6 +503,8 @@ class Harness:
                     ),
                     "image": images.get("agent"),
                     "images": images,
+                    "requested": outcome.get("requested", {}),
+                    "raw": outcome,
                     "done": False,
                 }
             return {
@@ -482,13 +514,14 @@ class Harness:
                     f"({end[0]:.4f}, {end[1]:.4f}, {end[2]:.4f})（{note}，"
                     f"{outcome.get('steps', 0)} ticks）。"
                 ),
-                # `kind` must travel with the result: the episode loop keys the
-                # self-harm checks off it, and without this field the
-                # "you are descending onto the object in your own pads" warning
-                # could never fire (P0d: 0 occurrences while it applied at t5).
+                # `kind` still travels with the result for `format_outcome`, but
+                # nothing in the episode loop keys off it any more: the self-harm
+                # checks dispatch on the CANONICAL tool name (see `_tool`).
                 "kind": outcome.get("kind"),
                 "image": images.get("agent"),
                 "images": images,
+                "requested": outcome.get("requested", {}),
+                "raw": outcome,
                 "done": False,
             }
 
@@ -556,6 +589,13 @@ class Harness:
                 "kind": outcome.get("kind"),
                 "note": outcome.get("note", ""),
                 "requested": outcome.get("requested", {}),
+                # Keep the adapter's own dict so the v2 envelope can carry the
+                # MEASURED numbers. `format_outcome` consumes them to build the
+                # human text, and without this copy the structured `measurement`
+                # shipped empty -- measured 2026-10-10: `approach` returned
+                # `"measurement": {}` on 27/27 calls, so the "返回实测位移" the
+                # v2 contract advertises never reached the model.
+                "raw": outcome,
             }
 
         if name == "declare_done":
@@ -591,19 +631,27 @@ class Harness:
 
     # ------------------------------------------------------------------ util
     def _structured_outcome(self, call: ToolCall, outcome: dict[str, Any]) -> dict[str, Any]:
-        raw = outcome.get("outcome", outcome)
+        # Read the numbers from the ADAPTER's dict, not from the flattened result
+        # `_dispatch` builds for the model. The flat dict never had eef_start /
+        # eef_end / measured_delta_m / steps at its top level, so the lookup below
+        # silently produced `"measurement": {}` for every motion call.
+        raw = outcome.get("raw") or outcome.get("outcome") or outcome
         measurement = {
             key: raw[key]
             for key in ("eef_start", "eef_end", "measured_delta_m", "steps")
-            if key in raw
+            if raw.get(key) is not None
         }
-        if "note" in raw:
-            measurement["note"] = raw["note"]
         status = "verified" if outcome.get("done") and outcome.get("success") else (
             "not_verified" if outcome.get("done") else "completed"
         )
         events: list[dict[str, Any]] = []
-        if "只走了" in str(outcome.get("text", "")):
+        # A motion that fell short is an EVENT, and both surfaces must say so with
+        # the same vocabulary: `move` reports "只走了 Xcm" and `descend_to`
+        # reports "未到达". Only the first was tested, so `approach` could come
+        # back with an empty event list while its own text said it never got down
+        # to the object.
+        text = str(outcome.get("text", ""))
+        if "只走了" in text or "未到达" in text:
             status = "partial"
             events.append({"type": "motion_shortfall"})
         if outcome.get("done") and not outcome.get("success"):
@@ -729,6 +777,12 @@ class Harness:
         return "\n".join(lines)
 
     def _skills_index(self) -> str:
+        # The skill tools (write_skill / read_skill) exist ONLY on the legacy
+        # surface. Under v2 this text was still appended to the system prompt of
+        # every turn, inviting the model to call tools that are not in its
+        # schema -- a dangling instruction to an unknown tool.
+        if not self.legacy_tools:
+            return ""
         skills = sorted(p.stem for p in self.skills_dir.glob("*.md"))
         if not skills:
             return "\n\n## 技能库\n（当前为空——如果你总结出有用的经验，可以用 write_skill 记录。）"
@@ -829,7 +883,17 @@ def _hold_gap(obs: dict[str, Any]) -> float | None:
 def format_state(obs: dict[str, Any], grasped: bool = False) -> str:
     eef = obs.get("eef_pos", [0, 0, 0])
     width = max(abs(v) for v in obs.get("gripper_qpos", [0, 0]))
-    grip = "张开" if width > 0.01 else "闭合"
+    # Same thresholds as `format_outcome`, deliberately. The old rule here was
+    # `width > 0.01`, so a width of 0.0230 -- an object between the pads -- was
+    # called 张开 in this line while `format_outcome` called the SAME turn
+    # "指间有物体（夹住了）". Two vocabularies for one measurement inside a
+    # single message is exactly the P0f failure mode.
+    if width >= GRIPPER_OPEN_WIDTH:
+        grip = "张开"
+    elif width <= GRIPPER_EMPTY_WIDTH:
+        grip = "闭合（空）"
+    else:
+        grip = "半闭（指间有物体）"
     # `grasped` comes from the last `set_gripper close` verdict. Do NOT infer it
     # from distance: P0a showed the pads parked 5.5 cm above an untouched can
     # being reported as holding it (7 "slip" + 5 "dropped" false alarms in one
@@ -979,7 +1043,7 @@ def compact_history(messages: list[dict[str, Any]], max_messages: int = MAX_HIST
         "role": "user",
         "content": (
             f"[上下文压缩] 更早的 {dropped} 条消息已省略（为避免超出模型上下文）。"
-            "如需要，可用 get_state 或 look 重新获取当前状态。"
+            "如需要，可以重新观察当前状态。"
         ),
     }
     return [*head, note, *tail]

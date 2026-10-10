@@ -192,13 +192,59 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 LEGACY_TOOL_SCHEMAS = TOOL_SCHEMAS
+# v2 surface. The descriptions now state the SAME limits the validator enforces
+# (`tool_protocol.REQUIRED` / `ENUMS`, the 0.1-15 cm and +-90 deg ranges). They
+# used to be hidden: the model could only discover them by being rejected, and
+# every rejection costs a whole turn. `height_offset_cm` was also unitless and
+# had no documented default -- which is how a run spent 26 turns parking 5 cm
+# above the object and closing on air (`gripper` width 0.0007, 26/26 calls).
 TOOL_SCHEMAS_V2: list[dict[str, Any]] = [
-    {"type": "function", "function": {"name": "observe", "description": "读取当前状态和场景证据；可选 target 指定物体。只观察，不移动。", "parameters": {"type": "object", "properties": {"target": {"type": "string"}, "camera": {"type": "string", "enum": ["agent", "wrist"]}}, "required": []}}},
-    {"type": "function", "function": {"name": "approach", "description": "将末端移动到目标上方并下降到指定高度；不执行夹爪动作。", "parameters": {"type": "object", "properties": {"target": {"type": "string"}, "height_offset_cm": {"type": "number"}}, "required": ["target"]}}},
-    {"type": "function", "function": {"name": "move", "description": "沿世界坐标轴移动指定距离。返回实测位移，不保证完全到达。", "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["+x", "-x", "+y", "-y", "+z", "-z"]}, "distance_cm": {"type": "number"}}, "required": ["direction", "distance_cm"]}}},
-    {"type": "function", "function": {"name": "rotate", "description": "绕世界坐标轴旋转末端并返回实测结果。", "parameters": {"type": "object", "properties": {"axis": {"type": "string", "enum": ["yaw", "pitch", "roll"]}, "angle_deg": {"type": "number"}}, "required": ["axis", "angle_deg"]}}},
-    {"type": "function", "function": {"name": "gripper", "description": "打开或闭合夹爪；返回指宽和是否夹住物体的测量结果。", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["open", "close"]}}, "required": ["action"]}}},
-    {"type": "function", "function": {"name": "verify", "description": "请求环境验证当前任务状态；成功与否由环境真值决定。", "parameters": {"type": "object", "properties": {"claim": {"type": "string", "enum": ["placed", "grasped", "task_complete"]}}, "required": ["claim"]}}},
+    {"type": "function", "function": {
+        "name": "observe",
+        "description": (
+            "读取当前状态和场景证据，不移动机械臂。给 target 时返回该物体的坐标与偏差；"
+            "给 camera 时重新渲染并返回该视角的新画面（不给 camera 就不会产生新画面）。"
+        ),
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "物体名，例如 alphabet soup / basket"},
+            "camera": {"type": "string", "enum": ["agent", "wrist"], "description": "要刷新的相机视角"},
+        }, "required": []}}},
+    {"type": "function", "function": {
+        "name": "approach",
+        "description": (
+            "对准目标并下降到它中心上方 height_offset_cm 厘米处（默认 1.2；正值=停在物体上方，"
+            "抓取时用 1.2 左右；不要用负值硬压）。不操作夹爪。"
+        ),
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "物体名"},
+            "height_offset_cm": {"type": "number", "description": "最终停在物体中心上方多少厘米，默认 1.2"},
+        }, "required": ["target"]}}},
+    {"type": "function", "function": {
+        "name": "move",
+        "description": "沿世界坐标轴平移，距离 0.1~15 厘米（+z 向上，-z 向下）。返回实测位移，可能少于请求值。",
+        "parameters": {"type": "object", "properties": {
+            "direction": {"type": "string", "enum": ["+x", "-x", "+y", "-y", "+z", "-z"]},
+            "distance_cm": {"type": "number", "description": "平移距离，单位厘米，范围 0.1~15"},
+        }, "required": ["direction", "distance_cm"]}}},
+    {"type": "function", "function": {
+        "name": "rotate",
+        "description": "绕世界坐标轴旋转末端，角度范围 -90~90 度。返回实测结果。",
+        "parameters": {"type": "object", "properties": {
+            "axis": {"type": "string", "enum": ["yaw", "pitch", "roll"]},
+            "angle_deg": {"type": "number", "description": "旋转角度，单位度，范围 -90~90"},
+        }, "required": ["axis", "angle_deg"]}}},
+    {"type": "function", "function": {
+        "name": "gripper",
+        "description": "打开或闭合夹爪，并返回实测指宽与是否夹住物体（两指完全闭合=空夹）。",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["open", "close"]},
+        }, "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "verify",
+        "description": "请求环境验证任务是否完成。成功与否只由环境真值决定，claim 只是标签，不影响判定。",
+        "parameters": {"type": "object", "properties": {
+            "claim": {"type": "string", "enum": ["placed", "grasped", "task_complete"]},
+        }, "required": []}}},
 ]
 
 SYSTEM_PROMPT = """你是机械臂智能体的决策核心。你通过调用工具观察场景、移动机械臂，完成"把指定物体拿起来放进篮子"的任务。
@@ -311,6 +357,7 @@ SYSTEM_PROMPT_V2 = """你是机械臂任务决策核心。目标是完成当前�
 不要发明工具、参数或并行调用。verify 的成功与否只由环境验证。
 
 坐标系：世界坐标中 +z 向上，位置单位米，move 距离单位厘米。
+需要新画面时必须用 observe 的 camera 参数，否则画面不会更新。
 工具职责：
 - observe：读取状态和场景证据，不移动。
 - approach：到目标上方并下降，不操作夹爪。

@@ -31,7 +31,10 @@ REQUIRED = {
     "move": ("direction", "distance_cm"),
     "rotate": ("axis", "angle_deg"),
     "gripper": ("action",),
-    "verify": ("claim",),
+    # `claim` is deliberately NOT required: `declare_done` ignores it and asks
+    # the environment for the ground truth, so requiring it only gave the model
+    # a way to fail validation on a parameter that changes nothing.
+    "verify": (),
 }
 
 ENUMS = {

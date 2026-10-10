@@ -38,6 +38,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 HARNESS = REPO / "src" / "arm_agent" / "agent" / "harness.py"
 PROMPTS = REPO / "src" / "arm_agent" / "agent" / "prompts.py"
+PROTOCOL = REPO / "src" / "arm_agent" / "agent" / "tool_protocol.py"
 
 failures: list[str] = []
 
@@ -51,9 +52,15 @@ def bad(msg: str) -> None:
     failures.append(msg)
 
 
-def tool_schema_names(src: str) -> set[str]:
-    """Tool names advertised to the model, from the TOOL_SCHEMAS literal."""
-    block = src.split("TOOL_SCHEMAS", 1)
+def tool_schema_names(src: str, anchor: str = "TOOL_SCHEMAS") -> set[str]:
+    """Tool names advertised to the model, from one TOOL_SCHEMAS literal.
+
+    There are two surfaces now (v1 = `TOOL_SCHEMAS`, v2 = `TOOL_SCHEMAS_V2`), so
+    the caller unions both: the loop compares CANONICAL names (`gripper`,
+    `approach`) under v2 and legacy names (`set_gripper`, `descend_to`) under v1,
+    and both must be recognised or this probe cries wolf on a correct file.
+    """
+    block = src.split(anchor, 1)
     if len(block) != 2:
         return set()
     body = block[1]
@@ -71,6 +78,7 @@ def tool_schema_names(src: str) -> set[str]:
 def main() -> int:
     hsrc = HARNESS.read_text()
     psrc = PROMPTS.read_text()
+    hsrc_protocol = PROTOCOL.read_text()
 
     # Scope the vocabulary check to `run_episode` ONLY. `format_outcome` also
     # compares against `kind`, and that one is legitimate: it consumes the
@@ -85,7 +93,7 @@ def main() -> int:
 
     # ---- 1. vocabulary -----------------------------------------------------
     kind_cmp = re.findall(r'\b_?kind\w*\s*==\s*"(\w+)"', loop)
-    tools = tool_schema_names(psrc)
+    tools = tool_schema_names(psrc) | tool_schema_names(psrc, "TOOL_SCHEMAS_V2")
     if kind_cmp:
         bad(f"run_episode still compares an adapter `kind` vocabulary string: {kind_cmp}")
     else:
@@ -122,11 +130,31 @@ def main() -> int:
     handled = set(re.findall(r'name == "(\w+)"', hsrc))
     for group in re.findall(r'name in \(([^)]*)\)', hsrc):
         handled |= set(re.findall(r'"(\w+)"', group))
-    unhandled = tools - handled
+
+    legacy_tools = tool_schema_names(psrc)                       # v1 surface
+    v2_tools = tool_schema_names(psrc, "TOOL_SCHEMAS_V2")         # v2 surface
+
+    unhandled = legacy_tools - handled
     if unhandled:
         bad(f"tool(s) in TOOL_SCHEMAS have no `_dispatch` branch: {sorted(unhandled)}")
     else:
-        ok(f"every TOOL_SCHEMAS entry has a `_dispatch` branch ({len(tools)} tools)")
+        ok(f"every TOOL_SCHEMAS entry has a `_dispatch` branch ({len(legacy_tools)} tools)")
+
+    # v2 names are translated to the legacy names at the top of `_dispatch`, so a
+    # v2 tool needs either its own branch OR an alias target that has one. Without
+    # this the probe reports a false failure for observe/approach/gripper/verify --
+    # i.e. exactly the four tools whose wiring it is supposed to protect.
+    aliases_block = hsrc_protocol.split("ALIASES", 1)[1].split("}", 1)[0]
+    aliases = dict(re.findall(r'"(\w+)":\s*"(\w+)"', aliases_block))
+    unresolved = []
+    for tool in sorted(v2_tools):
+        targets = {tool} | {legacy for legacy, canon in aliases.items() if canon == tool}
+        if not (targets & handled):
+            unresolved.append(tool)
+    if unresolved:
+        bad(f"v2 tool(s) resolve to no `_dispatch` branch: {unresolved}")
+    else:
+        ok(f"every v2 tool resolves to a `_dispatch` branch ({len(v2_tools)} tools)")
 
     print(f"\n{len(failures)} failure(s)")
     return 1 if failures else 0

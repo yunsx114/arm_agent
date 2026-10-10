@@ -98,6 +98,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         attach_images=not args.no_images,
         prompt_mode=args.prompt_mode,
         tool_protocol=args.tool_protocol,
+        history_messages=args.history_messages,
+        image_keep=args.image_keep,
+    )
+    print(
+        f"[run] history_messages={harness.history_messages} "
+        f"image_keep={harness.image_keep} prompt_mode={harness.prompt_mode} "
+        f"tool_protocol={harness.tool_protocol}",
+        flush=True,
     )
 
     results = []
@@ -192,6 +200,19 @@ def main(argv: list[str] | None = None) -> int:
         default="v2",
         choices=["v1", "v2"],
         help="model tool surface; v1 keeps the legacy tools for A/B comparison",
+    )
+    p.add_argument(
+        "--history-messages",
+        type=int,
+        default=None,
+        help="conversation cap; omit for harness.MAX_HISTORY_MESSAGES (32 GiB tier). "
+        "The 10 GiB tier is `--history-messages 4`.",
+    )
+    p.add_argument(
+        "--image-keep",
+        type=int,
+        default=None,
+        help="how many recent frames stay as pixels; omit for harness.HISTORY_IMAGE_KEEP",
     )
     p.add_argument("--record", action="store_true", help="record an mp4 per episode (cameras + model I/O)")
     p.add_argument("--video-fps", type=int, default=2)
