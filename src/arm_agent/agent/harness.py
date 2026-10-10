@@ -137,6 +137,11 @@ class Harness:
         self._last_width: float | None = None
         # Per-turn flag: this turn's `close` was issued onto already-shut pads.
         self._closed_on_air = False
+        # Per-turn flag: this turn deliberately opened the gripper. An `open`
+        # releases the payload ON PURPOSE, so it must NOT raise the "dropped"
+        # event -- otherwise the harness tells the model it lost the object and
+        # the model goes back to re-grasp something it just put down.
+        self._released = False
 
     # -------------------------------------------------------------- episode
     def run_episode(
@@ -298,6 +303,7 @@ class Harness:
                 # this time by reading, before it could mislead a run.
                 _tool = canonical_name(str(outcome.get("tool", "")))
                 self._closed_on_air = False
+                self._released = False
                 obs = outcome["obs"]
                 if outcome.get("images"):
                     last_images = outcome["images"]
@@ -342,6 +348,7 @@ class Harness:
                     _width = _grip_width(_note)
                     if _action == "open":
                         self._grasped = False
+                        self._released = True
                     elif _action == "close":
                         # "holding" is the adapter's verdict; "empty" is air.
                         self._grasped = "holding" in _note
@@ -402,7 +409,7 @@ class Harness:
                 gap = _hold_gap(obs) if self._grasped else None
                 slip = ""
                 if gap is None:
-                    if self._prev_gap is not None:
+                    if self._prev_gap is not None and not self._released:
                         # THE event that matters. MEASURED (v14 t16): the can was
                         # in the pads on t13 (gap 3.1 cm) and simply gone on t16.
                         # The distance-trend check below can NEVER fire for this:
@@ -412,6 +419,14 @@ class Harness:
                         # v12 only looked detectable because that run happened to
                         # dawdle at 4.3 cm for a turn.
                         # Detect the DISAPPEARANCE, not just the drift.
+                        #
+                        # `and not self._released` is the fix for a false alarm
+                        # that costs whole episodes: MEASURED (2026-10-10) the
+                        # model opened the gripper over the table (a deliberate
+                        # release) and the harness answered "⛔ 物体掉了", so the
+                        # model turned around and spent the remaining 70 turns
+                        # re-grasping what it had just put down. v4 in
+                        # docs/P0_stripdown.md died the same way.
                         slip = "\n⛔ **物体掉了**（上一轮还在夹爪里）。"
                     self._prev_gap = None
                     # The grip is gone: stop calling it a grasp. Without this the
@@ -534,13 +549,22 @@ class Harness:
             # text still read "已对准并下降到 … 下一步用 set_gripper 操作夹爪",
             # so the model dutifully closed on air 71 times in a row.
             z_err = _z_err(note)
-            if z_err is not None and z_err > 0.02:
+            # A stalled servo ("stuck at (x, y, z)") does NOT carry a `z err`, so
+            # the old test let it fall through to the SUCCESS branch: measured
+            # 2026-10-10 t69-t80, the result read "已对准并下降到
+            # (-1.0392, 0.4899, 0.0122)" while the arm was a metre outside the
+            # table and every following `close` came back on air. A stall is a
+            # shortfall, exactly like a z error.
+            stalled = "stuck" in note
+            if stalled or (z_err is not None and z_err > 0.02):
+                detail = (
+                    f"卡住了（{note}）"
+                    if stalled
+                    else f"终点 z={end[2]:.4f}，离目标还差 {z_err * 100:.1f}cm"
+                )
                 return {
                     "obs": resp.obs,
-                    "text": (
-                        f"[descend_to {object_name} +{z_offset}cm] 未到达：xy 已对准，"
-                        f"终点 z={end[2]:.4f}，离目标还差 {z_err * 100:.1f}cm"
-                    ),
+                    "text": f"[descend_to {object_name} +{z_offset}cm] 未到达：xy 已对准，{detail}",
                     "image": images.get("agent"),
                     "images": images,
                     "requested": outcome.get("requested", {}),
