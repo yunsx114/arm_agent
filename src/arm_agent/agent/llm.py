@@ -38,6 +38,7 @@ class QwenAgentModel:
         image_min_pixels: int | None = None,
         attn_impl: str | None = None,
         n_gpu: int = 1,
+        enable_thinking: bool = False,
     ) -> None:
         self.model_dir = str(model_dir)
         self.load = load
@@ -68,6 +69,12 @@ class QwenAgentModel:
         # left to the config default. None = leave the checkpoint's choice.
         self.attn_impl = attn_impl
         self.n_gpu = max(1, int(n_gpu))
+        # The chat template's reasoning switch. Off by default: a thinking block
+        # costs 1-3k tokens per turn on top of the answer, and measured decoding
+        # on this card is ~24 ms/token, so it adds ~30-70 s PER TURN and can
+        # overflow MAX_NEW_TOKENS mid-thought (the tool call then never appears).
+        # Kept configurable so it can be A/B'd instead of guessed at.
+        self.enable_thinking = bool(enable_thinking)
         self._tokenizer = None
         self._model = None
         self._processor = None
@@ -155,7 +162,7 @@ class QwenAgentModel:
             messages,
             tools=tools,
             tokenize=False,
-            enable_thinking=False,
+            enable_thinking=self.enable_thinking,
             add_generation_prompt=True,
         )
 

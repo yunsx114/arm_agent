@@ -98,6 +98,8 @@ def main() -> int:
     # question to the last turn and drop the tool schemas -- this is exactly what
     # the harness-side gate (A') would do, tested at the REAL context length.
     ap.add_argument("--ask", action="store_true")
+    # --thinking: turn on the chat template's reasoning block (llm.enable_thinking).
+    ap.add_argument("--thinking", action="store_true")
     args = ap.parse_args()
 
     episode_path = str(REPO / args.episode) if not Path(args.episode).is_absolute() else args.episode
@@ -211,6 +213,7 @@ def main() -> int:
         max_new_tokens=args.max_new_tokens,
         temperature=0.0,
         image_max_side=160,
+        enable_thinking=args.thinking,
     )
     model.load_model()
 

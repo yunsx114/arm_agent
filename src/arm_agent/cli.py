@@ -86,6 +86,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         load=args.load,
         gpu_mem_gib=args.gpu_mem_gib,
         max_new_tokens=args.max_new_tokens,
+        enable_thinking=args.enable_thinking,
         n_gpu=args.gpus,
     )
     model.load_model()
@@ -104,7 +105,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(
         f"[run] history_messages={harness.history_messages} "
         f"image_keep={harness.image_keep} prompt_mode={harness.prompt_mode} "
-        f"tool_protocol={harness.tool_protocol}",
+        f"tool_protocol={harness.tool_protocol} "
+        f"thinking={model.enable_thinking} max_new_tokens={model.max_new_tokens}",
         flush=True,
     )
 
@@ -222,6 +224,13 @@ def main(argv: list[str] | None = None) -> int:
         help="how many recent frames stay as pixels; omit for harness.HISTORY_IMAGE_KEEP",
     )
     p.add_argument("--record", action="store_true", help="record an mp4 per episode (cameras + model I/O)")
+    p.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="turn on the chat template's reasoning block. Off by default: it costs "
+        "1-3k tokens/turn (~30-70 s here) and can eat max-new-tokens before the "
+        "tool call is emitted. Raise --max-new-tokens when using it.",
+    )
     p.add_argument("--video-fps", type=int, default=2)
     p.add_argument("--video-dir", default=str(REPO / "outputs" / "videos"))
     p.add_argument("--keep-frames", action="store_true", help="keep per-turn PNG frames after encoding")
