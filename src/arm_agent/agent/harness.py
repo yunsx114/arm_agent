@@ -392,8 +392,9 @@ class Harness:
                         note = (
                             "[释放被否决] 核验者没有放行这次 gripper open，动作**未执行**。"
                             f"理由：{reason}\n"
-                            "物体还在夹爪上。请先按上面的理由修正位置，"
-                            "确认容器开口在夹爪正下方后再请求放行。"
+                            "物体还在夹爪上。请优先执行理由里建议的那个工具（若它给了 "
+                            "`approach(容器, 15)` 就照做一次，不要用一连串 move 去凑两轴位置）；"
+                            "对准之后再请求放行。"
                         )
                         messages.append({"role": "user", "content": note})
                         transcript.append({"turn": turn, "gate_reject": reason})
