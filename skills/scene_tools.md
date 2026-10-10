@@ -15,7 +15,9 @@
 - `verify(claim)`：只由环境真值回答任务是否完成，不是自我确认。
 
 ## 组合：探索一次就该记住
-- 抓起：`approach(物体)` → `gripper close`；夹空说明没对准，先 `move +z` 抬起再 approach。
+- 抓起：**先 `gripper open` → `approach(物体)` → `gripper close`**。顺序反了（两指闭合着下降）就是拿
+  指尖去顶物体：实测每次下降把罐子推走约 4cm（15 次共 30cm），而且永远夹不住。
+- 夹空之后：先 `move +z` 抬起、**再 `open`**，然后重新 `approach`；两指闭着的状态下重复 close 没有意义。
 - 放下：**先 `approach(容器, 15)` 到容器开口正上方**，再 `gripper open`；不要用一串 move 凭画面猜位置。
 - 容器很浅：`approach(容器, 1~2)` 会直插到容器底部并把容器推走；对准容器一律用 `height_offset_cm≈15`。
 - 见到「未到达 / 卡住 / 只走了 X cm」：先 `move +z` 抬起再重新 approach，不要原地重复同一条指令。
