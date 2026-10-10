@@ -10,6 +10,19 @@ from __future__ import annotations
 from typing import Any
 
 CANONICAL_TOOLS = ("observe", "approach", "move", "rotate", "gripper", "verify")
+# Temporarily UNREGISTERED surfaces: the code path stays (dispatch, aliases,
+# validation) but the model is neither shown the tool nor allowed to call it.
+#
+# `observe` is off since 2026-10-10 on purpose. Every turn now carries BOTH
+# camera frames, so the question this ablation answers is "can the model work
+# from pixels alone?" -- previously `observe <target>` was the ONLY source of
+# object coordinates, and it was also the only way to refresh a frame.
+# Re-enabling is deleting the entry below.
+#
+# The validator check matters for experimental validity: a model that calls a
+# tool from memory would otherwise still succeed, silently leaking the numbers
+# this ablation is trying to remove.
+UNREGISTERED_TOOLS: frozenset[str] = frozenset({"observe"})
 LEGACY_TOOLS = (
     "look", "locate", "descend_to", "align_xy", "get_state", "move",
     "rotate", "set_gripper", "declare_done", "write_skill", "read_skill",
@@ -55,6 +68,13 @@ def validate_tool_call(name: str, args: dict[str, str], *, legacy: bool = False)
     allowed = LEGACY_TOOLS if legacy else CANONICAL_TOOLS
     if name not in allowed:
         return [f"unknown_tool:{name}"]
+    # Scoped to the v2 surface on purpose: the legacy surface is the documented
+    # A/B path (and the no-GPU `probe_harness_dryrun.py` regression), which must
+    # keep working while this ablation is on. The ablation itself cannot leak
+    # through legacy names -- `look`/`locate`/`get_state` are not advertised
+    # anywhere in a v2 conversation, so the model has no reason to emit them.
+    if not legacy and (name in UNREGISTERED_TOOLS or canonical_name(name) in UNREGISTERED_TOOLS):
+        return [f"unregistered_tool:{name}"]
     canonical = canonical_name(name)
     normalized_args = dict(args)
     if name in ("locate", "descend_to", "align_xy"):

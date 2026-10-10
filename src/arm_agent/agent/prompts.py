@@ -13,7 +13,7 @@ conversation is Chinese and the template output is bilingual-tolerant.
 from __future__ import annotations
 
 from typing import Any
-from arm_agent.agent.tool_protocol import CANONICAL_TOOLS
+from arm_agent.agent.tool_protocol import CANONICAL_TOOLS, UNREGISTERED_TOOLS
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -202,8 +202,10 @@ TOOL_SCHEMAS_V2: list[dict[str, Any]] = [
     {"type": "function", "function": {
         "name": "observe",
         "description": (
-            "读取当前状态和场景证据，不移动机械臂。给 target 时返回该物体的坐标与偏差；"
-            "给 camera 时重新渲染并返回该视角的新画面（不给 camera 就不会产生新画面）。"
+            "观察，不移动机械臂。三种用法，返回形式不同："
+            "给 target → 返回该物体坐标与「偏差（物体 - 机械爪）」；"
+            "给 camera → 重新渲染并返回该视角的新画面；都不给 → 返回当前机械爪状态。"
+            "同时给 target 和 camera 时只按 target 处理。"
         ),
         "parameters": {"type": "object", "properties": {
             "target": {"type": "string", "description": "物体名，例如 alphabet soup / basket"},
@@ -212,30 +214,38 @@ TOOL_SCHEMAS_V2: list[dict[str, Any]] = [
     {"type": "function", "function": {
         "name": "approach",
         "description": (
-            "对准目标并下降到它中心上方 height_offset_cm 厘米处（默认 1.2；正值=停在物体上方，"
-            "抓取时用 1.2 左右；不要用负值硬压）。不操作夹爪。"
+            "把夹爪**移到**目标物体处，停在它中心上方 height_offset_cm 厘米（默认 1.2）。"
+            "它只做「对准 + 下降」这一件事：**不会抬起物体、不改变夹爪开合、不改变末端朝向**；"
+            "已经在该高度时它不会产生任何位移。要抬高物体用 move +z。不要传负值硬压。"
         ),
         "parameters": {"type": "object", "properties": {
-            "target": {"type": "string", "description": "物体名"},
-            "height_offset_cm": {"type": "number", "description": "最终停在物体中心上方多少厘米，默认 1.2"},
+            "target": {"type": "string", "description": "物体名，把夹爪移到它上方"},
+            "height_offset_cm": {"type": "number", "description": "停在物体中心（不是顶部）上方多少厘米，默认 1.2"},
         }, "required": ["target"]}}},
     {"type": "function", "function": {
         "name": "move",
-        "description": "沿世界坐标轴平移，距离 0.1~15 厘米（+z 向上，-z 向下）。返回实测位移，可能少于请求值。",
+        "description": (
+            "沿世界坐标轴平移 0.1~15 厘米。**这是唯一能改变高度的工具**：+z 向上抬高、-z 向下。"
+            "返回实测位移，可能少于请求值；不够时可以再走一次或分段。"
+        ),
         "parameters": {"type": "object", "properties": {
             "direction": {"type": "string", "enum": ["+x", "-x", "+y", "-y", "+z", "-z"]},
             "distance_cm": {"type": "number", "description": "平移距离，单位厘米，范围 0.1~15"},
         }, "required": ["direction", "distance_cm"]}}},
     {"type": "function", "function": {
         "name": "rotate",
-        "description": "绕世界坐标轴旋转末端，角度范围 -90~90 度。返回实测结果。",
+        "description": "绕世界坐标轴旋转末端，角度范围 -90~90 度。只改变末端朝向，不改变位置。返回实测结果。",
         "parameters": {"type": "object", "properties": {
             "axis": {"type": "string", "enum": ["yaw", "pitch", "roll"]},
             "angle_deg": {"type": "number", "description": "旋转角度，单位度，范围 -90~90"},
         }, "required": ["axis", "angle_deg"]}}},
     {"type": "function", "function": {
         "name": "gripper",
-        "description": "打开或闭合夹爪，并返回实测指宽与是否夹住物体（两指完全闭合=空夹）。",
+        "description": (
+            "打开或闭合夹爪，返回实测指宽与是否夹住物体（两指完全闭合=空夹，指间有物体=夹住）。"
+            "open 有两个用途：抓取前张开、以及把物体放进容器后松开。"
+            "close 之后不要再 close（会把已夹住的物体挤出去）。"
+        ),
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["open", "close"]},
         }, "required": ["action"]}}},
@@ -359,10 +369,14 @@ SYSTEM_PROMPT_V2 = """你是机械臂任务决策核心。目标是完成当前�
 输出格式：先用**一句话以内**说明判断，紧接着立即写出完整的工具调用。
 不要写多段推理、不要重复已经说过的内容。
 
-任务结构（每步完成后再进下一步，不要跳步也不要重复已完成的一步）：
-找到目标 → 张开夹爪并对准目标 → 合上夹爪夹住 → 抬高 → 移到篮子上方 → 张开夹爪放下。
+任务结构（括号内是这一步用的工具，逐步做，不要用别的工具代替）：
+张开夹爪（gripper open）→ 对准并降到抓取高度（approach）→ 合上夹爪（gripper close）
+→ 抬高（move +z）→ 水平移到容器上方（move）→ 张开夹爪放下（gripper open）→ 请求验证（verify）
 
 事实（都是测量的，不是建议）：
+- 每轮都会附带两张最新的相机画面：全局第三人称视角 + 腕部向下视角（朝下看夹爪下方）。
+  不需要额外的观察动作；位置和距离只能从画面判断，动作是否到位也以画面为准。
+- 本配置**不提供物体的坐标数字**（没有定位工具）。
 - 夹爪必须**先张开**才夹得住东西。结果里写「两指完全闭合」时，再 close 等于空夹；
   这种状态下下降只会把物体推开。
 - 已经夹着东西时，不要再往桌面上下降，否则会把夹着的东西刮掉；要先横向移到目标上方。
@@ -373,11 +387,9 @@ SYSTEM_PROMPT_V2 = """你是机械臂任务决策核心。目标是完成当前�
 - 结果里写「未到达 / 卡住 / 只走了 X cm」都表示那个动作没有达成；以实测数字为准。
 
 坐标系：世界坐标中 +z 向上，位置单位米，move 距离单位厘米。
-需要新画面时必须用 observe 的 camera 参数，否则画面不会更新。
 工具职责：
-- observe：读取状态和场景证据，不移动。
-- approach：到目标上方并下降，不操作夹爪。
-- move：执行明确的相对平移。
+- approach：把夹爪移到目标上方并停在指定高度（不会抬起物体）。
+- move：执行明确的相对平移（抬高/降低只能用它）。
 - rotate：执行明确的姿态旋转。
 - gripper：打开或闭合并报告测量到的夹爪状态。
 - verify：让环境检查任务是否完成。
@@ -397,4 +409,10 @@ def get_system_prompt(mode: str = "full") -> str:
 
 
 def get_tool_schemas(protocol: str = "v2") -> list[dict[str, Any]]:
-    return TOOL_SCHEMAS_V2 if str(protocol).strip().lower() == "v2" else LEGACY_TOOL_SCHEMAS
+    """The tool surface actually advertised to the model.
+
+    Schemas for unregistered tools stay in this file (see UNREGISTERED_TOOLS) so
+    re-enabling one is a one-line change; they are filtered out here.
+    """
+    schemas = TOOL_SCHEMAS_V2 if str(protocol).strip().lower() == "v2" else LEGACY_TOOL_SCHEMAS
+    return [s for s in schemas if s["function"]["name"] not in UNREGISTERED_TOOLS]
