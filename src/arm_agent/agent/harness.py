@@ -38,6 +38,10 @@ from arm_agent.agent.tool_protocol import canonical_name, structured_result
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
 
 SKILLS_DIRNAME = "skills"
+# Kept equal to `action_adapter.DESCEND_Z_TOL_M`: a descent that stops further
+# than this from the commanded z did not arrive, and saying it did is what makes
+# the model close on a rim instead of re-descending.
+DESCEND_SHORTFALL_M = 0.005
 # The shared skill file, injected into the executor AND the verifier prompts.
 SHARED_SKILL_FILE = "scene_tools.md"
 # Feed-back images: the newest N frames stay as pixels, the rest become text
@@ -661,7 +665,17 @@ class Harness:
             # table and every following `close` came back on air. A stall is a
             # shortfall, exactly like a z error.
             stalled = "stuck" in note
-            if stalled or (z_err is not None and z_err > 0.02):
+            # Shortfall bar, kept EQUAL to the adapter's DESCEND_Z_TOL_M (5 mm).
+            #
+            # It was 20 mm, and the gap broke a whole episode: the descent pressed
+            # on the can top for 565 ticks and stopped 12 mm high, which fell UNDER
+            # the old 20 mm bar, so the model was told "已对准并下降到 …（z err
+            # 12.0 mm）", believed it was down, closed there (finger width 0.0183 =
+            # gripping the can's rim, vs 0.0314 when a descent converges) and shed
+            # the can during the second +y carry -- after which 26 closes came back
+            # on air (episode_000_1791632189). The verdict and the servo's own
+            # tolerance must be the same number, or "arrived" means nothing.
+            if stalled or (z_err is not None and z_err > DESCEND_SHORTFALL_M):
                 detail = (
                     f"卡住了（{note}）"
                     if stalled
