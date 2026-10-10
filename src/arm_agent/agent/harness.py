@@ -174,6 +174,8 @@ class Harness:
         # Which container the executor last ran `approach` on. The release gate
         # hands this to the verifier together with that object's MEASURED centre.
         self._last_approach_target = ""
+        self._approach_order: list[str] = []
+        self._approached: dict[str, list[float]] = {}
         # Two-role release gate. Same weights, DIFFERENT context: when the
         # executor asks to open the gripper while carrying a payload, the harness
         # suspends that context and asks a verifier (fresh message list, its own
@@ -195,6 +197,58 @@ class Harness:
         self._task_text = ""
 
     # ------------------------------------------------------------- verifier
+    def _gate_container(
+        self, obs: dict[str, Any] | None
+    ) -> tuple[str | None, tuple[float, float] | None]:
+        """The container the executor means to release INTO, and its centre.
+
+        WHY this is not simply `_last_approach_target`: MEASURED (run 16,
+        2026-10-10). The executor's most recent `approach` is usually the PAYLOAD
+        (it re-approaches the can after every failed drop). The payload rides in
+        the gripper, so comparing the gripper against it gives Δ ≈ 0 every time
+        and the gate approved 10/10 releases -- including ones 18 cm short of the
+        basket. The destination container is the most recent `approach` target
+        that is NOT the object currently between the pads.
+        """
+        if not obs:
+            return None, None
+        held = _carried_name(obs) if self._grasped else None
+        objects = obs.get("objects") or {}
+        for name in reversed(self._approach_order):
+            if name == held:
+                continue
+            pos = objects.get(name)
+            if pos and len(pos) >= 2:
+                return name, (float(pos[0]), float(pos[1]))
+            rec = self._approached.get(name)
+            if rec:
+                return name, (rec[0], rec[1])
+        return None, None
+
+    def _gate_arithmetic(self, obs: dict[str, Any] | None) -> str:
+        """The harness's OWN verdict on the release pose, printed alongside the
+        verifier's, so a model/arithmetic disagreement is visible in the log.
+
+        Thresholds come from the measured scene facts in `skills/scene_tools.md`
+        (opening 16x17 cm, can 6.6 cm, rim z=0.115, payload bottom 5.4 cm below
+        the EEF centre).
+        """
+        if not obs:
+            return "没有 obs"
+        eef = obs.get("eef_pos")
+        name, centre = self._gate_container(obs)
+        if eef is None or centre is None:
+            held = _carried_name(obs) if self._grasped else None
+            return f"无法判断（容器未知，最近 approach 的是{held or '无' }）"
+        dx = (eef[0] - centre[0]) * 100.0
+        dy = (eef[1] - centre[1]) * 100.0
+        bottom = eef[2] - 0.054
+        ok = abs(dx) <= 5.0 and abs(dy) <= 5.0 and bottom >= 0.115
+        return (
+            f"容器={name} Δx={dx:+.1f}cm Δy={dy:+.1f}cm 爪心z={eef[2]:.4f} "
+            f"物体底≈{bottom:.4f} ⇒ {'应放行' if ok else '不应放行'}"
+        )
+
     def _release_verdict(
         self, executor_reply: str, images: dict[str, Any] | None, obs: dict[str, Any] | None = None
     ) -> tuple[bool, str]:
@@ -274,10 +328,9 @@ class Harness:
         eef = obs.get("eef_pos") or []
         if len(eef) == 3:
             lines.append(f"- 夹爪当前位置: ({eef[0]:+.4f}, {eef[1]:+.4f}, {eef[2]:+.4f}) m")
-        name = getattr(self, "_last_approach_target", "")
-        container = (obs.get("objects") or {}).get(name) if name else None
-        if container and len(container) >= 3:
-            cx, cy = container[0], container[1]
+        name, centre = self._gate_container(obs)
+        if name and centre:
+            cx, cy = centre
             lines.append(f"- 容器 `{name}` 开口中心（按它自己的几何中心测）: ({cx:+.4f}, {cy:+.4f}) m")
             if len(eef) == 3:
                 dx = (eef[0] - cx) * 100.0
@@ -285,10 +338,11 @@ class Harness:
                 lines.append(
                     f"- 差量: 夹爪比容器中心 Δx={dx:+.1f}cm, Δy={dy:+.1f}cm；爪心 z={eef[2]:.4f} m"
                 )
-        elif name:
-            lines.append(f"- 最近一次 approach 的目标是 `{name}`，但没有它的坐标。")
         else:
-            lines.append("- 执行者还没 approach 过任何容器，不知道它想放进哪里。")
+            lines.append(
+                "- **没有可参照的容器坐标**：执行者还没有 approach 过任何非手上物体的目标。"
+                "这通常意味着它根本没对准过容器，请只靠画面判：看不到容器开口在夹爪正下方就 reject。"
+            )
         return "\n".join(lines)
 
     # -------------------------------------------------------------- episode
@@ -424,9 +478,11 @@ class Harness:
                 ):
                     t_v0 = time.time()
                     approved, reason = self._release_verdict(reply, last_images, obs)
+                    _arith = self._gate_arithmetic(obs)
                     self._say(
                         f"[turn {turn}] gate: {'放行' if approved else '拒绝'} "
                         f"({time.time() - t_v0:.1f}s) {reason[:80]}"
+                        + (f" || 算数自检: {_arith}" if _arith else "")
                     )
                     if not approved:
                         note = (
@@ -465,6 +521,13 @@ class Harness:
                         _tgt = str((call.args or {}).get("target", "")).strip()
                         if _tgt:
                             self._last_approach_target = _tgt
+                            if _tgt in self._approach_order:
+                                self._approach_order.remove(_tgt)
+                            self._approach_order.append(_tgt)
+                            _req = (outcome.get("result") or {}).get("requested") or {}
+                            _xy = _req.get("target_xy")
+                            if _xy:
+                                self._approached[_tgt] = [float(_xy[0]), float(_xy[1])]
                 except Exception as exc:  # noqa: BLE001 - tool errors are prompts, not crashes
                     text = f"[工具错误] {type(exc).__name__}: {exc}。"
                     messages.append({"role": "user", "content": text})
