@@ -106,6 +106,11 @@ bash scripts/agentenv.sh scripts/encode_frames.py outputs/videos/<run>/frames
 
 中文字体（文泉驿正黑，从阿里镜像获取）已放在 `assets/fonts/`。
 
+编码 mp4 用 `imageio` + `imageio-ffmpeg`（后者自带 ffmpeg 二进制，**不需要系统 ffmpeg**），
+已包含在 `scripts/setup_agent_env.sh` 里。缺这两个包时录制器仍会逐轮写出 PNG 帧
+（不会丢失现场），只是 `finalize()` 编不出 mp4 —— 事后可用
+`scripts/encode_frames.py` 补编码。
+
 ## 结构
 
 ```

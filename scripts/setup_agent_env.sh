@@ -29,6 +29,10 @@ PKGS=(
     "transformers==5.12.1"
     accelerate bitsandbytes safetensors pillow modelscope
     "fla-core==0.5.2" "flash-linear-attention==0.5.2" "einops==0.8.1"
+    # Episode video (RECORD=1). imageio-ffmpeg SHIPS its own ffmpeg binary, so
+    # no system ffmpeg is required; without these two the recorder still writes
+    # every PNG frame but finalize() cannot encode the mp4.
+    imageio imageio-ffmpeg
 )
 
 echo "==> creating conda env '$ENV_AGENT' (python 3.11) in $CONDA_ROOT"
