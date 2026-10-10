@@ -49,9 +49,17 @@ trap cleanup EXIT INT TERM
 rm -f "$IPC_DIR"/cmd_*.json "$IPC_DIR"/resp_*.json
 
 echo "==> starting local simulator on 127.0.0.1:$TCP_PORT"
+# SEED changes the sim's randomization; TASK_ID/INIT_STATE pick a different scene
+# layout (LIBERO ships 10 init states per task). Both were unreachable before,
+# which made every run replay the SAME scene -- and in the 12th run the basket got
+# shoved out of the camera's view by the wandering arm, after which no release
+# position could ever be correct. Being able to vary the scene is a precondition
+# for telling "the model cannot aim" apart from "the target moved".
+SCENE_ARGS=(--seed "${SEED:-0}" --task-id "${TASK_ID:-0}")
 SIM_EGL_MODE=${SIM_EGL_MODE:-hardware} \
     bash "$HERE/simenv.sh" -u -m arm_agent.cli sim-server \
     --ipc-dir "$IPC_DIR" --tcp-port "$TCP_PORT" --idle-exit 7200 \
+    "${SCENE_ARGS[@]}" \
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -96,7 +104,7 @@ ARM_AGENT_MODEL_DIR="$MODEL_DIR" \
     PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True} \
     bash "$HERE/agentenv.sh" -u -m arm_agent.cli run \
     --ipc-dir "$IPC_DIR" --tcp-host 127.0.0.1 --tcp-port "$TCP_PORT" \
-    --episodes "$EPISODES" --max-turns "$MAXTURNS" \
+    --episodes "$EPISODES" --max-turns "$MAXTURNS" --init-state "${INIT_STATE:-0}" \
     --model-dir "$MODEL_DIR" --load "$LOAD" --gpu-mem-gib "$GPU_MEM_GIB" \
     --max-new-tokens "$MAX_NEW_TOKENS" --prompt-mode "$PROMPT_MODE" \
     "${BUDGET_ARGS[@]}" \
