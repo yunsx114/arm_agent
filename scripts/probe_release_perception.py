@@ -1,0 +1,208 @@
+"""Ask the model to judge the release point from a SINGLE turn of real frames.
+
+Why: the 80-turn run asserted "夹爪已到达篮子正上方" five times (t8/t15/t21/t26/t31)
+while the measured EEF was 5.3-7.4 cm OUTSIDE the basket opening in x every time
+and up to 29 cm short in y.  That is either (a) the model cannot see the relation
+from the pixels it is given, or (b) it can see it and the multi-turn context /
+system prompt talks it out of it.
+
+This probe isolates (b) from (a): one user message = the two real frames of that
+turn (agentview + wrist, exactly the pipeline the harness uses) + one neutral
+text question about the current state.  No tools, no history, no tool results.
+
+Ground truth (mesh-accurate opening, libero_object task 0, init_state 0):
+    opening x in [-0.0665, +0.0957]   y in [+0.1661, +0.3395]
+    centre  (0.0146, 0.2528)
+
+Usage:
+    ARM_AGENT_MODEL_DIR=/dev/shm/arm_agent_model bash scripts/simenv.sh \
+        scripts/probe_release_perception.py [--condition neutral|v2|both]
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+from PIL import Image  # noqa: E402
+
+from arm_agent.agent.llm import QwenAgentModel  # noqa: E402
+
+VIDEO = REPO / "outputs" / "videos" / "ep000_1791622918" / "video.mp4"
+EPISODE = REPO / "outputs" / "episodes" / "episode_000_1791623248.json"
+
+# Composite layout from agent/render.py: two 320x320 panels inside the left 640px.
+AGENT_BOX = (160, 20, 480, 340)
+WRIST_BOX = (160, 380, 480, 700)
+SOURCE_SIDE = 256  # render.py: "source frames are 256x256"
+
+OPEN_X = (-0.0665, 0.0957)
+OPEN_Y = (0.1661, 0.3395)
+
+# Turn -> what the model asserted, and the measured EEF at that moment.
+#
+# CAVEAT on frame vs decision: the recorder writes frame N *after* turn N's
+# tool ran (harness: call -> execute -> attach result+images -> record), so the
+# decision at turn N was made on frame N-1.  Both are listed: 7/14/20/25/30 are
+# the frames the model actually saw when it asserted "已到达篮子正上方", and
+# 8/15/21/26/31 are the states right after it released.
+TURNS = {
+    7: "DECISION FRAME for t8's claim（此时爪上仍夹着罐子）— 实测 y 差 20.4cm, x 差 5.9cm",
+    14: "DECISION FRAME for t15's claim（爪上仍夹着）— 实测 y 差 5.3cm, x 差 6.7cm",
+    20: "DECISION FRAME for t21's claim（爪上仍夹着）— 实测 y 在范围内, x 差 7.1cm",
+    25: "DECISION FRAME for t26's claim（爪上仍夹着）— 实测 y 在范围内, x 差 7.4cm",
+    30: "DECISION FRAME for t31's claim（爪上仍夹着）— 实测 y 在范围内, x 差 7.4cm",
+    8: "POST-ACTION: t8 open 之后（实测越出 x 5.9cm / y 20.5cm）",
+    15: "POST-ACTION: t15 open 之后（x 6.7cm / y 5.1cm）",
+    21: "POST-ACTION: t21 open 之后（x 7.0cm / y 0）",
+    26: "POST-ACTION: t26 open 之后（x 7.3cm / y 0）",
+    31: "POST-ACTION: t31 open 之后（x 7.2cm / y 0）",
+    32: "CONTROL: 真的在篮口内（实测 x=+0.0132, y=+0.2532），模型却说“物体仍未落入篮中”",
+    60: "CONTROL: 明显在远处角落（实测 x 差 48.7cm）",
+}
+
+QUESTION = (
+    "以上两张图是同一时刻机器人的画面：第 1 张是全局第三人称视角，第 2 张是装在夹爪上的腕部相机、朝正下方看。\n"
+    "只根据这两张画面回答，不要根据常识或任务目标猜测：\n"
+    "1. 分别描述两张画面里各自能看到的主要内容。\n"
+    "2. 第 2 张（腕部）画面正中央的下方是什么？\n"
+    "3. 画面里那个容器（篮子）的开口，是否就在夹爪的正下方？如果不在，请说明它相对夹爪的方位，"
+    "以及大概有多远（用画面里物体的尺寸作参照来估计）。\n"
+    "4. 如果现在张开夹爪，手里的物体会落进那个容器里吗？\n"
+    "请简短回答，逐条对应。"
+)
+
+NEUTRAL_SYSTEM = (
+    "你是一个机器人视觉助手。你只能依据给出的画面来回答，画面里看不出来的事情就直接说看不到，不要臆测。"
+)
+
+# The `leading` wording above contains "是否就在夹爪的正下方？如果不在，请说明方位",
+# which presupposes "not below" as a live answer -- and the t32 control shows the
+# model will say "not below" even when it IS below, so that wording cannot by
+# itself prove spontaneous detection.  This variant asks the same three facts with
+# no presupposition, and question 3 is phrased symmetrically ("是否会进入").
+QUESTION_OPEN = (
+    "以上两张图是同一时刻机器人的画面：第 1 张是全局第三人称视角，第 2 张是装在夹爪上的腕部相机、朝正下方看。\n"
+    "只根据这两张画面回答，不要根据常识或任务目标猜测：\n"
+    "1. 夹爪正下方有什么？请具体描述你看到的东西。\n"
+    "2. 画面里那个容器（篮子）在什么位置？相对夹爪是哪个方向、大概多远（用画面里物体的尺寸作参照）？\n"
+    "3. 如果此刻张开夹爪，手里的物体会落到哪里？请给出具体位置，并说明它是否会进入那个容器。\n"
+    "请简短回答，逐条对应。"
+)
+
+
+def frames_for(turns: list[int]) -> dict[int, tuple[Image.Image, Image.Image]]:
+    import imageio.v3 as iio
+
+    # Frame index == turn number: the recorder writes one frame per turn plus an
+    # initial and a final one, so 80 turns -> 82 frames.
+    needed = set(turns) | {0}
+    got: dict[int, tuple[Image.Image, Image.Image]] = {}
+    for i, arr in enumerate(iio.imiter(str(VIDEO))):
+        if i in needed:
+            img = Image.fromarray(np.asarray(arr))
+            agent = img.crop(AGENT_BOX).resize((SOURCE_SIDE, SOURCE_SIDE), Image.LANCZOS)
+            wrist = img.crop(WRIST_BOX).resize((SOURCE_SIDE, SOURCE_SIDE), Image.LANCZOS)
+            got[i] = (agent, wrist)
+        if i > max(needed):
+            break
+    missing = [t for t in turns if t not in got]
+    if missing:
+        raise SystemExit(f"video has no frames for turns {missing}")
+    return got
+
+
+def measured() -> dict[int, str]:
+    import json
+
+    d = json.load(open(EPISODE))
+    out: dict[int, str] = {}
+    for e in d["transcript"]:
+        if "result" not in e:
+            continue
+        ee = ((e.get("structured_result") or {}).get("measurement") or {}).get("eef_end")
+        if not ee:
+            continue
+        x, y = ee[0], ee[1]
+        xo = max(OPEN_X[0] - x, x - OPEN_X[1], 0.0) * 100
+        yo = max(OPEN_Y[0] - y, y - OPEN_Y[1], 0.0) * 100
+        out[e["turn"]] = f"x={x:+.4f} y={y:+.4f}  越出篮口 x {xo:.1f}cm / y {yo:.1f}cm"
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--condition", choices=["neutral", "v2", "both"], default="both")
+    # 420 truncated several answers mid-sentence, so "did it then call open?"
+    # could not be read off the output.  Long Chinese answers need ~700.
+    ap.add_argument("--max-new-tokens", type=int, default=700)
+    ap.add_argument("--turns", default="", help="comma-separated override of TURNS keys")
+    # leading = the wording with "如果不在" (presupposes not-below);
+    # open    = same three facts asked without presupposition.
+    ap.add_argument("--question", choices=["leading", "open"], default="leading")
+    ap.add_argument("--load", default=os.environ.get("LOAD", "bf16"))
+    ap.add_argument("--gpu-mem-gib", type=float, default=float(os.environ.get("GPU_MEM_GIB", 29)))
+    args = ap.parse_args()
+
+    if args.turns:
+        keep = [int(x) for x in args.turns.split(",") if x.strip()]
+        TURNS = {k: f"(specified) frame {k}" for k in keep}  # noqa: F841 - local override
+        globals()["TURNS"] = TURNS
+
+    model_dir = os.environ.get("ARM_AGENT_MODEL_DIR", str(REPO.parent / "qwen35_demo" / "models" / "Qwen3.5-9B"))
+    truth = measured()
+    frames = frames_for(sorted(TURNS))
+
+    systems = {}
+    if args.condition in ("neutral", "both"):
+        systems["neutral"] = NEUTRAL_SYSTEM
+    if args.condition in ("v2", "both"):
+        from arm_agent.agent.prompts import get_system_prompt
+
+        systems["v2"] = get_system_prompt("v2")
+
+    model = QwenAgentModel(
+        model_dir=model_dir,
+        load=args.load,
+        gpu_mem_gib=args.gpu_mem_gib,
+        max_new_tokens=args.max_new_tokens,
+        temperature=0.0,
+        image_max_side=160,  # same as the run (harness default)
+    )
+    model.load_model()
+
+    for name, system in systems.items():
+        for turn in sorted(TURNS):
+            agent, wrist = frames[turn]
+            question = QUESTION_OPEN if args.question == "open" else QUESTION
+            messages = [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": agent},
+                        {"type": "image", "image": wrist},
+                        {"type": "text", "text": question},
+                    ],
+                },
+            ]
+            reply = model.chat(messages, None)
+            print("=" * 100)
+            print(f"[{name}/{args.question}] turn {turn}  {TURNS[turn]}")
+            print(f"  实测: {truth.get(turn, '-')}")
+            print("-" * 100)
+            print(reply.strip())
+            print()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
