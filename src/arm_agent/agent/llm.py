@@ -247,8 +247,13 @@ def prepare_for_model(
     """Replace all but the newest `keep_recent_images` frames with a text stub.
 
     This is the M1 image-elision budget: the processor would otherwise re-encode
-    the full image history on every turn. The stub keeps a breadcrumb (camera +
-    the step it was taken) so the model knows a frame existed.
+    the full image history on every turn. The stub keeps a breadcrumb so the
+    model knows a frame existed.
+
+    One stub PER MESSAGE, not per image (changed 2026-10-10): a message now
+    carries two cameras, and a stub costs ~20 tokens, so per-image stubs would
+    make the 32-message tail pay ~600 extra tokens for information that is gone
+    either way.
     """
     total = sum(
         sum(1 for item in message["content"] if isinstance(item, dict) and item.get("type") == "image")
@@ -258,23 +263,28 @@ def prepare_for_model(
     if total <= keep_recent_images:
         return messages
 
-    to_drop = total - keep_recent_images
+    keep_from = total - keep_recent_images  # index of the first frame to keep
     out: list[dict[str, Any]] = []
+    seen = 0
     for message in messages:
         content = message.get("content")
         if not isinstance(content, list):
             out.append(message)
             continue
-        new_items = []
+        n_img = sum(1 for item in content if isinstance(item, dict) and item.get("type") == "image")
+        drop_all = n_img > 0 and seen + n_img <= keep_from
+        seen += n_img
+        if not drop_all:
+            out.append(message)
+            continue
+        new_items: list[dict[str, Any]] = []
+        stubbed = False
         for item in content:
-            if (
-                to_drop > 0
-                and isinstance(item, dict)
-                and item.get("type") == "image"
-            ):
-                to_drop -= 1
-                new_items.append({"type": "text", "text": "[较早的画面已省略，参考随后的状态数字]"})
-            else:
-                new_items.append(item)
+            if isinstance(item, dict) and item.get("type") == "image":
+                if not stubbed:
+                    new_items.append({"type": "text", "text": "[较早的画面已省略，参考随后的状态数字]"})
+                    stubbed = True
+                continue
+            new_items.append(item)
         out.append({**message, "content": new_items})
     return out

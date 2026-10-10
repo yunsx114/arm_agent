@@ -33,11 +33,12 @@ from arm_agent.agent.tool_protocol import canonical_name, structured_result
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
 
 SKILLS_DIRNAME = "skills"
-# Feed-back images: only the most recent N frames stay as pixels; the rest are
-# text stubs. Was 2 until v7 -- the prompt grew, and one extra frame's image
-# tokens plus the longer system prompt pushed the unfused attention over the
-# top. 1 frame is the newest view, which is the one the decision needs.
-HISTORY_IMAGE_KEEP = 1
+# Feed-back images: the newest N frames stay as pixels, the rest become text
+# stubs. Was 1 while only the agent view was attached; the loop now attaches the
+# agent AND wrist cameras each step, so 2 keeps exactly one whole frame pair
+# (keeping 1 would silently throw away half of the newest pair). Tokens: 2 x
+# 66 = 133 per turn, and only for the newest turn.
+HISTORY_IMAGE_KEEP = 2
 # Conversation cap. MEASURED (probe_gpu_memory.py): the OOM allocation was
 # exactly one full-attention N x N matrix (2900^2 * 16 heads * 2 bytes = 266 MiB)
 # — on this Turing card SDPA has no mem-efficient kernel, so attention memory
@@ -173,12 +174,15 @@ class Harness:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": images["agent"]},
+                        *(
+                            [{"type": "image", "image": images[cam]} for cam in ("agent", "wrist") if images.get(cam) is not None]
+                            or [{"type": "image", "image": images["agent"]}]
+                        ),
                         {
                             "type": "text",
                             "text": (
                                 f"任务：{result.language}\n"
-                                f"[上图是全局相机看到的场景]\n"
+                                f"[上图：全局相机 + 腕部相机（从上往下看夹爪下方，用来判断自己在哪）]\n"
                                 f"{format_state(obs)}\n"
                                 "请开始。记住：每次只调用一个工具。"
                             ),
@@ -357,8 +361,30 @@ class Harness:
                 # (open before close; do not descend onto your own payload) now
                 # live in the system prompt instead.
                 content: list[dict[str, Any]] = []
-                if outcome.get("image") is not None and self.attach_images:
-                    content.append({"type": "image", "image": outcome["image"]})
+                if self.attach_images:
+                    # BOTH cameras, every step that has fresh frames.
+                    #
+                    # MEASURED 2026-10-10: only the agent view was ever attached,
+                    # so "am I actually above the basket?" had to be inferred from
+                    # a third-person 256 px frame. The model released the can
+                    # 23 cm short (run 5, t9) and then 7 cm short from 10 cm of
+                    # drop height (run 6, t56), which rolled it out of the arm's
+                    # reach for the rest of the episode.
+                    #
+                    # The wrist camera looks straight down at what is under the
+                    # pads -- exactly the missing piece. Cost, measured with the
+                    # real processor (patch 16 / merge 2): a 160 px frame is
+                    # grid [1,16,16] = 64 image tokens + 2 delimiters = 66, so the
+                    # second camera adds ~67 tokens PER TURN, and only for the
+                    # newest turn -- older frames are already replaced by a text
+                    # stub (see llm.prepare_for_model).
+                    pair = outcome.get("images") or {}
+                    for cam in ("agent", "wrist"):
+                        frame = pair.get(cam)
+                        if frame is not None:
+                            content.append({"type": "image", "image": frame})
+                    if not content and outcome.get("image") is not None:
+                        content.append({"type": "image", "image": outcome["image"]})
 
                 # Deleted 2026-10-10: the grip-slip TREND tracker and its
                 # "⛔ 物体掉了" event (`_prev_gap` + `_hold_gap`).
