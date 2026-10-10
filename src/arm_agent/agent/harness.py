@@ -171,6 +171,9 @@ class Harness:
         # that has already produced one false alarm that cost a whole episode
         # (a deliberate `open` reported as "物体掉了", 2026-10-10).
         self._grasped = False
+        # Which container the executor last ran `approach` on. The release gate
+        # hands this to the verifier together with that object's MEASURED centre.
+        self._last_approach_target = ""
         # Two-role release gate. Same weights, DIFFERENT context: when the
         # executor asks to open the gripper while carrying a payload, the harness
         # suspends that context and asks a verifier (fresh message list, its own
@@ -193,7 +196,7 @@ class Harness:
 
     # ------------------------------------------------------------- verifier
     def _release_verdict(
-        self, executor_reply: str, images: dict[str, Any] | None
+        self, executor_reply: str, images: dict[str, Any] | None, obs: dict[str, Any] | None = None
     ) -> tuple[bool, str]:
         """Ask the verifier role whether the pending `gripper open` may proceed.
 
@@ -206,6 +209,7 @@ class Harness:
         more move; releasing wrongly drops the payload and ends the attempt.
         """
         pair = images or {}
+        facts = self._gate_facts(obs)
         content: list[dict[str, Any]] = []
         for cam in ("agent", "wrist"):
             frame = pair.get(cam)
@@ -216,12 +220,14 @@ class Harness:
                 "type": "text",
                 "text": (
                     f"任务目标：{self._task_text}\n"
+                    "环境实测数字（由环境直接测量，不是执行者的说法）：\n"
+                    f"{facts}\n"
                     "执行者现在请求执行的动作：张开夹爪（gripper open）放下物体。\n"
-                    "以下是执行者这一轮的完整自述（可能不准，以画面为准）：\n"
+                    "以下是执行者这一轮的完整自述（可能不准）：\n"
                     "<执行者自述>\n"
                     f"{executor_reply.strip()}\n"
                     "</执行者自述>\n\n"
-                    "请按系统提示词里的唯一标准裁决，并只调用 release 工具一次。"
+                    "请按系统提示词里的标准裁决，并只调用 release 工具一次。"
                 ),
             }
         )
@@ -250,6 +256,40 @@ class Harness:
                     return False, reason or "核验者未给出理由"
                 return False, f"核验者给出了无法识别的裁决 {verdict!r}：{reason}"
         return False, f"核验者没有给出 release 调用（原文：{reply.strip()[:120]}）"
+
+    def _gate_facts(self, obs: dict[str, Any] | None) -> str:
+        """Instrument readings handed to the verifier, in one place.
+
+        WHY: an images-only verifier was asked to judge "is the gripper over the
+        container opening" from one oblique render plus a wrist view that the
+        payload itself fills. MEASURED (2026-10-10, INIT_STATE=0): at the
+        provably correct release pose -- `approach(basket_1, 20)` reported xy err
+        1.3 mm against the basket's measured centre, basket never moved -- the
+        verifier rejected 4/4 attempts ("夹爪位于左侧，篮子在右侧，两者有明显水平
+        距离"). Pixels confirm the pose was correct. So the numbers go in.
+        """
+        if not obs:
+            return "（环境未提供数字，只能靠画面判断）"
+        lines: list[str] = []
+        eef = obs.get("eef_pos") or []
+        if len(eef) == 3:
+            lines.append(f"- 夹爪当前位置: ({eef[0]:+.4f}, {eef[1]:+.4f}, {eef[2]:+.4f}) m")
+        name = getattr(self, "_last_approach_target", "")
+        container = (obs.get("objects") or {}).get(name) if name else None
+        if container and len(container) >= 3:
+            cx, cy = container[0], container[1]
+            lines.append(f"- 容器 `{name}` 开口中心（按它自己的几何中心测）: ({cx:+.4f}, {cy:+.4f}) m")
+            if len(eef) == 3:
+                dx = (eef[0] - cx) * 100.0
+                dy = (eef[1] - cy) * 100.0
+                lines.append(
+                    f"- 差量: 夹爪比容器中心 Δx={dx:+.1f}cm, Δy={dy:+.1f}cm；爪心 z={eef[2]:.4f} m"
+                )
+        elif name:
+            lines.append(f"- 最近一次 approach 的目标是 `{name}`，但没有它的坐标。")
+        else:
+            lines.append("- 执行者还没 approach 过任何容器，不知道它想放进哪里。")
+        return "\n".join(lines)
 
     # -------------------------------------------------------------- episode
     def run_episode(
@@ -383,7 +423,7 @@ class Harness:
                     and self._grasped
                 ):
                     t_v0 = time.time()
-                    approved, reason = self._release_verdict(reply, last_images)
+                    approved, reason = self._release_verdict(reply, last_images, obs)
                     self._say(
                         f"[turn {turn}] gate: {'放行' if approved else '拒绝'} "
                         f"({time.time() - t_v0:.1f}s) {reason[:80]}"
@@ -415,6 +455,16 @@ class Harness:
                     outcome = self._dispatch(call, obs)
                     outcome["result"] = self._structured_outcome(call, outcome)
                     tool_s = time.time() - t_tool0
+                    # Remember which container the executor last tried to align
+                    # with, so the release gate can hand the verifier that
+                    # container's MEASURED centre instead of asking it to guess
+                    # millimetres from one oblique render (MEASURED: images-only
+                    # verifier rejected 4/4 attempts at a provably correct pose,
+                    # xy err 1.3 mm -- see _release_verdict).
+                    if canonical_name(str(call.name)) == "approach":
+                        _tgt = str((call.args or {}).get("target", "")).strip()
+                        if _tgt:
+                            self._last_approach_target = _tgt
                 except Exception as exc:  # noqa: BLE001 - tool errors are prompts, not crashes
                     text = f"[工具错误] {type(exc).__name__}: {exc}。"
                     messages.append({"role": "user", "content": text})
