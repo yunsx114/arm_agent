@@ -23,6 +23,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from arm_agent.agent.tool_protocol import validate_tool_call
+
 _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _FUNCTION_RE = re.compile(r"<function=([\w.\-]+)>")
 _PARAM_RE = re.compile(r"<parameter=([\w.\-]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
@@ -43,6 +45,13 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
         args = {m.group(1): m.group(2) for m in _PARAM_RE.finditer(block)}
         calls.append(ToolCall(name=match.group(1), args=args))
     return calls
+
+
+def validate_calls(calls: list[ToolCall], *, legacy: bool = False) -> list[str]:
+    """Validate call count and arguments before dispatch."""
+    if len(calls) != 1:
+        return [f"expected_exactly_one_call:got_{len(calls)}"]
+    return validate_tool_call(calls[0].name, calls[0].args, legacy=legacy)
 
 
 def truncate_to_first_call(text: str) -> str:

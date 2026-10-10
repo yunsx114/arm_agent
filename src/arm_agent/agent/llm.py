@@ -99,6 +99,8 @@ class QwenAgentModel:
             from transformers import BitsAndBytesConfig
 
             kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        elif self.load in ("bf16", "bfloat16"):
+            kwargs["dtype"] = torch.bfloat16
         elif self.load in ("fp16", "float16"):
             kwargs["dtype"] = torch.float16
         elif self.load in ("fp32", "float32"):

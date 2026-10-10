@@ -13,6 +13,7 @@ conversation is Chinese and the template output is bilingual-tolerant.
 from __future__ import annotations
 
 from typing import Any
+from arm_agent.agent.tool_protocol import CANONICAL_TOOLS
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -190,6 +191,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
+LEGACY_TOOL_SCHEMAS = TOOL_SCHEMAS
+TOOL_SCHEMAS_V2: list[dict[str, Any]] = [
+    {"type": "function", "function": {"name": "observe", "description": "读取当前状态和场景证据；可选 target 指定物体。只观察，不移动。", "parameters": {"type": "object", "properties": {"target": {"type": "string"}, "camera": {"type": "string", "enum": ["agent", "wrist"]}}, "required": []}}},
+    {"type": "function", "function": {"name": "approach", "description": "将末端移动到目标上方并下降到指定高度；不执行夹爪动作。", "parameters": {"type": "object", "properties": {"target": {"type": "string"}, "height_offset_cm": {"type": "number"}}, "required": ["target"]}}},
+    {"type": "function", "function": {"name": "move", "description": "沿世界坐标轴移动指定距离。返回实测位移，不保证完全到达。", "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["+x", "-x", "+y", "-y", "+z", "-z"]}, "distance_cm": {"type": "number"}}, "required": ["direction", "distance_cm"]}}},
+    {"type": "function", "function": {"name": "rotate", "description": "绕世界坐标轴旋转末端并返回实测结果。", "parameters": {"type": "object", "properties": {"axis": {"type": "string", "enum": ["yaw", "pitch", "roll"]}, "angle_deg": {"type": "number"}}, "required": ["axis", "angle_deg"]}}},
+    {"type": "function", "function": {"name": "gripper", "description": "打开或闭合夹爪；返回指宽和是否夹住物体的测量结果。", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["open", "close"]}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "verify", "description": "请求环境验证当前任务状态；成功与否由环境真值决定。", "parameters": {"type": "object", "properties": {"claim": {"type": "string", "enum": ["placed", "grasped", "task_complete"]}}, "required": ["claim"]}}},
+]
+
 SYSTEM_PROMPT = """你是机械臂智能体的决策核心。你通过调用工具观察场景、移动机械臂，完成"把指定物体拿起来放进篮子"的任务。
 
 ## 工作方式
@@ -293,13 +304,34 @@ SYSTEM_PROMPT_PLAIN = """你是机械臂智能体的决策核心。任务是：�
 完成后调用 `declare_done`。
 """
 
+SYSTEM_PROMPT_V2 = """你是机械臂任务决策核心。目标是完成当前任务。
+
+每次只调用一个工具。工具结果是环境测量，不是行动建议；不要假设动作一定完成。
+如果动作被拒绝或只完成一部分，根据返回的状态和事件自行选择下一步。
+不要发明工具、参数或并行调用。verify 的成功与否只由环境验证。
+
+坐标系：世界坐标中 +z 向上，位置单位米，move 距离单位厘米。
+工具职责：
+- observe：读取状态和场景证据，不移动。
+- approach：到目标上方并下降，不操作夹爪。
+- move：执行明确的相对平移。
+- rotate：执行明确的姿态旋转。
+- gripper：打开或闭合并报告测量到的夹爪状态。
+- verify：让环境检查任务是否完成。
+"""
+
 
 PROMPT_MODES = {
     "full": SYSTEM_PROMPT,
     "plain": SYSTEM_PROMPT_PLAIN,
+    "v2": SYSTEM_PROMPT_V2,
 }
 
 
 def get_system_prompt(mode: str = "full") -> str:
     """Pick the system prompt. Unknown modes fall back to `full`."""
     return PROMPT_MODES.get(str(mode).strip().lower(), SYSTEM_PROMPT)
+
+
+def get_tool_schemas(protocol: str = "v2") -> list[dict[str, Any]]:
+    return TOOL_SCHEMAS_V2 if str(protocol).strip().lower() == "v2" else LEGACY_TOOL_SCHEMAS

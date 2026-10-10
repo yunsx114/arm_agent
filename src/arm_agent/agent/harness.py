@@ -25,8 +25,11 @@ from typing import Any
 import numpy as np
 
 from arm_agent.agent.llm import prepare_for_model
-from arm_agent.agent.parser import ToolCall, as_float, parse_tool_calls, truncate_to_first_call
-from arm_agent.agent.prompts import TOOL_SCHEMAS, get_system_prompt
+from arm_agent.agent.parser import (
+    ToolCall, as_float, parse_tool_calls, truncate_to_first_call, validate_calls,
+)
+from arm_agent.agent.prompts import get_system_prompt, get_tool_schemas
+from arm_agent.agent.tool_protocol import canonical_name, structured_result
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
 
 SKILLS_DIRNAME = "skills"
@@ -83,6 +86,7 @@ class Harness:
         attach_images: bool = True,
         log: bool = True,
         prompt_mode: str = "full",
+        tool_protocol: str = "v1",
     ) -> None:
         self.client = client
         self.model = model
@@ -92,7 +96,10 @@ class Harness:
         self.log = log
         # "full" = the accumulated scene-specific prompt; "plain" = task +
         # frame + tool semantics only (see prompts.get_system_prompt).
-        self.prompt_mode = prompt_mode
+        self.prompt_mode = "v2" if tool_protocol == "v2" and prompt_mode == "full" else prompt_mode
+        self.tool_protocol = tool_protocol
+        self.tool_schemas = get_tool_schemas(tool_protocol)
+        self.legacy_tools = str(tool_protocol).lower() != "v2"
         self.skills_dir = self.workspace / SKILLS_DIRNAME
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         # Last observed grip offset, used to detect the payload creeping out of
@@ -168,7 +175,7 @@ class Harness:
                 try:
                     reply = self.model.chat(
                         prepare_for_model(compact_history(messages), HISTORY_IMAGE_KEEP),
-                        tools=TOOL_SCHEMAS,
+                        tools=self.tool_schemas,
                     )
                 except Exception as exc:  # noqa: BLE001
                     # Measured failure modes that must not lose the episode: CUDA
@@ -183,11 +190,12 @@ class Harness:
                 messages.append({"role": "assistant", "content": reply})
                 transcript.append({"turn": turn, "assistant": reply})
 
-                if len(calls) != 1:
+                call_errors = validate_calls(calls, legacy=self.legacy_tools)
+                if call_errors:
                     result.protocol_retries += 1
                     note = (
-                        "你的上一条回复没有包含工具调用或包含多个。"
-                        "请只输出**一个** <tool_call>...</tool_call> 块。"
+                        f"工具协议错误：{', '.join(call_errors)}。"
+                        "请只输出一个合法工具调用，并修正参数。"
                     )
                     messages.append({"role": "user", "content": note})
                     transcript.append({"turn": turn, "protocol_retry": True})
@@ -196,7 +204,7 @@ class Harness:
                         recorder.record(
                             turn,
                             reply=reply,
-                            tool_call=f"(协议失败: 解析出 {len(calls)} 个调用)",
+                            tool_call=f"(协议失败: {', '.join(call_errors)})",
                             result=note,
                             status="协议重试",
                             status_color=YELLOW,
@@ -211,9 +219,10 @@ class Harness:
                 try:
                     t_tool0 = time.time()
                     outcome = self._dispatch(call, obs)
+                    outcome["result"] = self._structured_outcome(call, outcome)
                     tool_s = time.time() - t_tool0
                 except Exception as exc:  # noqa: BLE001 - tool errors are prompts, not crashes
-                    text = f"[工具错误] {type(exc).__name__}: {exc}。请修正参数后重试。"
+                    text = f"[工具错误] {type(exc).__name__}: {exc}。"
                     messages.append({"role": "user", "content": text})
                     transcript.append({"turn": turn, "tool_error": text})
                     if recorder is not None:
@@ -269,8 +278,11 @@ class Harness:
                 if outcome["done"]:
                     result.done_declared = True
                     result.success = bool(outcome["success"])
-                    messages.append({"role": "user", "content": outcome["text"]})
-                    transcript.append({"turn": turn, "result": outcome["text"], "success": result.success})
+                    result_text = outcome["text"] + "\n" + json.dumps(
+                        outcome["result"], ensure_ascii=False, separators=(",", ":")
+                    )
+                    messages.append({"role": "user", "content": result_text})
+                    transcript.append({"turn": turn, "result": result_text, "success": result.success})
                     if result.success:
                         break
                     continue
@@ -353,10 +365,18 @@ class Harness:
                     self._prev_gap = gap
                 content.append({
                     "type": "text",
-                    "text": outcome["text"] + "\n" + format_state(obs, self._grasped) + slip + hurt,
+                    "text": (
+                        outcome["text"] + "\n"
+                        + json.dumps(outcome["result"], ensure_ascii=False, separators=(",", ":"))
+                        + "\n" + format_state(obs, self._grasped) + slip + hurt
+                    ),
                 })
                 messages.append({"role": "user", "content": content})
-                transcript.append({"turn": turn, "result": outcome["text"] + slip + hurt})
+                transcript.append({
+                    "turn": turn,
+                    "result": outcome["text"] + slip + hurt,
+                    "structured_result": outcome["result"],
+                })
                 self._prev_grasped = self._grasped
 
         except Exception as exc:  # noqa: BLE001 - keep episode artifacts even on crash
@@ -379,6 +399,38 @@ class Harness:
 
     def _dispatch(self, call: ToolCall, obs: dict[str, Any]) -> dict[str, Any]:
         name, args = call.name, call.args
+        original_name = name
+        canonical = canonical_name(name)
+        if canonical == "observe":
+            if args.get("target") or original_name == "locate":
+                return {"obs": obs, "text": self._locate(args.get("target", args.get("name", "")), obs), "image": None, "done": False}
+            if original_name == "look" or args.get("camera"):
+                resp = self.client.look(camera=args.get("camera", "agent"))
+                images = resp.images(self.client.ipc_dir)
+                cam = args.get("camera", "agent")
+                return {
+                    "obs": resp.obs,
+                    "text": f"[observe] refreshed {cam} view",
+                    "image": images.get(cam),
+                    "images": images,
+                    "done": False,
+                }
+            return {"obs": obs, "text": f"[observe] {format_state(obs, self._grasped)}", "image": None, "done": False}
+        if canonical == "approach":
+            if original_name == "align_xy":
+                name = "align_xy"
+            else:
+                name = "descend_to"
+                args = {
+                    **args,
+                    "name": args.get("target", args.get("name", "")),
+                    "z_offset_cm": args.get("height_offset_cm", args.get("z_offset_cm", "1.2")),
+                }
+        elif canonical == "gripper":
+            name = "set_gripper"
+        elif canonical == "verify":
+            name = "declare_done"
+            args = {**args, "answer_note": args.get("claim", args.get("answer_note", ""))}
 
         if name == "look":
             resp = self.client.look(camera=args.get("camera", "agent"))
@@ -538,6 +590,32 @@ class Harness:
         raise ValueError(f"unknown tool: {name!r}")
 
     # ------------------------------------------------------------------ util
+    def _structured_outcome(self, call: ToolCall, outcome: dict[str, Any]) -> dict[str, Any]:
+        raw = outcome.get("outcome", outcome)
+        measurement = {
+            key: raw[key]
+            for key in ("eef_start", "eef_end", "measured_delta_m", "steps")
+            if key in raw
+        }
+        if "note" in raw:
+            measurement["note"] = raw["note"]
+        status = "verified" if outcome.get("done") and outcome.get("success") else (
+            "not_verified" if outcome.get("done") else "completed"
+        )
+        events: list[dict[str, Any]] = []
+        if "只走了" in str(outcome.get("text", "")):
+            status = "partial"
+            events.append({"type": "motion_shortfall"})
+        if outcome.get("done") and not outcome.get("success"):
+            events.append({"type": "completion_check_failed"})
+        return structured_result(
+            tool=canonical_name(call.name),
+            status=status,
+            requested=outcome.get("requested") or raw.get("requested") or dict(call.args),
+            measurement=measurement,
+            events=events,
+        )
+
     def _locate(self, query: str, obs: dict[str, Any]) -> str:
         """Report a GT object position (the 'object detector' affordance).
 

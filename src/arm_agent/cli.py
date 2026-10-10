@@ -97,6 +97,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_turns=args.max_turns,
         attach_images=not args.no_images,
         prompt_mode=args.prompt_mode,
+        tool_protocol=args.tool_protocol,
     )
 
     results = []
@@ -164,7 +165,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--init-state", type=int, default=0)
     p.add_argument("--max-turns", type=int, default=60)
     p.add_argument("--model-dir", default=str(DEFAULT_MODEL))
-    p.add_argument("--load", default="4bit", choices=["4bit", "8bit", "fp16", "fp32", "cpu", "auto"])
+    p.add_argument(
+        "--load",
+        default="4bit",
+        choices=["4bit", "8bit", "bf16", "bfloat16", "fp16", "fp32", "cpu", "auto"],
+    )
     p.add_argument("--gpu-mem-gib", type=float, default=9.5)
     p.add_argument(
         "--gpus",
@@ -181,6 +186,12 @@ def main(argv: list[str] | None = None) -> int:
         default="full",
         choices=["full", "plain"],
         help="full = 累积了场景专用补丁的提示；plain = 只给任务/坐标系/工具语义（P0a 剩离实验）",
+    )
+    p.add_argument(
+        "--tool-protocol",
+        default="v2",
+        choices=["v1", "v2"],
+        help="model tool surface; v1 keeps the legacy tools for A/B comparison",
     )
     p.add_argument("--record", action="store_true", help="record an mp4 per episode (cameras + model I/O)")
     p.add_argument("--video-fps", type=int, default=2)
