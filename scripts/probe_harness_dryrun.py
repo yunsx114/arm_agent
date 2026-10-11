@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -192,6 +193,128 @@ def _call(name: str, args: dict) -> str:
     return f"<tool_call>\n<function={name}>\n{params}\n</function>\n</tool_call>"
 
 
+# ---------------------------------------------------------------- 档 A leg
+# The scripted policy above drives the LEGACY surface (`set_gripper`), which is
+# still the v1 path. 档 A added `grasp` / `release` to the v2 surface, and the
+# properties that matter are not "did the tool call arrive" but:
+#   * the model is told a CONCEPT, not a finger width;
+#   * `_grasped` follows the CONTACT table (so the state line is honest);
+#   * `release()` returns only after the payload cleared the pads, which is what
+#     makes an immediately following `verify` meaningful (before 档 A that check
+#     failed 8/8 times and the model read it as "my release failed").
+# This leg runs that exact sequence with no LLM, so it is cheap enough to run on
+# every change.
+CONCEPT_SCRIPT: list[tuple[str, dict[str, str]]] = [
+    ("release", {}),
+    ("approach", {"target": "alphabet soup", "height_offset_cm": "1.2"}),
+    ("grasp", {}),
+    # TWO lifts on purpose: `move` clamps to MOVE_MAX_DISTANCE_CM = 15, so a
+    # single `move +z 25` only reaches ~0.20 -- 4.5 cm short of the 0.22 the
+    # payload bottom needs to clear the rim. MEASURED here: the lateral travel
+    # then scraped the rim and pushed the BASKET 18 cm away (final basket y =
+    # 0.434 vs 0.252 at reset), which is the documented "approach pushes the
+    # basket" failure, and the release missed.
+    ("move", {"direction": "+z", "distance_cm": "15"}),
+    ("move", {"direction": "+z", "distance_cm": "10"}),
+    ("approach", {"target": "basket", "height_offset_cm": "25"}),
+    ("release", {}),
+    ("verify", {"claim": "placed"}),
+]
+
+
+class ConceptPolicy:
+    """Emits CONCEPT_SCRIPT in order, then repeats the last call.
+
+    It also records the `爪上：` state line it is shown, because that line lives
+    inside the user message the harness builds each turn -- the transcript does
+    not store it, so the model is the only place a no-LLM probe can read it.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.state_lines: list[str] = []
+
+    def chat(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+        for message in messages:
+            content = message.get("content")
+            if message.get("role") != "user":
+                continue
+            # The harness builds user content as a PARTS LIST (images + a text
+            # part); the first version of this probe tested `isinstance(str)`
+            # and therefore collected zero state lines.
+            parts = content if isinstance(content, list) else [content]
+            for part in parts:
+                if isinstance(part, str) and "爪上：" in part:
+                    self.state_lines.append(part)
+                elif isinstance(part, dict) and "爪上：" in str(part.get("text", "")):
+                    self.state_lines.append(str(part["text"]))
+        turns = sum(1 for m in messages if m.get("role") == "assistant")
+        name, args = CONCEPT_SCRIPT[min(turns, len(CONCEPT_SCRIPT) - 1)]
+        reply = (
+            "现状：脚本化步骤。\n判定：按顺序执行。\n动作：调用工具。\n"
+            + _call(name, args)
+        )
+        self.calls.append({"name": name, "args": args})
+        return reply
+
+
+def concept_leg(ipc_dir: Path) -> bool:
+    server = SimServer(ipc_dir=ipc_dir, suite_name="libero_object", task_id=0, cam_size=256)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"idle_exit_s": 120}, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    client = SimClient(ipc_dir)
+    policy = ConceptPolicy()
+    harness = Harness(
+        client=client,
+        model=policy,
+        workspace=REPO,
+        max_turns=20,
+        tool_protocol="v2",
+        log=False,
+    )
+    result = harness.run_episode(init_state_idx=0, episode_id=998)
+    final_obs = client.state().obs
+    transcript = json.loads(Path(result.transcript_path).read_text())["transcript"]
+    client.close()
+    time.sleep(0.3)
+
+    texts = [e["result"] for e in transcript if e.get("result")]
+    structs = [e["structured_result"] for e in transcript if e.get("structured_result")]
+    grasp_results = [t for t in texts if t.startswith("[grasp]")]
+    release_results = [t for t in texts if t.startswith("[release]")]
+    grasp_struct = [s for s in structs if s.get("tool") == "grasp"]
+    state_lines = policy.state_lines
+
+    checks = {
+        "grasp 返回了概念而不是指宽": bool(grasp_results)
+        and "夹住了" in grasp_results[0]
+        and "0.0" not in grasp_results[0],
+        "grasp 的结构化结果里有接触与 body": bool(grasp_struct)
+        and grasp_struct[0].get("status") == "grasped"
+        and (grasp_struct[0].get("measurement") or {}).get("contact_sides") == ["left", "right"],
+        "release 返回了概念": bool(release_results) and "已放开" in release_results[0],
+        "状态行跟着接触走": any("有物体（两指接触）" in s for s in state_lines)
+        and any("爪上：空" in s for s in state_lines),
+        "release 之后立刻判定成功": bool(result.success),
+    }
+    for label, passed in checks.items():
+        print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
+    print(f"  概念腿：success={result.success} source={result.success_source} "
+          f"turns={result.turns} retries={result.protocol_retries}")
+    if grasp_results:
+        print(f"  示例：{grasp_results[0]}")
+    if release_results:
+        print(f"  示例：{release_results[0]}")
+    print("  结果行：" + " | ".join(t[:46] for t in texts))
+    objects = final_obs.get("objects", {})
+    soup = objects.get("alphabet_soup_1", [0, 0, 0])
+    basket = objects.get("basket_1", [0, 0, 0])
+    print(f"  最终：罐体心={[round(v, 4) for v in soup]} 篮={[round(v, 4) for v in basket]} "
+          f"eef={[round(v, 4) for v in final_obs.get('eef_pos', [])]}")
+    return all(checks.values())
+
+
 def main() -> int:
     ipc_dir = REPO / "runtime" / "ipc_dryrun"
     shutil.rmtree(ipc_dir, ignore_errors=True)
@@ -237,6 +360,8 @@ def main() -> int:
     time.sleep(0.3)
 
     ok = result.tool_calls > 10 and result.protocol_retries == 0
+    print("\n=== 档 A 概念腿（v2 grasp/release，无 LLM）===")
+    ok = concept_leg(REPO / "runtime" / "ipc_dryrun2") and ok
     print("PLUMBING OK" if ok else "PLUMBING PROBLEM")
     return 0 if ok else 1
 

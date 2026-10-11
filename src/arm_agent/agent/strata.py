@@ -132,8 +132,8 @@ class StrataAgentModel:
         # deep inside ("'<=' not supported ..."); coerce at the boundary.
         self.max_new_tokens = int(max_new_tokens)
         self.reasoning_effort = str(reasoning_effort).strip().lower()
-        # What `thinking=True` means for this backend. The verifier asks for it
-        # per call (Verifier thinking=True), the executor leaves it alone.
+        # What `thinking=True` means for this backend (mapped to
+        # `reasoning_effort`); the default run leaves it alone.
         self.thinking_effort = str(thinking_effort).strip().lower()
         self.timeout_s = float(timeout_s)
         self.api_key = api_key

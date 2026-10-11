@@ -124,6 +124,12 @@ class SimServer:
                 outcome = self.adapter.rotate(str(action["axis"]), float(action["angle_deg"]))
             elif act_kind == "gripper":
                 outcome = self.adapter.set_gripper(str(action["action"]))
+            elif act_kind == "grasp":
+                # Concept primitive (档 A): the adapter owns open -> close to
+                # contact -> squeeze -> hold window and answers with a status.
+                outcome = self.adapter.grasp()
+            elif act_kind == "release":
+                outcome = self.adapter.release()
             elif act_kind == "align":
                 # Server-side primitive: servo the EEF x/y onto an object.
                 # See ActionAdapter.align_xy for why the LLM cannot do this.

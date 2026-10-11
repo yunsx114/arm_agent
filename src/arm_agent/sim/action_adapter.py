@@ -106,6 +106,24 @@ GRIPPER_MAX_STEPS = 130  # measured: full sweep needs ~100 steps at 0.01/step
 # (close width 0.0005 afterwards) and 30 ticks let it slip mid-carry.
 # 10 ticks firms the pinch without ejecting.
 GRIPPER_RAMP_EXTRA_STEPS = 10
+# ---- grasp / release concepts (档 A, 2026-10-11) --------------------------
+# Contact is decided from the raw MuJoCo contact table, never from the finger
+# width. MEASURED with scripts/probe_contact_table.py: at reset the pads sit
+# HALF CLOSED (width 0.0207) inside the old "something is between the pads"
+# band while the contact table holds ZERO finger contacts -- so a width test
+# calls the boot state a grasp. Closing on air walks through the same band.
+CONTACT_DIST_TOL_M = 0.0005  # MuJoCo reports ~-0.1..-0.35 mm for real pad contact
+# Extra closed-loop ticks after bilateral contact, so the clamp reaches full
+# force before anything moves (the ramp above is the same idea at close time).
+GRASP_SQUEEZE_TICKS = 10
+# Bilateral contact must persist this long before the grasp counts as secured;
+# losing a side inside the window is reported as `slipped`.
+GRASP_HOLD_TICKS = 10
+# After opening, wait up to this many ticks for the pads to clear the payload.
+# MEASURED (8/8 episodes, 2026-10-11): `verify` immediately after an `open`
+# fails EVERY time, because the pads are still opening while the payload has not
+# started falling -- a systematic false negative.
+RELEASE_SETTLE_TICKS = 15
 
 AXIS_VECTORS = {
     # rotate tool axis name -> base-frame axis-angle unit axis
@@ -135,6 +153,15 @@ class ActionOutcome:
     eef_end: list[float] = field(default_factory=list)
     measured_delta_m: list[float] = field(default_factory=list)
     note: str = ""
+    # --- concept layer (档 A) -------------------------------------------
+    # `status` is the closed-vocabulary verdict the MODEL is shown
+    # ("grasped"/"empty"/"slipped"/"released"/"still_carrying"/"").
+    # `measurement` is the same event in numbers and stays in the transcript:
+    # the model gets the concept, the instruments keep the resolution.
+    status: str = ""
+    measurement: dict[str, Any] = field(default_factory=dict)
+    # None = this action says nothing about what is between the pads.
+    held: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +172,9 @@ class ActionOutcome:
             "eef_end": self.eef_end,
             "measured_delta_m": self.measured_delta_m,
             "note": self.note,
+            "status": self.status,
+            "measurement": self.measurement,
+            "held": self.held,
         }
 
 
@@ -339,6 +369,231 @@ class ActionAdapter:
         else:
             grip_state = "holding"
         outcome.note = f"gripper finger width {width:.4f} ({grip_state})"
+        return outcome
+
+    # --------------------------------------------------------- grasp concept
+    def _pad_sides(self) -> tuple[set[int], set[int], list[str]]:
+        """Finger-pad body ids as (left, right, body_names).
+
+        MEASURED (scripts/probe_contact_table.py, 2026-10-11, LIBERO object task
+        0): the bodies that actually touch a payload are
+        `gripper0_finger_joint1_tip` (left) and `gripper0_finger_joint2_tip`
+        (right). The finger *base* bodies (`gripper0_leftfinger`,
+        `gripper0_rightfinger`) never appear in the contact table at all.
+
+        The names come from `sim.model.body_names`; the first version of that
+        probe asked for `model.body_id2name`, which does not exist on the
+        robosuite wrapper, and silently printed `<body N>` for every body --
+        a "value from another vocabulary" bug of exactly the kind
+        scripts/probe_tool_wiring.py exists to prevent.
+        """
+        table = list(getattr(self.sim.env.env.sim.model, "body_names", []) or [])
+        left: set[int] = set()
+        right: set[int] = set()
+        for body_id, name in enumerate(table):
+            low = str(name).lower()
+            if "finger" not in low:
+                continue
+            if "joint1" in low or "left" in low:
+                left.add(body_id)
+            elif "joint2" in low or "right" in low:
+                right.add(body_id)
+        tips = [i for i, n in enumerate(table) if "finger" in str(n).lower() and "tip" in str(n).lower()]
+        if tips:  # prefer the pads that make contact; the bases never do
+            return {i for i in tips if i in left}, {i for i in tips if i in right}, table
+        return left, right, table
+
+    def pad_contacts(self) -> dict[str, set[str]]:
+        """Object body name -> set of pad sides currently touching it.
+
+        This is the scene-independent half of the grasp concept: it names no
+        object, uses no coordinate and no width, and works for any scene whose
+        gripper has two finger pads. `dist <= CONTACT_DIST_TOL_M` is Jev's
+        filter (embodied_jev/physics.py::contacts) and matches what MuJoCo
+        reports for a real pad contact here (-0.1 .. -0.35 mm).
+        """
+        left, right, table = self._pad_sides()
+        if not left and not right:
+            return {}
+        sim = self.sim.env.env.sim
+        model = getattr(sim.model, "_model", sim.model)
+        data = sim.data
+        out: dict[str, set[str]] = {}
+        for contact in data.contact[: int(data.ncon)]:
+            if float(contact.dist) > CONTACT_DIST_TOL_M:
+                continue
+            a = int(model.geom_bodyid[int(contact.geom1)])
+            b = int(model.geom_bodyid[int(contact.geom2)])
+            for pad, other in ((a, b), (b, a)):
+                side = "left" if pad in left else "right" if pad in right else None
+                if side is None:
+                    continue
+                name = str(table[other]) if 0 <= other < len(table) else f"<body {other}>"
+                out.setdefault(name, set()).add(side)
+        return out
+
+    def held_object(self) -> tuple[str | None, set[str]]:
+        """(body name between BOTH pads, the sides touching it).
+
+        `name` is not None only for a bilateral contact -- that is the whole
+        point of the concept. A single-side contact is reported as such so the
+        caller can tell `slipped` from `empty`.
+        """
+        contacts = self.pad_contacts()
+        if not contacts:
+            return None, set()
+        name, sides = max(contacts.items(), key=lambda kv: (len(kv[1]), kv[0]))
+        return (name if len(sides) == 2 else None), sides
+
+    def _command_gripper(self, value: float, outcome: ActionOutcome) -> None:
+        """One tick of a pure gripper command (translation channels hold)."""
+        action = np.zeros(C.ACTION_DIM)
+        action[6] = value
+        self.sim.step(action)
+        outcome.steps += 1
+
+    def _open_pads(self, outcome: ActionOutcome) -> float:
+        """Command `open` until the pads are genuinely open; returns the width."""
+        width = self._gripper_now()
+        while width < GRIPPER_OPEN_WIDTH and outcome.steps < GRIPPER_MAX_STEPS:
+            self._command_gripper(C.GRIPPER_OPEN, outcome)
+            width = self._gripper_now()
+        return width
+
+    def grasp(self) -> ActionOutcome:
+        """Close the pads around whatever is between them and report a CONCEPT.
+
+        WHY this is a primitive and the width is not: the finger width is not a
+        grasp. MEASURED at reset (probe_contact_table.py): the sim boots with the
+        pads HALF CLOSED (width 0.0207) inside the "something is between the
+        pads" band while the contact table holds ZERO finger contacts, and
+        closing on air walks through the same band. So a width test calls the
+        boot state -- and every empty close -- a grasp, which is exactly the
+        false positive that cost an episode earlier (P0a: 7 "slip" + 5 "dropped"
+        alarms, and a can shed mid-carry).
+
+        The sequence is the one the project measured by hand, now owned by code:
+          1. OPEN first. The sim starts half-closed, so a bare `close` only
+             pinches (~0.0183) -- the documented cause of a "looks grasped,
+             sheds on the first lateral move" failure.
+          2. Close until BOTH pads contact the same body (the concept), or the
+             pads shut on air.
+          3. Keep commanding `close` for GRASP_SQUEEZE_TICKS so the clamp reaches
+             full force; the command is rate-limited (0.01/tick), so stopping at
+             first contact leaves a weak grip (measured: the can slid out
+             mid-carry) while a 100-tick ramp squeezed it out the other side.
+          4. Hold and re-check for GRASP_HOLD_TICKS: contact that disappears
+             inside the window is a `slipped`, not a `grasped`.
+        The model is told the concept; the numbers stay in `measurement`.
+        """
+        outcome = ActionOutcome(
+            kind="grasp",
+            requested={"action": "grasp"},
+            eef_start=list(self._eef_now()),
+        )
+        with self._renderless():
+            open_width = self._open_pads(outcome)
+            # --- close until bilateral contact (or a shut pad pair) ----------
+            secured = False
+            sides: set[str] = set()
+            body: str | None = None
+            prev = self._gripper_now()
+            stable = 0
+            while outcome.steps < GRIPPER_MAX_STEPS:
+                self._command_gripper(C.GRIPPER_CLOSE, outcome)
+                body, sides = self.held_object()
+                if len(sides) == 2:
+                    secured = True
+                    break
+                cur = self._gripper_now()
+                if cur <= GRIPPER_EMPTY_WIDTH:
+                    break  # shut on air
+                if abs(cur - prev) < GRIPPER_CONVERGE_EPS:
+                    stable += 1
+                    if stable >= GRIPPER_SETTLE_AVG:
+                        break  # converged without a bilateral contact
+                else:
+                    stable = 0
+                prev = cur
+
+            squeeze_ticks = hold_ticks = 0
+            lost_side = False
+            if secured:
+                for _ in range(GRASP_SQUEEZE_TICKS):
+                    self._command_gripper(C.GRIPPER_CLOSE, outcome)
+                    squeeze_ticks += 1
+                for _ in range(GRASP_HOLD_TICKS):
+                    self._command_gripper(C.GRIPPER_HOLD, outcome)
+                    hold_ticks += 1
+                    _, now_sides = self.held_object()
+                    if len(now_sides) < 2:
+                        lost_side = True
+                        sides = now_sides
+                        break
+
+        width = self._gripper_now()
+        if secured and not lost_side:
+            status = "grasped"
+        elif secured and lost_side:
+            status = "slipped"
+        elif sides:
+            status = "slipped" if len(sides) == 1 else "empty"
+        else:
+            status = "empty"
+        outcome.status = status
+        outcome.held = status == "grasped"
+        outcome.note = f"grasp {status}"
+        outcome.measurement = {
+            "object_body": body,
+            "contact_sides": sorted(sides),
+            "width_mm": round(width * 1000, 2),
+            "open_width_mm": round(open_width * 1000, 2),
+            "squeeze_ticks": squeeze_ticks,
+            "hold_ticks": hold_ticks,
+        }
+        return outcome
+
+    def release(self) -> ActionOutcome:
+        """Open the pads, WAIT for the payload to clear them, report a CONCEPT.
+
+        The settle window is not cosmetic. MEASURED (8/8 episodes, 2026-10-11):
+        `verify` issued immediately after `open` fails EVERY time -- the pads are
+        still opening and the payload has not begun to fall, so the
+        environment's "is it placed" check is answered too early, and the model
+        read that as "my release failed" and dived back into the basket (in one
+        case dragging the can 29 cm back out of it). Returning only after the
+        pads have actually cleared the object makes the next `verify` honest.
+
+        No scene knowledge: the concept is "is anything between the pads", the
+        same contact table `grasp` uses.
+        """
+        outcome = ActionOutcome(
+            kind="release",
+            requested={"action": "release"},
+            eef_start=list(self._eef_now()),
+        )
+        with self._renderless():
+            width = self._open_pads(outcome)
+            cleared_after = None
+            for tick in range(RELEASE_SETTLE_TICKS):
+                self._command_gripper(C.GRIPPER_HOLD, outcome)
+                body, sides = self.held_object()
+                if not sides:
+                    cleared_after = tick + 1
+                    break
+                width = self._gripper_now()
+
+        body, sides = self.held_object()
+        still = bool(sides)
+        outcome.status = "still_carrying" if still else "released"
+        outcome.held = still
+        outcome.note = f"release {outcome.status}"
+        outcome.measurement = {
+            "object_body": body,
+            "contact_sides": sorted(sides),
+            "width_mm": round(width * 1000, 2),
+            "cleared_after_ticks": cleared_after,
+        }
         return outcome
 
     # -------------------------------------------------------------- align_xy

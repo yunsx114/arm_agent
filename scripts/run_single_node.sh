@@ -95,11 +95,12 @@ RECORD_ARGS=()
 BUDGET_ARGS=()
 [ -n "${HISTORY_MESSAGES:-}" ] && BUDGET_ARGS+=(--history-messages "$HISTORY_MESSAGES")
 [ -n "${IMAGE_KEEP:-}" ] && BUDGET_ARGS+=(--image-keep "$IMAGE_KEEP")
-# Two-role release gate (same weights, fresh verifier context). VERIFIER=1 on,
-# VERIFIER_THINKING=1 additionally gives ONLY the verifier call a reasoning block.
+# Released-gate knobs removed 2026-10-11: the two-role verifier that had to
+# approve every carrying `gripper open` is gone (16/16 approvals, 0 blocks, and
+# an audit showed all 16 release poses were correct -- it re-checked a solved
+# problem for ~4 % of wall clock). The harness still LOGS `_gate_arithmetic` at
+# every release; nothing blocks an action any more.
 GATE_ARGS=()
-[ "${VERIFIER:-0}" = "1" ] && GATE_ARGS+=(--verifier)
-[ "${VERIFIER_THINKING:-0}" = "1" ] && GATE_ARGS+=(--verifier-thinking)
 # Which model answers. LOCAL (default) = the in-process Qwen3.5-9B, which needs
 # the GPU to itself; STRATA = HTTP to the Strata server on 127.0.0.1:8080, whose
 # engine already holds ~31 GiB of VRAM -- so loading the 9B as well would OOM.

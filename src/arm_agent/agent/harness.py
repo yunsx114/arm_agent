@@ -31,8 +31,6 @@ from arm_agent.agent.parser import (
 from arm_agent.agent.prompts import (
     get_system_prompt,
     get_tool_schemas,
-    get_verifier_prompt,
-    get_verifier_tools,
 )
 from arm_agent.agent.tool_protocol import canonical_name, structured_result
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
@@ -42,7 +40,7 @@ SKILLS_DIRNAME = "skills"
 # than this from the commanded z did not arrive, and saying it did is what makes
 # the model close on a rim instead of re-descending.
 DESCEND_SHORTFALL_M = 0.005
-# The shared skill file, injected into the executor AND the verifier prompts.
+# The shared skill file, injected into the executor's system prompt.
 SHARED_SKILL_FILE = "scene_tools.md"
 # Feed-back images: the newest N frames stay as pixels, the rest become text
 # stubs. Was 1 while only the agent view was attached; the loop now attaches the
@@ -50,11 +48,6 @@ SHARED_SKILL_FILE = "scene_tools.md"
 # (keeping 1 would silently throw away half of the newest pair). Tokens: 2 x
 # 66 = 133 per turn, and only for the newest turn.
 HISTORY_IMAGE_KEEP = 2
-# The verifier replies with one `release` call and a one-sentence reason; with the
-# reasoning block off it needs ~120 tokens. Kept small on purpose: the format rule
-# for the verifier has no preamble, so anything larger only invites a monologue
-# that could get truncated before the call closes.
-VERIFIER_MAX_NEW_TOKENS = 512
 # Conversation cap. MEASURED (probe_gpu_memory.py): the OOM allocation was
 # exactly one full-attention N x N matrix (2900^2 * 16 heads * 2 bytes = 266 MiB)
 # — on this Turing card SDPA has no mem-efficient kernel, so attention memory
@@ -95,6 +88,11 @@ class EpisodeResult:
     task: str = ""
     language: str = ""
     success: bool = False
+    # "env" = the sim's own check_success() flipped True (the official LIBERO
+    # criterion); "declared" = the agent called verify and the sim agreed at
+    # that instant. Both count as success; the field exists so a report can
+    # never confuse "the object is placed" with "the agent noticed".
+    success_source: str = ""
     done_declared: bool = False
     turns: int = 0
     tool_calls: int = 0
@@ -117,8 +115,6 @@ class Harness:
         tool_protocol: str = "v1",
         history_messages: int | None = None,
         image_keep: int | None = None,
-        verifier: bool = False,
-        verifier_thinking: bool | None = None,
     ) -> None:
         self.client = client
         self.model = model
@@ -138,18 +134,21 @@ class Harness:
         self.legacy_tools = str(tool_protocol).lower() != "v2"
         self.skills_dir = self.workspace / SKILLS_DIRNAME
         self.skills_dir.mkdir(parents=True, exist_ok=True)
-        # SHARED SKILL, injected into BOTH roles' system prompts.
+        # SHARED SKILL, injected into the executor's system prompt.
         #
         # It lives on disk (not inline in prompts.py) so it can be edited /
         # self-iterated without touching code. Read once here: the system prompt
         # string is rebuilt every turn, and re-reading a file each turn would be
         # pure I/O overhead.
         #
-        # Why both roles need it: the executor had the axis convention in its own
-        # prompt while the verifier did not, and the verifier's picture-relative
-        # hints ("篮子在右侧") made the executor march in +x while the real
-        # deficit was +y -- 40/40 moves in the wrong axis, measured. One shared
-        # vocabulary is the fix.
+        # History: it used to be shared with the release-gate verifier because the
+        # executor had the axis convention in its own prompt while the verifier
+        # did not, and the verifier's picture-relative hints ("篮子在右侧") made
+        # the executor march in +x while the real deficit was +y -- 40/40 moves in
+        # the wrong axis, measured. The gate is gone (2026-10-11), the axis
+        # convention stays: it is scene vocabulary, and it is the ONE thing here
+        # that is a description of the world rather than a decision taken for the
+        # model.
         skill_path = self.skills_dir / SHARED_SKILL_FILE
         self.shared_skill = f"\n\n{skill_path.read_text().strip()}" if skill_path.exists() else ""
         # Grasp state, taken from the gripper's own verdict ("holding" in the
@@ -171,32 +170,41 @@ class Harness:
         # that has already produced one false alarm that cost a whole episode
         # (a deliberate `open` reported as "物体掉了", 2026-10-10).
         self._grasped = False
-        # Which container the executor last ran `approach` on. The release gate
-        # hands this to the verifier together with that object's MEASURED centre.
+        # Which container the executor last ran `approach` on. Feeds the
+        # arithmetic instrument below (log only, never blocks).
         self._last_approach_target = ""
         self._approach_order: list[str] = []
         self._approached: dict[str, list[float]] = {}
-        # Two-role release gate. Same weights, DIFFERENT context: when the
-        # executor asks to open the gripper while carrying a payload, the harness
-        # suspends that context and asks a verifier (fresh message list, its own
-        # system prompt, one tool: `release`) whether the action is safe.
+        # What is between the pads, as a SIM BODY NAME, taken from the contact
+        # table (adapter.held_object). None = nothing held. This replaces the
+        # ground-truth-distance guess `_carried_name` as the primary source; the
+        # distance version survives only as a fallback for the legacy surface.
+        self._held_body: str | None = None
+        # DELETED 2026-10-11: the two-role release gate (`--verifier`, a
+        # fresh-context verifier that had to approve every carrying `open`).
         #
-        # Why a separate role instead of a prompt rule: measured 2026-10-10, the
-        # executor asserts arrival without checking (5/5 releases proceeded on a
-        # false "已到达篮子正上方"; 0/80 turns doubted the release position), and
-        # when the executor is asked the same question directly it answers
-        # correctly (8/8 single-turn, 4/4 at full run context with the reasoning
-        # block on, 3/4 with it off). The gate moves the question into the loop.
-        # Only `gripper open` while `_grasped` is gated -- an `open` on an empty
-        # hand is just part of a re-grasp cycle (22 of them in the last run).
-        self.verifier_enabled = bool(verifier)
-        self.verifier_thinking = verifier_thinking
-        self.verifier_schemas = get_verifier_tools()
-        self.verifier_prompt = get_verifier_prompt() + self.shared_skill
-        self.verifier_calls = 0
-        self._task_text = ""
+        # Why it existed: measured 2026-10-10, the executor asserted arrival
+        # without checking (5/5 releases proceeded on a false "已到达篮子正上方")
+        # and a second role asked the same question answered correctly.
+        #
+        # Why it is gone: the failure mode it guarded (a release that leaves the
+        # payload ON the basket rim) was a WRONG CONSTANT, not a missing check --
+        # the skill had the rim at 0.115 while the basket's own geometry says
+        # 0.1513, and every `approach(basket, 20)` therefore dropped the can on
+        # the rim. With the constants measured, the gate's own record is 16/16
+        # releases approved, 0 blocks, and an independent audit of those 16
+        # releases (scripts/audit_release_poses.py) found 16/16 CORRECT poses
+        # (|Δx|,|Δy| <= 0.2 cm, payload bottom 0.195-0.198 vs rim 0.151). So it
+        # cost one prefill of the context plus a reply per release (~4 % of wall
+        # clock) to re-check a solved problem -- and on the 9B it had a
+        # documented 4/4 false-REJECT record against a provably correct pose.
+        #
+        # The DIRECTION of this project is to hand judgement back to the model
+        # and keep the harness as measurement only, so the rejection path goes;
+        # `_gate_arithmetic` stays as a logged instrument (it is free: it reads
+        # numbers the observation already carries).
 
-    # ------------------------------------------------------------- verifier
+    # ---------------------------------------------------- release instrument
     def _gate_container(
         self, obs: dict[str, Any] | None
     ) -> tuple[str | None, tuple[float, float] | None]:
@@ -212,7 +220,7 @@ class Harness:
         """
         if not obs:
             return None, None
-        held = _carried_name(obs) if self._grasped else None
+        held = self._held_body or (_carried_name(obs) if self._grasped else None)
         objects = obs.get("objects") or {}
         for name in reversed(self._approach_order):
             if name == held:
@@ -226,8 +234,17 @@ class Harness:
         return None, None
 
     def _gate_arithmetic(self, obs: dict[str, Any] | None) -> str:
-        """The harness's OWN verdict on the release pose, printed alongside the
-        verifier's, so a model/arithmetic disagreement is visible in the log.
+        """The harness's OWN reading of the release pose -- LOGGED, never
+        enforced.
+
+        WHY it survives the verifier's deletion: it is the only independent
+        record of where a release happened, and it costs nothing (it subtracts
+        numbers the observation already carries). Reading it back is how the
+        "the can went in but the run scored a failure" incident was found, and
+        `scripts/audit_release_poses.py` re-derives the same numbers from the
+        transcripts afterwards. Enforcing it would be the harness deciding for
+        the model, which is the opposite of where this project is going: it is
+        an instrument now, not a gate.
 
         Thresholds are the sim's own geometry, measured 2026-10-11 by
         scripts/probe_rim.py + scripts/probe_release_offset.py: the basket's rim
@@ -235,15 +252,14 @@ class Harness:
         and the gripper holds it at mid-height so the payload's bottom rides
         0.050 below the EEF.  The old pair (rim 0.115, bottom = eef - 0.054) was
         3.6 cm out, and every release at approach(basket, 20) then left the can
-        resting ON the rim (episode_000_1791722140: 3 gate-approved releases, 3
-        verify failures).
+        resting ON the rim.
         """
         if not obs:
             return "没有 obs"
         eef = obs.get("eef_pos")
         name, centre = self._gate_container(obs)
         if eef is None or centre is None:
-            held = _carried_name(obs) if self._grasped else None
+            held = self._held_body or (_carried_name(obs) if self._grasped else None)
             return f"无法判断（容器未知，最近 approach 的是{held or '无' }）"
         dx = (eef[0] - centre[0]) * 100.0
         dy = (eef[1] - centre[1]) * 100.0
@@ -253,102 +269,6 @@ class Harness:
             f"容器={name} Δx={dx:+.1f}cm Δy={dy:+.1f}cm 爪心z={eef[2]:.4f} "
             f"物体底≈{bottom:.4f} ⇒ {'应放行' if ok else '不应放行'}"
         )
-
-    def _release_verdict(
-        self, executor_reply: str, images: dict[str, Any] | None, obs: dict[str, Any] | None = None
-    ) -> tuple[bool, str]:
-        """Ask the verifier role whether the pending `gripper open` may proceed.
-
-        Fresh context on purpose: the verifier sees the task, the two current
-        camera frames and the executor's own words -- and NOT the executor's
-        history, so it cannot inherit the executor's "already close enough"
-        narrative. Same weights, so this costs one prefill plus a short reply.
-
-        Fail-closed: a missing/garbled verdict rejects. Rejecting only costs one
-        more move; releasing wrongly drops the payload and ends the attempt.
-        """
-        pair = images or {}
-        facts = self._gate_facts(obs)
-        content: list[dict[str, Any]] = []
-        for cam in ("agent", "wrist"):
-            frame = pair.get(cam)
-            if frame is not None:
-                content.append({"type": "image", "image": frame})
-        content.append(
-            {
-                "type": "text",
-                "text": (
-                    f"任务目标：{self._task_text}\n"
-                    "环境实测数字（由环境直接测量，不是执行者的说法）：\n"
-                    f"{facts}\n"
-                    "执行者现在请求执行的动作：张开夹爪（gripper open）放下物体。\n"
-                    "以下是执行者这一轮的完整自述（可能不准）：\n"
-                    "<执行者自述>\n"
-                    f"{executor_reply.strip()}\n"
-                    "</执行者自述>\n\n"
-                    "请按系统提示词里的标准裁决，并只调用 release 工具一次。"
-                ),
-            }
-        )
-        messages = [
-            {"role": "system", "content": self.verifier_prompt},
-            {"role": "user", "content": content},
-        ]
-        self.verifier_calls += 1
-        try:
-            reply = self.model.chat(
-                messages,
-                tools=self.verifier_schemas,
-                thinking=self.verifier_thinking,
-                max_new_tokens=VERIFIER_MAX_NEW_TOKENS,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return False, f"核验者调用失败（{type(exc).__name__}: {exc}），按最保守处理"
-        parsed = parse_tool_calls(reply)
-        for call in parsed:
-            if call.name == "release":
-                verdict = str((call.args or {}).get("verdict", "")).strip().lower()
-                reason = str((call.args or {}).get("reason", "")).strip()
-                if verdict == "approve":
-                    return True, reason
-                if verdict == "reject":
-                    return False, reason or "核验者未给出理由"
-                return False, f"核验者给出了无法识别的裁决 {verdict!r}：{reason}"
-        return False, f"核验者没有给出 release 调用（原文：{reply.strip()[:120]}）"
-
-    def _gate_facts(self, obs: dict[str, Any] | None) -> str:
-        """Instrument readings handed to the verifier, in one place.
-
-        WHY: an images-only verifier was asked to judge "is the gripper over the
-        container opening" from one oblique render plus a wrist view that the
-        payload itself fills. MEASURED (2026-10-10, INIT_STATE=0): at the
-        provably correct release pose -- `approach(basket_1, 20)` reported xy err
-        1.3 mm against the basket's measured centre, basket never moved -- the
-        verifier rejected 4/4 attempts ("夹爪位于左侧，篮子在右侧，两者有明显水平
-        距离"). Pixels confirm the pose was correct. So the numbers go in.
-        """
-        if not obs:
-            return "（环境未提供数字，只能靠画面判断）"
-        lines: list[str] = []
-        eef = obs.get("eef_pos") or []
-        if len(eef) == 3:
-            lines.append(f"- 夹爪当前位置: ({eef[0]:+.4f}, {eef[1]:+.4f}, {eef[2]:+.4f}) m")
-        name, centre = self._gate_container(obs)
-        if name and centre:
-            cx, cy = centre
-            lines.append(f"- 容器 `{name}` 开口中心（按它自己的几何中心测）: ({cx:+.4f}, {cy:+.4f}) m")
-            if len(eef) == 3:
-                dx = (eef[0] - cx) * 100.0
-                dy = (eef[1] - cy) * 100.0
-                lines.append(
-                    f"- 差量: 夹爪比容器中心 Δx={dx:+.1f}cm, Δy={dy:+.1f}cm；爪心 z={eef[2]:.4f} m"
-                )
-        else:
-            lines.append(
-                "- **没有可参照的容器坐标**：执行者还没有 approach 过任何非手上物体的目标。"
-                "这通常意味着它根本没对准过容器，请只靠画面判：看不到容器开口在夹爪正下方就 reject。"
-            )
-        return "\n".join(lines)
 
     # -------------------------------------------------------------- episode
     def run_episode(
@@ -368,10 +288,6 @@ class Harness:
             last_images = images
             result.task = obs.get("task", "")
             result.language = obs.get("language", "")
-            # The verifier role is told the goal in words, not by replaying the
-            # episode: its whole point is a context that does NOT inherit the
-            # executor's narrative.
-            self._task_text = result.language or result.task
             if recorder is not None:
                 recorder.task = result.language or result.task
                 recorder.record(
@@ -470,47 +386,17 @@ class Harness:
                 result.tool_calls += 1
                 self._say(f"[turn {turn}] {call.name} {call.args}")
 
-                # ---- release gate (two-role: executor context -> verifier) ----
-                # Runs BEFORE the tool is dispatched: a rejected release must not
-                # touch the arm. The executor's own context is untouched while the
-                # verifier runs, so it resumes exactly where it left off.
-                _pending = canonical_name(str(call.name))
+                # DELETED 2026-10-11: the release-gate interception (see the
+                # constructor note). What replaces it is one log line: when the
+                # executor is about to release a payload, the harness writes down
+                # where the gripper actually is. That is measurement, not a
+                # decision -- the action is ALWAYS dispatched.
                 if (
-                    self.verifier_enabled
-                    and _pending == "gripper"
+                    canonical_name(str(call.name)) == "gripper"
                     and str((call.args or {}).get("action", "")).strip().lower() == "open"
                     and self._grasped
                 ):
-                    t_v0 = time.time()
-                    approved, reason = self._release_verdict(reply, last_images, obs)
-                    _arith = self._gate_arithmetic(obs)
-                    self._say(
-                        f"[turn {turn}] gate: {'放行' if approved else '拒绝'} "
-                        f"({time.time() - t_v0:.1f}s) {reason[:80]}"
-                        + (f" || 算数自检: {_arith}" if _arith else "")
-                    )
-                    if not approved:
-                        note = (
-                            "[释放被否决] 核验者没有放行这次 gripper open，动作**未执行**。"
-                            f"理由：{reason}\n"
-                            "物体还在夹爪上。请优先执行理由里建议的那个工具（若它建议「先 `move +z`"
-                            "抬高、再 `approach(容器, 25)`」就照做：抬高是为了让物体底部越过容器口沿 "
-                            "z≈0.151（实测值），否则下一次 approach 还会把容器推走/把物体刮掉）；"
-                            "对准之后再请求放行。"
-                        )
-                        messages.append({"role": "user", "content": note})
-                        transcript.append({"turn": turn, "gate_reject": reason})
-                        if recorder is not None:
-                            recorder.record(
-                                turn,
-                                reply=reply,
-                                tool_call=f"{_fmt_call(call)} → 被核验者否决",
-                                result=note,
-                                status="释放被否决",
-                                status_color=RED,
-                                images=last_images,
-                            )
-                        continue
+                    self._say(f"[turn {turn}] 放手位置自检: {self._gate_arithmetic(obs)}")
 
                 try:
                     t_tool0 = time.time()
@@ -518,11 +404,10 @@ class Harness:
                     outcome["result"] = self._structured_outcome(call, outcome)
                     tool_s = time.time() - t_tool0
                     # Remember which container the executor last tried to align
-                    # with, so the release gate can hand the verifier that
-                    # container's MEASURED centre instead of asking it to guess
-                    # millimetres from one oblique render (MEASURED: images-only
-                    # verifier rejected 4/4 attempts at a provably correct pose,
-                    # xy err 1.3 mm -- see _release_verdict).
+                    # with: the release instrument needs that container's
+                    # MEASURED centre, and the executor's most recent `approach`
+                    # is usually the payload itself (re-approaching the can after
+                    # every failed drop), against which Δ ≈ 0 always.
                     if canonical_name(str(call.name)) == "approach":
                         _tgt = str((call.args or {}).get("target", "")).strip()
                         if _tgt:
@@ -576,6 +461,10 @@ class Harness:
                 # this time by reading, before it could mislead a run.
                 _tool = canonical_name(str(outcome.get("tool", "")))
                 obs = outcome["obs"]
+                # Ground truth for this turn, computed once: see the long note
+                # where it is consumed below.
+                sim_done = bool(obs.get("success"))
+                _turn_success = (bool(outcome.get("done")) and bool(outcome.get("success"))) or sim_done
                 if outcome.get("images"):
                     last_images = outcome["images"]
                 rec_s = 0.0
@@ -586,8 +475,8 @@ class Harness:
                         reply=reply,
                         tool_call=_fmt_call(call),
                         result=outcome["text"],
-                        status="任务成功" if outcome.get("done") and outcome.get("success") else "运行中",
-                        status_color=GREEN if outcome.get("done") and outcome.get("success") else ACCENT,
+                        status="任务成功" if _turn_success else "运行中",
+                        status_color=GREEN if _turn_success else ACCENT,
                         images=last_images,
                     )
                     rec_s = time.time() - t_rec0
@@ -602,6 +491,7 @@ class Harness:
                 if outcome["done"]:
                     result.done_declared = True
                     result.success = bool(outcome["success"])
+                    result.success_source = "declared" if result.success else ""
                     result_text = outcome["text"] + "\n" + json.dumps(
                         outcome["result"], ensure_ascii=False, separators=(",", ":")
                     )
@@ -611,9 +501,36 @@ class Harness:
                         break
                     continue
 
-                # Track whether the pads actually closed on something. Only
-                # `close` reports this, and only the adapter knows the width.
-                if _tool == "gripper":
+                # The sim's own verdict rides along in EVERY observation
+                # (`pack()` includes `success`) and is refreshed on every
+                # physics tick, so the ground truth is already here for free.
+                #
+                # Until 2026-10-11 it was sampled only inside `verify`, i.e. the
+                # metric answered "did the agent declare correctly?" instead of
+                # LIBERO's own question, "is the object placed?".  MEASURED on
+                # the 16-episode A/B: all 3 failures had the can resting in the
+                # basket at some turn (can centre z = 0.0554, the exact value a
+                # clean-release probe leaves, and inside the `contain_region`
+                # box: xy half-extent 6.1 cm, z ceiling 0.137) -- yet they were
+                # scored failures, because the agent had already spent its one
+                # declare and either never tried again (B/3, B/4) or went on to
+                # DRAG the can back out of the basket (A/1: can pushed from
+                # y=0.262 to y=0.547).  Counting them is also what stops the
+                # harness from letting a finished episode be wrecked.
+                # (`sim_done` itself is computed above, next to the recorder.)
+
+                # Track what is between the pads. Since 档 A this comes from the
+                # CONTACT table (`outcome["held"]`), not from a substring of the
+                # adapter note: MEASURED at reset, the pads sit half closed
+                # (width 0.0207, inside the "holding" band) with ZERO finger
+                # contacts, so the old width test reported a grasp on an empty
+                # hand at the very start of every episode.
+                if _tool in ("grasp", "release") and outcome.get("held") is not None:
+                    self._grasped = bool(outcome["held"])
+                    self._held_body = _object_key_from_body(
+                        (outcome.get("measurement") or {}).get("object_body")
+                    )
+                elif _tool == "gripper":
                     _action = (outcome.get("requested") or {}).get("action")
                     _note = str(outcome.get("note", ""))
                     if _action == "open":
@@ -692,6 +609,11 @@ class Harness:
                     "result": outcome["text"],
                     "structured_result": outcome["result"],
                 })
+                if sim_done:
+                    result.success = True
+                    result.success_source = "env"
+                    self._say(f"[episode] 环境判定成功（第 {turn} 轮，物体已放好），提前结束")
+                    break
 
         except Exception as exc:  # noqa: BLE001 - keep episode artifacts even on crash
             result.error = result.error or f"episode failed: {type(exc).__name__}: {exc}"
@@ -742,6 +664,8 @@ class Harness:
                 }
         elif canonical == "gripper":
             name = "set_gripper"
+        elif canonical in ("grasp", "release"):
+            name = canonical
         elif canonical == "verify":
             name = "declare_done"
             args = {**args, "answer_note": args.get("claim", args.get("answer_note", ""))}
@@ -756,6 +680,30 @@ class Harness:
                 "image": images.get(cam),
                 "images": images,
                 "done": False,
+            }
+
+        if name == "grasp" or name == "release":
+            # Concept primitives (档 A): the adapter owns the whole sequence
+            # (open first, close to contact, squeeze, hold window / settle
+            # window) and answers with a status from a closed vocabulary. The
+            # harness passes that through and keeps the numbers in the
+            # structured result -- the model reads the concept.
+            resp = self.client.act({"kind": name})
+            outcome = resp.outcome
+            images = resp.images(self.client.ipc_dir)
+            return {
+                "obs": resp.obs,
+                "text": format_outcome(outcome),
+                "image": (images or {}).get("wrist"),
+                "images": images,
+                "done": False,
+                "tool": name,
+                "kind": outcome.get("kind", name),
+                "note": f"{outcome.get('status', '')}",
+                "status": outcome.get("status", ""),
+                "held": outcome.get("held"),
+                "measurement": outcome.get("measurement") or {},
+                "requested": outcome.get("requested") or {},
             }
 
         if name == "descend_to":
@@ -947,6 +895,15 @@ class Harness:
         status = "verified" if outcome.get("done") and outcome.get("success") else (
             "not_verified" if outcome.get("done") else "completed"
         )
+        # Concept primitives (档 A) answer with their own closed vocabulary
+        # (`grasped`/`empty`/`slipped`/`released`/`still_carrying`) and carry the
+        # numbers separately. Both belong in the transcript: the model reads the
+        # concept, while the offline audits (release poses, slip counts) need
+        # `contact_sides` / `object_body` / `width_mm` at full resolution.
+        concept_status = str(outcome.get("status") or "")
+        if concept_status:
+            status = concept_status
+        measurement.update(outcome.get("measurement") or {})
         events: list[dict[str, Any]] = []
         # A motion that fell short is an EVENT, and both surfaces must say so with
         # the same vocabulary: `move` reports "只走了 Xcm" and `descend_to`
@@ -1097,6 +1054,7 @@ class Harness:
                 "task": result.task,
                 "language": result.language,
                 "success": result.success,
+                "success_source": result.success_source,
                 "done_declared": result.done_declared,
                 "turns": result.turns,
                 "tool_calls": result.tool_calls,
@@ -1137,6 +1095,20 @@ def _z_err(note: str) -> float | None:
     return float(m.group(1)) / 1000.0 if m else None
 
 
+def _object_key_from_body(body: str | None) -> str | None:
+    """Sim body name -> observation object key.
+
+    The adapter reads names out of the contact table, where objects appear with
+    their MJCF body name (`alphabet_soup_1_main`), while `obs["objects"]` is keyed
+    by the `<name>_pos` observable (`alphabet_soup_1`). One place converts, so the
+    release instrument compares like with like.
+    """
+    if not body:
+        return None
+    text = str(body)
+    return text[: -len("_main")] if text.endswith("_main") else text
+
+
 def _carried_name(obs: dict[str, Any], tol_m: float = 0.06) -> str | None:
     """Which object is currently between the pads (nearest to the EEF).
 
@@ -1159,45 +1131,24 @@ def _carried_name(obs: dict[str, Any], tol_m: float = 0.06) -> str | None:
 
 
 def format_state(obs: dict[str, Any], grasped: bool = False) -> str:
+    """One line of state: where the gripper is, and whether it holds anything.
+
+    CHANGED 2026-10-11 (档 A): the gripper half is a CONCEPT now, and its source
+    moved from the finger width to the CONTACT table (the caller passes the
+    adapter's `held`). MEASURED at reset the pads sit half closed (0.0207) with
+    zero contacts, so the old `张开 / 闭合（空）/ 半闭（指间有物体）` classification
+    called an empty hand "指间有物体" at the start of every episode.
+
+    The object NAME and its distance to the gripper centre are gone too: the
+    name came from ground-truth object positions (`_carried_name`), i.e. the
+    harness was leaking scene truth through a string the model reads. What the
+    model needs to notice a drop is *whether* something is between the pads, and
+    that is exactly what is left. The identity and the millimetres stay in the
+    transcript (`measurement.object_body`, `width_mm`).
+    """
     eef = obs.get("eef_pos", [0, 0, 0])
-    width = max(abs(v) for v in obs.get("gripper_qpos", [0, 0]))
-    # Same thresholds as `format_outcome`, deliberately. The old rule here was
-    # `width > 0.01`, so a width of 0.0230 -- an object between the pads -- was
-    # called 张开 in this line while `format_outcome` called the SAME turn
-    # "指间有物体（夹住了）". Two vocabularies for one measurement inside a
-    # single message is exactly the P0f failure mode.
-    if width >= GRIPPER_OPEN_WIDTH:
-        grip = "张开"
-    elif width <= GRIPPER_EMPTY_WIDTH:
-        grip = "闭合（空）"
-    else:
-        grip = "半闭（指间有物体）"
-    # `grasped` comes from the last `set_gripper close` verdict. Do NOT infer it
-    # from distance: P0a showed the pads parked 5.5 cm above an untouched can
-    # being reported as holding it (7 "slip" + 5 "dropped" false alarms in one
-    # run). A grasp is a fact about the gripper.
-    held = _carried_name(obs) if grasped else None
-    if held:
-        # Report HOW FAR the payload sits from the gripper centre. MEASURED
-        # (v12): it crept 2.8 -> 3.1 -> 4.3 cm across three `+y 15` carries and
-        # fell off on the fourth. The distance grows because the basket is 48 cm
-        # from the pick point while one `move` is capped at 15 cm, so the carry
-        # is necessarily 4 separate pushes and each one extrudes the can a
-        # little further. A number that only ever grows is the only warning the
-        # model gets that the grip is failing.
-        pos = (obs.get("objects") or {}).get(held)
-        if pos is not None:
-            gap = float(
-                np.linalg.norm(np.asarray(pos, dtype=float) - np.asarray(eef, dtype=float))
-            )
-            hold = f"爪上：{held}（离爪心 {gap * 100:.1f}cm）"
-            # P0b: report the offset (a measurement) and drop both the 3.8cm
-            # threshold and the "don't translate" instruction.
-            return f"机械爪位置 {_fmt3(eef)} m；夹爪：{grip}；{hold}"
-        hold = f"爪上：{held}"
-    else:
-        hold = "爪上：空（没有物体跟着手）"
-    return f"机械爪位置 {_fmt3(eef)} m；夹爪：{grip}；{hold}"
+    hold = "爪上：有物体（两指接触）" if grasped else "爪上：空"
+    return f"机械爪位置 {_fmt3(eef)} m；{hold}"
 
 
 def format_outcome(outcome: dict[str, Any]) -> str:
@@ -1206,6 +1157,19 @@ def format_outcome(outcome: dict[str, Any]) -> str:
     delta = outcome.get("measured_delta_m", [0, 0, 0])
     end = outcome.get("eef_end", [0, 0, 0])
     ticks = outcome.get("steps", 0)
+    if kind in ("grasp", "release"):
+        # Concept primitives: the model is told WHAT happened, not how many
+        # millimetres the fingers travelled. The numbers are in the structured
+        # result (`measurement`), which is where the instruments read them.
+        status = str(outcome.get("status", ""))
+        concept = {
+            "grasped": "夹住了（两指都接触物体，握力已加够）",
+            "empty": "没夹到东西（指间是空的）",
+            "slipped": "接触不稳定（只碰到一侧或握持中松开）",
+            "released": "已放开（物体已离开指间）",
+            "still_carrying": "还夹着（物体未脱离指间）",
+        }.get(status, status or "结果未知")
+        return f"[{kind}] {concept}"
     if kind == "move":
         # MEASURED (v10 t24/t33/t41/t47/t50): several `move -z` calls returned
         # 10-60% of the requested distance with a completely silent result --

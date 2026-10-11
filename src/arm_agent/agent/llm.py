@@ -161,10 +161,9 @@ class QwenAgentModel:
         which is the order the chat template emits vision placeholders in.
 
         `thinking` / `max_new_tokens` override the instance defaults for THIS call
-        only. That is what makes a two-role loop affordable: the executor keeps the
-        reasoning block off and a 384-token budget, while a rare verifier call can
-        turn it on with its own budget -- same weights, different context, no
-        reload and no second copy of the model.
+        only, so a caller can pay for a reasoning block on one decision without
+        paying for it on every turn -- same weights, no reload and no second copy
+        of the model.
         """
         import torch
 

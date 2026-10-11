@@ -114,8 +114,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         attach_images=not args.no_images,
         prompt_mode=args.prompt_mode,
         tool_protocol=args.tool_protocol,
-        verifier=args.verifier,
-        verifier_thinking=True if args.verifier_thinking else None,
         history_messages=args.history_messages,
         image_keep=args.image_keep,
     )
@@ -124,8 +122,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"history_messages={harness.history_messages} "
         f"image_keep={harness.image_keep} prompt_mode={harness.prompt_mode} "
         f"tool_protocol={harness.tool_protocol} "
-        f"thinking={model.enable_thinking} max_new_tokens={model.max_new_tokens} "
-        f"verifier={harness.verifier_enabled} verifier_thinking={harness.verifier_thinking}",
+        f"thinking={model.enable_thinking} max_new_tokens={model.max_new_tokens}",
         flush=True,
     )
 
@@ -143,7 +140,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         result = harness.run_episode(init_state_idx=init_idx, episode_id=episode_id, recorder=recorder)
         results.append(result)
         print(
-            f"[episode {episode_id}] success={result.success} turns={result.turns} "
+            f"[episode {episode_id}] success={result.success} "
+            f"source={result.success_source or '-'} turns={result.turns} "
             f"tool_calls={result.tool_calls} retries={result.protocol_retries} "
             f"elapsed={result.elapsed_s:.0f}s transcript={result.transcript_path}",
             flush=True,
@@ -152,7 +150,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"[episode {episode_id}] video: {recorder.video_path}", flush=True)
 
     wins = sum(r.success for r in results)
-    print(f"\n[run] episodes: {len(results)}, success: {wins}/{len(results)}", flush=True)
+    # Split by where the verdict came from: "env" = the sim's own check_success
+    # flipped (the official LIBERO criterion), "declared" = the agent's own
+    # verify agreed. A run whose successes are ALL "env" still counts, but it
+    # says the agent never noticed on its own -- worth seeing at a glance.
+    by_src = {}
+    for r in results:
+        if r.success:
+            by_src[r.success_source or "?"] = by_src.get(r.success_source or "?", 0) + 1
+    print(
+        f"\n[run] episodes: {len(results)}, success: {wins}/{len(results)}"
+        + (f"  (env={by_src.get('env', 0)}, declared={by_src.get('declared', 0)})" if wins else ""),
+        flush=True,
+    )
     client.close()
     return 0 if wins else 1
 
@@ -234,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         "--thinking-effort",
         default="high",
         choices=["none", "low", "medium", "high"],
-        help="strata backend only: what `thinking=True` (the verifier's request) means",
+        help="strata backend only: what `thinking=True` maps to (reasoning_effort)",
     )
     p.add_argument("--timeout", type=float, default=600.0, help="per-IPC-call timeout")
     p.add_argument("--wait-server", type=float, default=120.0)
@@ -271,17 +281,6 @@ def main(argv: list[str] | None = None) -> int:
         help="turn on the chat template's reasoning block. Off by default: it costs "
         "1-3k tokens/turn (~30-70 s here) and can eat max-new-tokens before the "
         "tool call is emitted. Raise --max-new-tokens when using it.",
-    )
-    p.add_argument(
-        "--verifier",
-        action="store_true",
-        help="two-role release gate: a fresh-context verifier (same weights) must "
-        "approve every `gripper open` issued while carrying a payload.",
-    )
-    p.add_argument(
-        "--verifier-thinking",
-        action="store_true",
-        help="give ONLY the verifier call the reasoning block (executor stays off)",
     )
     p.add_argument("--video-fps", type=int, default=2)
     p.add_argument("--video-dir", default=str(REPO / "outputs" / "videos"))

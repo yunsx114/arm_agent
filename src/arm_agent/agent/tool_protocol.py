@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-CANONICAL_TOOLS = ("observe", "approach", "move", "rotate", "gripper", "verify")
+CANONICAL_TOOLS = ("observe", "approach", "move", "rotate", "gripper", "grasp", "release", "verify")
 # Temporarily UNREGISTERED surfaces: the code path stays (dispatch, aliases,
 # validation) but the model is neither shown the tool nor allowed to call it.
 #
@@ -19,10 +19,16 @@ CANONICAL_TOOLS = ("observe", "approach", "move", "rotate", "gripper", "verify")
 # object coordinates, and it was also the only way to refresh a frame.
 # Re-enabling is deleting the entry below.
 #
+# `gripper` (open/close + a finger-width readout) is off since 2026-10-11: it is
+# replaced by `grasp` / `release`, which decide from the CONTACT table and answer
+# in concepts instead of millimetres. Blocking it under v2 means the ablation
+# cannot silently fall back to the old surface -- the same reason `observe` is
+# blocked, and the validator checks this (see UNREGISTERED_TOOLS below).
+#
 # The validator check matters for experimental validity: a model that calls a
 # tool from memory would otherwise still succeed, silently leaking the numbers
 # this ablation is trying to remove.
-UNREGISTERED_TOOLS: frozenset[str] = frozenset({"observe"})
+UNREGISTERED_TOOLS: frozenset[str] = frozenset({"observe", "gripper"})
 LEGACY_TOOLS = (
     "look", "locate", "descend_to", "align_xy", "get_state", "move",
     "rotate", "set_gripper", "declare_done", "write_skill", "read_skill",
@@ -44,6 +50,12 @@ REQUIRED = {
     "move": ("direction", "distance_cm"),
     "rotate": ("axis", "angle_deg"),
     "gripper": ("action",),
+    # `grasp` / `release` take no parameters on purpose: how far to close, when
+    # to squeeze and when the payload has cleared the pads are all decided from
+    # the contact table (see action_adapter.grasp/release). A parameter here
+    # would be the harness asking the model to guess millimetres again.
+    "grasp": (),
+    "release": (),
     # `claim` is deliberately NOT required: `declare_done` ignores it and asks
     # the environment for the ground truth, so requiring it only gave the model
     # a way to fail validation on a parameter that changes nothing.
