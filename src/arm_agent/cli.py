@@ -81,14 +81,29 @@ def cmd_run(args: argparse.Namespace) -> int:
                 return 2
             time.sleep(1.0)
 
-    model = QwenAgentModel(
-        model_dir=args.model_dir,
-        load=args.load,
-        gpu_mem_gib=args.gpu_mem_gib,
-        max_new_tokens=args.max_new_tokens,
-        enable_thinking=args.enable_thinking,
-        n_gpu=args.gpus,
-    )
+    if args.backend == "strata":
+        # Strata serves Qwen3.8-Flash-Next over OpenAI-compatible HTTP
+        # (127.0.0.1:8080). See arm_agent/agent/strata.py for the three
+        # conversions this backend does. Kept as a branch rather than a
+        # replacement so the 9B path stays runnable for A/B.
+        from arm_agent.agent.strata import StrataAgentModel
+
+        model = StrataAgentModel(
+            base_url=args.strata_url,
+            model=args.strata_model,
+            max_new_tokens=args.max_new_tokens,
+            reasoning_effort=args.reasoning_effort,
+            thinking_effort=args.thinking_effort,
+        )
+    else:
+        model = QwenAgentModel(
+            model_dir=args.model_dir,
+            load=args.load,
+            gpu_mem_gib=args.gpu_mem_gib,
+            max_new_tokens=args.max_new_tokens,
+            enable_thinking=args.enable_thinking,
+            n_gpu=args.gpus,
+        )
     model.load_model()
 
     harness = Harness(
@@ -105,7 +120,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         image_keep=args.image_keep,
     )
     print(
-        f"[run] history_messages={harness.history_messages} "
+        f"[run] backend={args.backend} "
+        f"history_messages={harness.history_messages} "
         f"image_keep={harness.image_keep} prompt_mode={harness.prompt_mode} "
         f"tool_protocol={harness.tool_protocol} "
         f"thinking={model.enable_thinking} max_new_tokens={model.max_new_tokens} "
@@ -197,6 +213,28 @@ def main(argv: list[str] | None = None) -> int:
         help="per-turn reply budget. 160 was too small: the model's Chinese "
         "preamble ate it and the tool call was cut off mid-XML (18 of 19 "
         "retries in one 80-turn run).",
+    )
+    p.add_argument(
+        "--backend",
+        default="local",
+        choices=["local", "strata"],
+        help="local = in-process Qwen3.5-9B (transformers, needs the GPU here); "
+        "strata = HTTP to a running Strata server (Qwen3.8-Flash-Next)",
+    )
+    p.add_argument("--strata-url", default="http://127.0.0.1:8080/v1")
+    p.add_argument("--strata-model", default="strata", help="the name Strata ignores")
+    p.add_argument(
+        "--reasoning-effort",
+        default="none",
+        choices=["none", "low", "medium", "high"],
+        help="strata backend only: the executor's thinking level (the server's "
+        "own default is high). none keeps the turn short like the 9B's thinking=off.",
+    )
+    p.add_argument(
+        "--thinking-effort",
+        default="high",
+        choices=["none", "low", "medium", "high"],
+        help="strata backend only: what `thinking=True` (the verifier's request) means",
     )
     p.add_argument("--timeout", type=float, default=600.0, help="per-IPC-call timeout")
     p.add_argument("--wait-server", type=float, default=120.0)

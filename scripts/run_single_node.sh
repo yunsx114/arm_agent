@@ -97,6 +97,13 @@ BUDGET_ARGS=()
 GATE_ARGS=()
 [ "${VERIFIER:-0}" = "1" ] && GATE_ARGS+=(--verifier)
 [ "${VERIFIER_THINKING:-0}" = "1" ] && GATE_ARGS+=(--verifier-thinking)
+# Which model answers. LOCAL (default) = the in-process Qwen3.5-9B, which needs
+# the GPU to itself; STRATA = HTTP to the Strata server on 127.0.0.1:8080, whose
+# engine already holds ~31 GiB of VRAM -- so loading the 9B as well would OOM.
+BACKEND_ARGS=(--backend "${BACKEND:-local}")
+[ -n "${STRATA_URL:-}" ] && BACKEND_ARGS+=(--strata-url "$STRATA_URL")
+[ -n "${REASONING_EFFORT:-}" ] && BACKEND_ARGS+=(--reasoning-effort "$REASONING_EFFORT")
+[ -n "${THINKING_EFFORT:-}" ] && BACKEND_ARGS+=(--thinking-effort "$THINKING_EFFORT")
 
 echo "==> running $EPISODES episode(s) with $LOAD model (log: $AGENT_LOG)"
 set +e
@@ -109,6 +116,7 @@ ARM_AGENT_MODEL_DIR="$MODEL_DIR" \
     --max-new-tokens "$MAX_NEW_TOKENS" --prompt-mode "$PROMPT_MODE" \
     "${BUDGET_ARGS[@]}" \
     "${GATE_ARGS[@]}" \
+    "${BACKEND_ARGS[@]}" \
     "${RECORD_ARGS[@]}" 2>&1 | tee "$AGENT_LOG"
 status=${PIPESTATUS[0]}
 set -e
