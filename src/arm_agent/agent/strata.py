@@ -121,6 +121,12 @@ class StrataAgentModel:
         retries: int = 2,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        # /health lives at the server ROOT, not under /v1: a naive
+        # f"{base_url}/health" becomes /v1/health, which is a 404, and a 404 here
+        # means load_model() polls for the full 600 s and then raises. Cost one
+        # smoke test (2026-10-11) -- the paths are not interchangeable.
+        _root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        self.health_url = f"{_root}/health"
         self.model = model
         # Same reason as QwenAgentModel: a str reaching the request body fails
         # deep inside ("'<=' not supported ..."); coerce at the boundary.
@@ -145,7 +151,7 @@ class StrataAgentModel:
         last = ""
         while time.time() < deadline:
             try:
-                with urllib.request.urlopen(f"{self.base_url}/health", timeout=20) as r:
+                with urllib.request.urlopen(self.health_url, timeout=20) as r:
                     info = json.load(r)
                 if info.get("loaded"):
                     print(
@@ -164,7 +170,7 @@ class StrataAgentModel:
             except Exception as exc:  # noqa: BLE001 - the server may still be starting
                 last = f"{type(exc).__name__}: {exc}"
             time.sleep(3.0)
-        raise RuntimeError(f"Strata server at {self.base_url} never became ready ({last})")
+        raise RuntimeError(f"Strata server at {self.health_url} never became ready ({last})")
 
     # ------------------------------------------------------------------ chat
     def chat(

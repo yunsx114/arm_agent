@@ -229,9 +229,14 @@ class Harness:
         """The harness's OWN verdict on the release pose, printed alongside the
         verifier's, so a model/arithmetic disagreement is visible in the log.
 
-        Thresholds come from the measured scene facts in `skills/scene_tools.md`
-        (opening 16x17 cm, can 6.6 cm, rim z=0.115, payload bottom 5.4 cm below
-        the EEF centre).
+        Thresholds are the sim's own geometry, measured 2026-10-11 by
+        scripts/probe_rim.py + scripts/probe_release_offset.py: the basket's rim
+        is at z=0.1513 (body z=-0.0046 + a 17.3 cm box), the can is 8.5 cm tall,
+        and the gripper holds it at mid-height so the payload's bottom rides
+        0.050 below the EEF.  The old pair (rim 0.115, bottom = eef - 0.054) was
+        3.6 cm out, and every release at approach(basket, 20) then left the can
+        resting ON the rim (episode_000_1791722140: 3 gate-approved releases, 3
+        verify failures).
         """
         if not obs:
             return "没有 obs"
@@ -242,8 +247,8 @@ class Harness:
             return f"无法判断（容器未知，最近 approach 的是{held or '无' }）"
         dx = (eef[0] - centre[0]) * 100.0
         dy = (eef[1] - centre[1]) * 100.0
-        bottom = eef[2] - 0.054
-        ok = abs(dx) <= 5.0 and abs(dy) <= 5.0 and bottom >= 0.115
+        bottom = eef[2] - 0.050
+        ok = abs(dx) <= 5.0 and abs(dy) <= 5.0 and bottom >= 0.151
         return (
             f"容器={name} Δx={dx:+.1f}cm Δy={dy:+.1f}cm 爪心z={eef[2]:.4f} "
             f"物体底≈{bottom:.4f} ⇒ {'应放行' if ok else '不应放行'}"
@@ -489,8 +494,9 @@ class Harness:
                             "[释放被否决] 核验者没有放行这次 gripper open，动作**未执行**。"
                             f"理由：{reason}\n"
                             "物体还在夹爪上。请优先执行理由里建议的那个工具（若它建议「先 `move +z`"
-                            "抬高、再 `approach(容器, 20)`」就照做：抬高是为了让物体底部越过容器口沿 "
-                            "z≈0.115，否则下一次 approach 还会把容器推走）；对准之后再请求放行。"
+                            "抬高、再 `approach(容器, 25)`」就照做：抬高是为了让物体底部越过容器口沿 "
+                            "z≈0.151（实测值），否则下一次 approach 还会把容器推走/把物体刮掉）；"
+                            "对准之后再请求放行。"
                         )
                         messages.append({"role": "user", "content": note})
                         transcript.append({"turn": turn, "gate_reject": reason})

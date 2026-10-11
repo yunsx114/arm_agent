@@ -29,7 +29,10 @@ mkdir -p "$IPC_DIR" "$LOG_DIR"
 case "$EPISODES" in
     ''|*[!0-9]*) echo "episodes must be a non-negative integer: $EPISODES" >&2; exit 2 ;;
 esac
-if [ ! -d "$MODEL_DIR" ]; then
+# The in-process 9B needs its weights on disk; the Strata backend does not read
+# them at all (the engine on 127.0.0.1:8080 owns the model), and requiring the
+# folder there would only force a pointless 18 GB copy.
+if [ "${BACKEND:-local}" != "strata" ] && [ ! -d "$MODEL_DIR" ]; then
     echo "ERROR: model directory does not exist: $MODEL_DIR" >&2
     exit 2
 fi
