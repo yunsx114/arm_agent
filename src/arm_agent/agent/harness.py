@@ -169,6 +169,31 @@ def summary_due(turn: int, every: int) -> bool:
     return bool(every) and turn > 1 and (turn - 1) % every == 0
 
 
+def _final_eef(
+    entries: list[dict[str, Any]], obs: dict[str, Any]
+) -> list[float]:
+    """The executor's LAST reported end-effector position (fallback: the live state)."""
+    for entry in reversed(entries):
+        measurement = (entry.get("structured_result") or {}).get("measurement") or {}
+        pos = measurement.get("eef_end")
+        if isinstance(pos, list) and len(pos) == 3:
+            return [round(float(v), 4) for v in pos]
+    eef = obs.get("eef_pos") or [0.0, 0.0, 0.0]
+    return [round(float(v), 4) for v in eef]
+
+
+def _summarise_gripper(entries: list[dict[str, Any]]) -> dict[str, int]:
+    """Per-verdict counts of the sub-model's gripper calls (its only actuation report)."""
+    counts: dict[str, int] = {}
+    for entry in entries:
+        structured = entry.get("structured_result") or {}
+        if structured.get("tool") != "gripper":
+            continue
+        verdict = str(structured.get("status") or "?")
+        counts[verdict] = counts.get(verdict, 0) + 1
+    return counts
+
+
 class Harness:
     def __init__(
         self,
@@ -201,7 +226,10 @@ class Harness:
         # 档 B: `truth` = the simulator owns object positions (the A/B baseline);
         # `pixels` = it does not, and the model targets pixels instead.
         self.observation_mode = str(observation_mode).strip().lower()
-        self.auto_frames = self.observation_mode != "look"
+        # `look` AND the planner share the pull-based image policy: no frame is attached
+        # to a turn automatically, and none is ever elided. The planner NEVER receives
+        # frames from its dispatches either (the sub-model's look calls are the sub's).
+        self.auto_frames = self.observation_mode not in ("look", "planner")
         # 0 or None disables the self-summary (A/B control arm); the mechanical cap then
         # still applies, exactly as before.
         self.summary_every = int(summary_every) if summary_every else 0
@@ -217,7 +245,7 @@ class Harness:
             # `look` mode that is the whole point: the model paid a turn for each frame,
             # and comparing the frame it took before a step with the one after is how it
             # judges whether the step was too big.
-            -1 if self.observation_mode == "look" else HISTORY_IMAGE_KEEP
+            -1 if self.observation_mode in ("look", "planner") else HISTORY_IMAGE_KEEP
         )
         # "full" = the accumulated scene-specific prompt; "plain" = task +
         # frame + tool semantics only (see prompts.get_system_prompt).
@@ -389,7 +417,7 @@ class Harness:
     # -------------------------------------------------------------- episode
     def run_episode(
         self,
-        init_state_idx: int = 0,
+        init_state_idx: int | None = 0,
         episode_id: int = 0,
         recorder: EpisodeRecorder | None = None,
     ) -> EpisodeResult:
@@ -398,9 +426,17 @@ class Harness:
         transcript: list[dict[str, Any]] = []
         last_images: dict[str, Any] = {}
         try:
-            resp = self.client.reset(init_state_idx=init_state_idx)
-            obs = resp.obs
-            images = resp.images(self.client.ipc_dir)
+            if init_state_idx is None:
+                # 档 E: continue in the CURRENT world (the executor of a dispatch).
+                # Everything else about the episode loop is shared, but a reset here
+                # would teleport the arm back to the start between every phase.
+                resp = self.client.state()
+                obs = resp.obs
+                images: dict[str, Any] = {}
+            else:
+                resp = self.client.reset(init_state_idx=init_state_idx)
+                obs = resp.obs
+                images = resp.images(self.client.ipc_dir)
             last_images = images
             result.task = obs.get("task", "")
             result.language = obs.get("language", "")
@@ -564,6 +600,16 @@ class Harness:
                 try:
                     t_tool0 = time.time()
                     outcome = self._dispatch(call, obs)
+                    # 档 E: flatten the executor's transcript into the OUTER one. One
+                    # episode file then holds both layers, and every offline audit
+                    # (direction rate, distances) reads the moves where they actually
+                    # happened -- inside the sub-episodes -- without a second file.
+                    # `sub`/`outer_turn` keep the two layers distinguishable.
+                    sub_entries = outcome.pop("_sub_transcript", None) or []
+                    for entry in sub_entries:
+                        entry["sub"] = True
+                        entry["outer_turn"] = turn
+                        transcript.append(entry)
                     outcome["result"] = self._structured_outcome(call, outcome)
                     tool_s = time.time() - t_tool0
                     # A DEGENERATE LOOP IS A FACT ABOUT THE MODEL'S OWN CALLS, and
@@ -928,6 +974,98 @@ class Harness:
         )
         return compressed, summary
 
+    # ---------------------------------------------------- 档 E · dispatch
+    def _run_subtask(self, call: ToolCall, obs: dict[str, Any]) -> dict[str, Any]:
+        """Run the executor (the `look`-mode model) on one coarse task, report back.
+
+        The user's spec, and what each part of this method is for:
+          * the sub-model gets a CLEAN context per call ("上下文不同") -- built from
+            nothing but the task text and the CURRENT scene state;
+          * a turn budget, after which it returns automatically ("预算结束后自动返回") --
+            `max_turns` on the sub-harness, so the planner can never hand over the
+            whole episode;
+          * a REPORT the planner reads to accept or reject the phase -- the planner has
+            no actuation, so this text plus its own `look`s are the whole acceptance test;
+          * the report says WHY a phase failed, because that is what the planner needs
+            to rewrite the task ("根据子模型执行的过程改造粗粒度任务提示词，提供失败经验").
+        """
+        task = str(call.args.get("task", "")).strip()
+        budget = as_float(call.args.get("budget_turns"), None) or C.DISPATCH_BUDGET_DEFAULT
+        budget = int(min(max(budget, C.DISPATCH_BUDGET_RANGE[0]), C.DISPATCH_BUDGET_RANGE[1]))
+        self._sub_count = getattr(self, "_sub_count", 0) + 1
+        self._say(f"[turn ?] dispatch #{self._sub_count}：预算 {budget} 轮，任务：{task[:60]}…")
+
+        sub = SubTaskHarness(
+            client=self.client,
+            model=self.model,
+            workspace=self.workspace,
+            max_turns=budget,
+            tool_protocol="v2",
+            log=self.log,
+            observation_mode="look",
+            move_ladder=self.move_ladder,
+            # The sub starts mid-episode, so it inherits the planner's grasp state --
+            # otherwise "爪上：空" would tell it to go grab something it is ALREADY
+            # holding (and the other way round).
+            history_messages=max(int(self.history_messages or 32), 2 * budget + 8),
+            summary_every=0,
+        )
+        sub._grasped = bool(self._grasped)
+        sub.mm_per_px = self.mm_per_px
+        sub_result = sub.run_episode(init_state_idx=None, episode_id=900 + self._sub_count)
+        self._grasped = bool(sub._grasped)
+        self._held_body = sub._held_body
+
+        entries = sub.captured
+        verdicts = _summarise_gripper(entries)
+        tools = {}
+        for entry in entries:
+            structured = entry.get("structured_result") or {}
+            name_i = structured.get("tool")
+            if name_i:
+                tools[name_i] = tools.get(name_i, 0) + 1
+        final_eef = _final_eef(entries, obs)
+
+        grip_txt = "、".join(f"{k}×{v}" for k, v in sorted(verdicts.items())) or "没有合/开过夹爪"
+        env_success = bool(sub_result.success)
+        error_txt = f"；中途异常：{sub_result.error}" if sub_result.error else ""
+        report = (
+            f"[dispatch #{self._sub_count} 完成] 任务“{task[:80]}”：\n"
+            f"执行者用了 {sub_result.turns}/{budget} 轮（{sub_result.tool_calls} 次工具调用，"
+            f"协议重试 {sub_result.protocol_retries}）；"
+            f".move {tools.get('move', 0)} 次、look {tools.get('look', 0)} 次、"
+            f"gripper：{grip_txt}{error_txt}。\n"
+            f"最终爪心 {_fmt3(final_eef)}，爪上：{format_state(obs, self._grasped).split('；')[-1].strip()}。"
+            + (f"执行者报告环境判定：{'完成' if env_success else '未完成'}。" if sub_result.tool_calls else "")
+            + "\n请验收：对照这个阶段的目标看上面的数字（必要时自己 look 再看一眼）。"
+              "失败就把原因和要改的点写进新的 task 再 dispatch；不要原样重发同一个任务。"
+        )
+        return {
+            "obs": obs,
+            "text": report,
+            "image": None,
+            "images": {},
+            "done": False,
+            # The structured envelope: counts the planner reads and the audits re-read.
+            "requested": {"task": task, "budget_turns": budget},
+            "measurement": {
+                "sub_turns": sub_result.turns,
+                "sub_turns_budget": budget,
+                "sub_tool_calls": sub_result.tool_calls,
+                "sub_tools": tools,
+                "sub_gripper": verdicts,
+                "final_eef": final_eef,
+                "held": self._grasped,
+                "sub_success": sub_result.success,
+                "sub_error": sub_result.error,
+            },
+            "held": self._grasped,
+            "raw": {"kind": "dispatch", "requested": {"task": task}},
+            # Popped by the episode loop and flattened into the OUTER transcript with a
+            # depth marker, so one episode file carries both layers.
+            "_sub_transcript": entries,
+        }
+
     def _dispatch(self, call: ToolCall, obs: dict[str, Any]) -> dict[str, Any]:
         name, args = call.name, call.args
         original_name = name
@@ -936,6 +1074,9 @@ class Harness:
         # other tool can have moved the arm, the object or the frame since.
         if canonical != "aim":
             self._last_aim = None
+        if name == "dispatch":
+            return self._run_subtask(call, obs)
+
         if canonical == "observe":
             if args.get("target") or original_name == "locate":
                 return {"obs": obs, "text": self._locate(args.get("target", args.get("name", "")), obs), "image": None, "done": False}
@@ -1529,6 +1670,36 @@ GRIPPER_OPEN_WIDTH = 0.034  # at/above this the pads are still open (no grasp)
 GRIPPER_EMPTY_WIDTH = 0.006  # at/below this they are fully shut on air
 # (P0b removed BASKET_RIM_Z / CARRY_SAFE_CENTRE_Z: scene constants fitted to
 # past crashes, no longer referenced by any code path.)
+
+
+# 档 E: the planner's executor. Defined AFTER `Harness` (it is a subclass).
+class SubTaskHarness(Harness):
+    """The planner's executor: the `look`-mode model with a context of its own.
+
+    Same weights (same model object), same simulator (same client), same physical arm --
+    but a FRESH conversation per dispatch, a bounded turn budget, and no reset: it
+    arrives mid-episode. Two overrides make it fit:
+
+    * `_say` prefixes every log line with [sub], so a nested run's turn numbers do not
+      read as the planner's.
+    * `_write_transcript` CAPTURES the transcript instead of writing a file: the entries
+      are flattened into the planner's transcript by the dispatch handler (with a
+      depth marker), so one episode file holds both layers and the offline audits see
+      the moves where they actually happened -- in the sub-episodes.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        super().__init__(*args, **kwargs)
+        self.captured: list[dict[str, Any]] = []
+
+    def _say(self, message: str) -> None:
+        # Nested turn numbers must never be mistaken for the planner's own turns.
+        if self.log:
+            print(f"[sub] {message}", flush=True)
+
+    def _write_transcript(self, episode_id: int, result: Any, transcript: list[dict[str, Any]]) -> Path:
+        self.captured = list(transcript)
+        return Path("")
 
 
 def _fmt3(vec: Any) -> str:

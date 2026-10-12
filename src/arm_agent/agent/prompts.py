@@ -282,6 +282,22 @@ LEGACY_TOOL_SCHEMAS = TOOL_SCHEMAS
 # had no documented default -- which is how a run spent 26 turns parking 5 cm
 # above the object and closing on air (`gripper` width 0.0007, 26/26 calls).
 TOOL_SCHEMAS_V2: list[dict[str, Any]] = [
+    # 档 E: the planner's delegation tool. It is in the master list so the static wiring
+    # probe checks it, and it is filtered to the `planner` surface by MODE_TOOLS.
+    {"type": "function", "function": {
+        "name": "dispatch",
+        "description": (
+            "把一个粗粒度动作交给执行者（另一个模型实例）去完成，并拿到它的执行报告。"
+            "**执行者看不到你们这边的对话**——它只能看到你写的 task 和当时的现场状态，"
+            "所以 task 要写成一份完整的独立指令：目标、做法要点、要避免什么（上次失败的原因）。"
+            "它会在 budget_turns 轮内自己看图、自己移动/开合夹爪，预算用完自动返回；"
+            "报告里含它用了多少轮、每个夹爪动作的回报、最后爪心位置、爪上是否有东西。"
+            "你要自己验收：成功就进入下一阶段；失败就把原因与新经验写进新的 task 再 dispatch。"
+        ),
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string", "description": "给执行者的完整任务描述（独立可读），含目标、要点与要避免的坑"},
+            "budget_turns": {"type": "number", "description": "执行者的轮数预算，默认 30，范围 5~60"},
+        }, "required": ["task"]}}},
     {"type": "function", "function": {
         "name": "observe",
         "description": (
@@ -703,6 +719,17 @@ LOOK_SCHEMA: dict[str, Any] = {
 }
 
 
+PLANNERS_APPENDIX = """
+
+## 附：本模式的词汇换算
+- 你自己只有 `look` / `dispatch` / `verify` 三个工具：**没有 move、没有 gripper**，
+  场景事实里提到的 `approach / aim / target / grasp / release / move / gripper / rotate`
+  都是**执行者**（你 dispatch 出去的那个模型）的工具，不是你的。
+- 场景事实里的操作建议（"横移前爪心要 ≥0.22"之类）你用不上也执行不了——把它们
+  **写进 task 交给执行者**。
+"""
+
+
 LOOKS_APPENDIX = """
 
 ## 附：本模式的词汇换算
@@ -716,6 +743,47 @@ LOOKS_APPENDIX = """
 # the one thing the model has to understand: seeing is now an ACTION it takes, and the
 # frames it takes stay in the conversation, so "did that step take me past it?" is now a
 # question it can actually answer by comparing two frames it asked for.
+# 档 E: the PLANNER's own system prompt. It deliberately says almost nothing about how
+# to move the arm -- that is the sub-model's expertise (the look-mode prompt). What it
+# must teach is the ITERATION OF DELEGATION: write a self-contained task, read the
+# report, judge, and on failure REWRITE the task with the reason (the user's spec:
+# "根据子模型执行的过程改造粗粒度任务提示词，提供失败经验").
+SYSTEM_PROMPT_V2_PLANNER = """你是机械臂任务的**规划者**。你自己**不能移动机械臂**——你能做的只有三件事：
+看图（look）、把一个粗粒度阶段交给执行者（dispatch）、在全部完成后请求环境判定（verify）。
+
+**执行者**是另一个模型：它拿你写的一段任务描述，在**它自己的上下文里**（它看不到你们的
+对话历史）用 move / gripper / look 尝试完成，最多走 budget_turns 轮，**预算用完自动返回**。
+
+## 工作循环
+1. 先 `look(agent)` 看清现场（必要时 `look(wrist)`）。记住你自己有图，但**没有手**。
+2. 把任务拆成**少数几个粗粒度阶段**（例如：①张开夹爪、把爪心移到目标罐正上方、下降并夹住；
+   ②抬高并移到容器上方；③降到合适高度放手）。一次只 dispatch 一个阶段。
+3. dispatch 的 `task` 是给执行者的**完整独立指令**：目标、做法要点、以及**要避免什么**
+   （把上一次失败的原因写进去——它自己不知道）。
+4. 拿到报告后**验收**：读报告数字（轮数、move 次数、夹爪回报、最后爪心位置、爪上是否有东西），
+   必要时自己再 `look` 一次确认画面。
+   - 阶段成功 ⇒ 进入下一阶段。
+   - 失败 ⇒ 改写 task 再 dispatch：**写明这次为什么失败、下次要改什么**。不要原样重发同一个 task
+     （同样的指令只会得到同样的失败）。
+5. 全部阶段完成 ⇒ `verify`。
+
+## 报告怎么读
+[dispatch] 返回：任务原文、轮数用量（如 23/30）、move 次数、gripper 各动作的回报
+（夹住了 / 夹空了 / 接触不稳 / 已张开）、最后爪心坐标、爪上是否有东西、若执行者问过环境的
+判定结果。报告是测量，不是结论——你要根据它判断阶段是否达成。
+
+输出格式：每次回复严格按三段写，标题照抄：
+现状：（你最近看过的画面或上一份报告里的事实）
+判定：（当前阶段是否完成；下一步交给执行者做什么、要它避免什么）
+动作：（下一个工具调用：look / dispatch / verify；必须与判定一致）
+三段写完后紧接写出完整的工具调用。除这三段外不要写任何其他内容。
+
+## 事实
+- 执行者与你**同一时刻共享同一个机械臂与世界**：它做完（或预算耗尽）后你接手判断，中途你无法干预。
+- 你可以在 dispatch 之间反复 look——图是留存的，可以对比"这一阶段前后"。
+- 环境只在物品真正放好后才算任务完成（verify 的判定与环境一致）。
+"""
+
 SYSTEM_PROMPT_V2_LOOK = """你是机械臂任务决策核心。目标是完成当前任务。
 
 每次只调用一个工具。工具结果是环境测量，不是行动建议；不要假设动作一定完成。
@@ -781,6 +849,8 @@ def get_system_prompt(
         return raw_prompt(move_ladder)
     if mode_o == "look" and mode_l == "v2":
         return SYSTEM_PROMPT_V2_LOOK
+    if mode_o == "planner" and mode_l == "v2":
+        return SYSTEM_PROMPT_V2_PLANNER
     return PROMPT_MODES.get(mode_l, SYSTEM_PROMPT)
 
 
@@ -829,6 +899,8 @@ def mode_appendix(observation_mode: str) -> str:
         return RAWS_APPENDIX
     if mode == "look":
         return LOOKS_APPENDIX
+    if mode == "planner":
+        return PLANNERS_APPENDIX
     return ""
 
 
@@ -915,9 +987,10 @@ def get_tool_schemas(
     schemas = TOOL_SCHEMAS_V2 if str(protocol).strip().lower() == "v2" else LEGACY_TOOL_SCHEMAS
     if move_ladder:
         schemas = [MOVE_LADDER_SCHEMA if s["function"]["name"] == "move" else s for s in schemas]
-    if str(observation_mode).strip().lower() == "look":
-        # `look` replaces the three-in-one `observe`: one camera per call, and the only
-        # source of pixels. Names, positions and object coordinates stay absent.
+    if str(observation_mode).strip().lower() in ("look", "planner"):
+        # `look` (and the planner's own `look`) replaces the three-in-one `observe`:
+        # one camera per call, and the only source of pixels. Names, positions and
+        # object coordinates stay absent.
         schemas = [LOOK_SCHEMA if s["function"]["name"] == "observe" else s for s in schemas]
     if str(protocol).strip().lower() != "v2":
         return schemas

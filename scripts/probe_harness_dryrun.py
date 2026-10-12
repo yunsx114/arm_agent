@@ -1141,6 +1141,117 @@ def look_leg(ipc_dir: Path) -> bool:
     return all(checks.values())
 
 
+class PlannerStub:
+    """One object, two roles (the harness hands the SAME model to the sub-harness).
+
+    It routes on the system prompt, which is the only thing that differs between the
+    planner's context and the sub-model's: `规划者` -> the planner script (one dispatch,
+    then verify); otherwise -> hand everything to a `RawPolicy`, i.e. the exact scripted
+    `look`-mode executor the raw leg already proved. That is precisely the 档 E shape:
+    same weights, different context.
+    """
+
+    def __init__(self, server: SimServer) -> None:
+        self.inner = RawPolicy(server=server)
+        self.planner_calls = 0
+
+    def chat(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+        system = str(next((m.get("content", "") for m in messages if m.get("role") == "system"), ""))
+        if "规划者" in system:
+            self.planner_calls += 1
+            task = (
+                "抓起 alphabet soup：先张开夹爪，把爪心移到蓝罐正上方，下降到罐身再合爪；"
+                "然后抬到 z≥0.25，移到篮子上方，降到 0.16 放手。"
+                "**上次失败原因（写给你避免）：合手高度太高会只碰到盖沿——eef z 要 <0.08 再 close。**"
+            )
+            if self.planner_calls == 1:
+                return (
+                    "现状：第一回合，还没看过现场。\n"
+                    "判定：整体分两个阶段，先交执行者抓取+搬运。\n"
+                    "动作：调用 dispatch。\n"
+                    + _call("dispatch", {"task": task, "budget_turns": "40"})
+                )
+            return (
+                "现状：执行者已返回报告。\n"
+                "判定：验收，请环境判定任务是否完成。\n"
+                "动作：调用 verify。\n"
+                + _call("verify", {"claim": "task_complete"})
+            )
+        return self.inner.chat(messages, tools=tools, **kwargs)
+
+
+def planner_leg(ipc_dir: Path) -> bool:
+    """档 E: the planner has NO actuation; the executor is the `look`-mode model.
+
+    What has to be proven here (each is the reason the mode exists):
+    1. The planner's surface is exactly {look, dispatch, verify} -- no move, no gripper.
+    2. ONE dispatch runs a sub-episode with the look-mode surface and a turn budget,
+       WITHOUT resetting the world (the arm carries over; the sub inherits 爪上 state).
+    3. The report the planner reads carries turns used / gripper verdicts / final eef.
+    4. The sub's transcript is flattened INTO the planner's episode file (depth-marked).
+    5. The whole task still completes (the sub IS the proven raw-leg controller).
+    """
+    server = SimServer(
+        ipc_dir=ipc_dir,
+        suite_name="libero_object",
+        task_id=0,
+        cam_size=256,
+        observation_mode="planner",
+        pixel_grid_px=32,
+    )
+    thread = threading.Thread(target=server.serve_forever, kwargs={"idle_exit_s": 120}, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    client = SimClient(ipc_dir)
+    stub = PlannerStub(server=server)
+    harness = Harness(
+        client=client,
+        model=stub,
+        workspace=REPO,
+        max_turns=8,
+        tool_protocol="v2",
+        log=False,
+        observation_mode="planner",
+    )
+    advertised = sorted(s["function"]["name"] for s in harness.tool_schemas)
+    result = harness.run_episode(init_state_idx=0, episode_id=993)
+    transcript = json.loads(Path(result.transcript_path).read_text())["transcript"]
+    client.close()
+    time.sleep(0.3)
+
+    sub_entries = [e for e in transcript if e.get("sub")]
+    planner_entries = [e for e in transcript if not e.get("sub") and e.get("result")]
+    dispatch_reports = [e for e in planner_entries if str(e.get("result", "")).startswith("[dispatch")]
+    moves = [e for e in sub_entries if (e.get("structured_result") or {}).get("tool") == "move"]
+    grips = [e for e in sub_entries if (e.get("structured_result") or {}).get("tool") == "gripper"]
+    st = (dispatch_reports[0].get("structured_result") or {}).get("measurement") or {} if dispatch_reports else {}
+    report = str(dispatch_reports[0].get("result", "")) if dispatch_reports else ""
+    checks = {
+        "planner 工具面 = look/dispatch/verify（无 move/gripper）": advertised == ["dispatch", "look", "verify"],
+        "发生了至少一次 dispatch，报告到达 planner": bool(dispatch_reports),
+        "报告带预算用量与夹爪回报": (
+            "gripper" in report and bool(st.get("sub_turns_budget")) and st.get("sub_turns", 0) >= 1
+        ),
+        "子回合确实在跑（move+gripper 都在子层）": bool(moves) and bool(grips),
+        "子回合已折叠进同一份转写（带 sub 深度标记）": bool(sub_entries)
+        and all(e.get("outer_turn") for e in sub_entries),
+        "执行者没有重置世界（子层首步爪心 = reset 位置之后）": (
+            moves and abs((moves[0].get("structured_result") or {}).get("measurement", {}).get("eef_start", [9])[0] - (-0.152)) < 0.03
+        ),
+        "预算生效（子回合数 ≤ 预算）": (not st) or st.get("sub_turns", 0) <= st.get("sub_turns_budget", 0),
+        "planner 自身回合数很小（外层只发号施令）": result.turns <= 4,
+        "整体任务完成（执行者=已证明的 look 腿控制器）": bool(result.success),
+    }
+    for label, passed in checks.items():
+        print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
+    print(f"  planner 腿：success={result.success} source={result.success_source} "
+          f"外层 turns={result.turns}；dispatch 数={len(dispatch_reports)}；"
+          f"子条目 {len(sub_entries)}（move {len(moves)} / gripper {len(grips)}）")
+    if dispatch_reports:
+        print(f"  报告节选：{report[:180]}")
+    return all(checks.values())
+
+
 def main() -> int:
     ipc_dir = REPO / "runtime" / "ipc_dryrun"
     shutil.rmtree(ipc_dir, ignore_errors=True)
@@ -1196,6 +1307,8 @@ def main() -> int:
     ok = ladder_leg(REPO / "runtime" / "ipc_dryrun5") and ok
     print("\n=== look 腿（model 自己决定何时看图，历史图不清理）===")
     ok = look_leg(REPO / "runtime" / "ipc_dryrun6") and ok
+    print("\n=== planner 腿（档 E：主模型只规划+验收，执行者=look 模式子模型）===")
+    ok = planner_leg(REPO / "runtime" / "ipc_dryrun7") and ok
     print("PLUMBING OK" if ok else "PLUMBING PROBLEM")
     return 0 if ok else 1
 

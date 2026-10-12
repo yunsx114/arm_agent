@@ -12,7 +12,7 @@ from typing import Any
 from arm_agent import contracts as C
 
 CANONICAL_TOOLS = (
-    "observe", "look", "aim", "target", "approach", "move", "rotate", "gripper", "grasp", "release", "verify",
+    "observe", "look", "aim", "target", "approach", "dispatch", "move", "rotate", "gripper", "grasp", "release", "verify",
 )
 # WHICH TOOLS EACH OBSERVATION MODE ADVERTISES AND ACCEPTS (v2).
 #
@@ -47,6 +47,15 @@ MODE_TOOLS: dict[str, frozenset[str]] = {
     # validated instrument; the truth-driven scripted control scores 94%), i.e. a random
     # walk -- consistent with a policy that cannot see what its own steps did.
     "look": frozenset({"move", "gripper", "observe", "verify"}),
+    # 档 E · 分层：主模型（planner）自己**没有任何动作工具**。它看图（look）、
+    # 把粗粒度阶段交给执行者（dispatch）、全部完成再问环境（verify）。
+    # 执行者是 `look` 模式的模型本体：同一份权重，但**自己的上下文、自己的轮数预算**，
+    # 拿到一段任务描述后在预算内用 {move, gripper, look, verify} 尝试，预算用完自动返回，
+    # 由主模型读报告验收（成功→下一阶段；失败→把失败经验写进新的 task 再来）。
+    # NOTE on the odd pair {"look", "observe"}: the ADVERTISED schema is named `look`
+    # (LOOK_SCHEMA) but `canonical_name` maps it to `observe` (the alias table), and the
+    # whitelist is compared in canonical space -- so both spellings must be members.
+    "planner": frozenset({"look", "observe", "dispatch", "verify"}),
 }
 DEFAULT_MODE = "truth"
 # NOTE (2026-10-12): there used to be an `UNREGISTERED_TOOLS = {"observe"}` here that was
@@ -82,6 +91,10 @@ ALIASES = {
 REQUIRED = {
     "observe": (),
     "approach": ("target",),
+    # 档 E: the planner's ONE delegation argument. Everything the sub-model gets is this
+    # text -- it has no access to the planner's conversation -- so `task` is where the
+    # failure experience from previous dispatches has to be written too.
+    "dispatch": ("task",),
     # `aim` and `target` require the pixel and nothing else: the clearance offset is
     # optional because 0 is a legitimate request ("ground this pixel and go"), the
     # camera defaults to the third-person view, and the block length defaults to the
@@ -160,6 +173,21 @@ def validate_tool_call(
     # else. A distance in centimetres is rejected with a reason instead of being
     # silently converted -- the whole point is that the model is not doing the
     # arithmetic any more, and a silent conversion would hide it still trying to.
+    if canonical == "dispatch":
+        # The sub-model's turn budget. Bounded because the planner PAID nothing for a
+        # dispatch (it is one planner turn) while the sub-episode spends real turns --
+        # an unbounded budget would let the planner hand over the whole episode.
+        budget = str(normalized_args.get("budget_turns", "")).strip()
+        if budget:
+            try:
+                value = float(budget)
+            except ValueError:
+                return [f"invalid_number:budget_turns={budget}"]
+            if not C.DISPATCH_BUDGET_RANGE[0] <= value <= C.DISPATCH_BUDGET_RANGE[1]:
+                return [
+                    f"invalid_range:budget_turns={budget}"
+                    f"({C.DISPATCH_BUDGET_RANGE[0]}~{C.DISPATCH_BUDGET_RANGE[1]})"
+                ]
     if canonical == "observe" and not legacy:
         # `observe` has THREE branches, and only the camera one belongs on a pixel/frame
         # surface: `observe(target=...)` returns GROUND-TRUTH object coordinates (it is the

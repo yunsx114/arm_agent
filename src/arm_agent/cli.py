@@ -190,11 +190,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--observation-mode",
         default="truth",
-        choices=["truth", "pixels", "raw", "look"],
+        choices=["truth", "pixels", "raw", "look", "planner"],
         help="truth = 允许按名字取仿真真值坐标；pixels = 断掉那条路，"
         "只接受 aim/target 给像素，并把带网格+夹爪准线的画面送给模型；"
         "raw = 连像素工具也断掉，只剩 move + gripper + verify（画面上只留夹爪准线）；"
-        "look = 同 raw，但**不再每轮自动给图**，改由模型自己调 look 工具取图（且历史图不清理）",
+        "look = 同 raw，但**不再每轮自动给图**，改由模型自己调 look 工具取图（且历史图不清理）；"
+        "planner = 主模型无动作工具（look + dispatch + verify），粗粒度阶段交给派生子模型"
+        "（子模型即 look 模式同一权重、独立上下文、带轮数预算）；**外层回合数用 MAXTURNS 控制，"
+        "建议 ≤30**（子回合另计）",
     )
     p.add_argument(
         "--pixel-grid",
@@ -317,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--observation-mode",
         default="truth",
-        choices=["truth", "pixels", "raw", "look"],
+        choices=["truth", "pixels", "raw", "look", "planner"],
         help="truth = 仿真提供物体坐标（A/B 基线）；pixels = 不提供任何物体坐标 ，"
         "模型用带网格的画面给 aim/target 传像素；raw = 只有 move/gripper/verify ；"
         "look = 同 raw，但画面要模型自己 look（不自动给、历史图不清理）。"

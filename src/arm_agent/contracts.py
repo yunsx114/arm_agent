@@ -43,6 +43,13 @@ OBS_WRIST = "robot0_eye_in_hand_image"
 # MODEL uses in a tool call. 档 B needs the mapping in one place: the tool speaks
 # "agent"/"wrist" while the simulator speaks "agentview"/"robot0_eye_in_hand".
 CAMERA_NAMES = {"agent": "agentview", "wrist": "robot0_eye_in_hand"}
+
+# 档 E (planner/executor split): the one cross-model argument the protocol needs.
+# The sub-model's TURN budget -- after it, the sub-episode returns control no matter
+# what (the user's spec: "预算结束后自动返回"). The default lives with the schema
+# description; the range is checked by `validate_tool_call`.
+DISPATCH_BUDGET_RANGE = (5, 60)
+DISPATCH_BUDGET_DEFAULT = 30
 # Key of the magnified crop in an image payload (档 B v2 `aim`/`target`). It lives
 # here because BOTH sides need it and neither may import the other: the agent process
 # has no robosuite, and the sim process has no model client. It is not a camera, so it
