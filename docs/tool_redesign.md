@@ -555,7 +555,28 @@ v3 给模型加了「尺」（每步回显爪心实际移动多少像素 + 此�
    即现在的约束是「**XY ≤22mm 且合手高度低于罐顶**」两件事同时满足；模型靠"降到降不动了就
    停"这条规则会在**碰到罐顶**时停下并合手（比成功高度高 2~5cm）。
 
-## 12. 参考
+## 12. 档 E：planner/executor 分层（2026-10-12，提交 `a205f79`）
+
+主模型**没有动作工具**（只有 `look` / `dispatch` / `verify`）；粗粒度阶段由它自主拆分，
+每个阶段 `dispatch(task, budget_turns)` 派给**执行者 = look 模式的模型本体**——同一份权重、
+不同上下文（它看不到主模型的对话，只看到 task + 现场状态）、自己的轮数预算（用完自动返回）。
+主模型读报告验收：成功→下一阶段；失败→把原因写进新的 task 重试。
+
+### 12.1 机制要点
+
+| 件 | 实现 |
+|---|---|
+| 子模型 | `SubTaskHarness(Harness)`：复用整个 episode 循环，但 `init_state_idx=None` 走 `client.state()` 而**不 reset**（世界不回起点）；继承 `爪上` 状态与 mm/px 标定 |
+| 预算 | 子 harness 的 `max_turns`（5~60，默认 30），用完自动返回 |
+| 报告 | 轮数用量 / move 次数 / gripper 各回报 / 最后爪心 / 爪上 / 错误；structured `sub_turns(_budget)`/`sub_tools`/`sub_gripper`/`final_eef`/`held` |
+| 转写 | 子条目折叠进**同一份** episode 文件，带 `sub`/`outer_turn` 深度标记——离线审计把 move 归到真正发生的地方 |
+| 白名单坑 | `canonical_name("look")` 归一到 `"observe"`（别名表），白名单在 canonical 空间比较 ⇒ planner 的 `MODE_TOOLS` 必须同时含两种拼写 |
+
+干跑 planner 腿 9 项断言全绿：工具面无动作工具、一次 dispatch 即完成整任务
+（执行者是已证明的 look 腿控制器；74 个子条目全在同一份转写里；世界未被 reset；
+**外层只用了 2 轮**）。六条腿 PLUMBING OK。
+
+## 13. 参考
 * 计划与教训：[`docs/P0_stripdown.md`](P0_stripdown.md)（该剥/不该剥的边界）
 * 场景与几何实测：[`skills/scene_tools.md`](../skills/scene_tools.md)
 * 放手位姿审计：[`scripts/audit_release_poses.py`](../scripts/audit_release_poses.py)
