@@ -162,8 +162,10 @@ class SimServer:
                 outcome = self.adapter.move(
                     str(action["direction"]), float(action["distance_cm"])
                 )
+                self._attach_pixel_scale(outcome)
             elif act_kind == "rotate":
                 outcome = self.adapter.rotate(str(action["axis"]), float(action["angle_deg"]))
+                self._attach_pixel_scale(outcome)
             elif act_kind == "gripper":
                 outcome = self.adapter.set_gripper(str(action["action"]))
             elif act_kind == "grasp":
@@ -255,6 +257,37 @@ class SimServer:
         raise ValueError(f"unknown command: {kind!r}")
 
     # ------------------------------------------------------------------ 档 B
+    def _attach_pixel_scale(self, outcome) -> None:  # noqa: ANN001 - ActionOutcome
+        """Report the step the model just took IN PIXELS, and what a pixel is worth.
+
+        WHY (档 D, three arms measured): the model's own estimate of how far it still has
+        to go is **2.4-6x too small** -- median ratio of its claimed distance to the truth
+        was 0.42 (`raw` baseline), 0.16 (ladder v1), 0.38 (ladder v2), with 54-72% of the
+        quoted moves underestimating by 2x or more. It quotes the pixel gap correctly and
+        then converts at roughly **1mm/px, while the global view measures 3.0-4.0mm/px**.
+        That single wrong scale makes every step too small in every arm, which is why all
+        three crawl and never arrive -- no tool surface fixes it.
+
+        The scale is MEASUREMENT, and the code knows it exactly, so the fix is to hand the
+        model the calibration it just performed: this motion moved the crosshair by N
+        pixels at this depth. E.g. "一步走了 10cm = 27 像素" is a fact it can read off its
+        own action, instead of a scale factor it has to trust.
+        """
+        start = getattr(outcome, "eef_start", None)
+        end = getattr(outcome, "eef_end", None)
+        if not (start and end and len(start) == 3 and len(end) == 3):
+            return
+        try:
+            camera = self._camera("agent")
+            u0, v0, d0 = camera.project(np.asarray(start, dtype=float))
+            u1, v1, d1 = camera.project(np.asarray(end, dtype=float))
+        except Exception:  # noqa: BLE001 - a missing camera must not break the motion
+            return
+        if not all(np.isfinite(x) for x in (u0, v0, u1, v1)):
+            return
+        outcome.measurement["delta_px"] = [round(float(u1 - u0), 1), round(float(v1 - v0), 1)]
+        outcome.measurement["mm_per_px"] = round(float(camera.mm_per_px(float(d1))), 3)
+
     def _camera(self, key: str) -> Camera:
         cam_name = C.CAMERA_NAMES.get(str(key).strip().lower())
         if cam_name is None:

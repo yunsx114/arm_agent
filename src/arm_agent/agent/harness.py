@@ -1570,6 +1570,19 @@ def format_outcome(outcome: dict[str, Any]) -> str:
             f"[move {requested.get('direction')}{rung_tag} {requested.get('distance_cm')}cm] "
             f"实测位移 {_fmt3(delta)} m（{ticks} ticks）；机械爪现在位于 {_fmt3(end)}"
         )
+        # THE RULER, measured on the model's OWN step. Three arms measured the same defect:
+        # its "I am still N cm away" is 2.4-6x too small (it converts the global view at
+        # ~1mm/px where the camera measures 3.0-4.0mm/px), so every step it picks is too
+        # small -- 54-72% of quoted moves underestimate by 2x or more. Telling it the scale
+        # is not enough (the prompt already states it, and it is still wrong); this line lets
+        # it calibrate against something it cannot argue with: the step it just took.
+        px = (outcome.get("measurement") or {}).get("delta_px")
+        mm_px = (outcome.get("measurement") or {}).get("mm_per_px")
+        if px and mm_px:
+            text += (
+                f"；这一步在全局画面里让爪心移动了 {px[0]:+.1f} / {px[1]:+.1f} 像素"
+                f"（此处 1 像素≈{mm_px:.1f}mm）"
+            )
         if want > 0.005 and got < want * 0.5:
             # Fact (the shortfall) only. The old text added "don't repeat the
             # same direction; try another, or lift first" -- that is planning.

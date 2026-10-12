@@ -50,6 +50,23 @@ SMALL_WORDS = re.compile(r"一小步|小步|微调|稍微|一点点?|很小|毫�
 PX_CLAIM = re.compile(r"(\d+)\s*[~～\-到至]\s*(\d+)\s*像素|约\s*(\d+)\s*像素|(\d+)\s*像素")
 GLOBAL_MM_PER_PX = 3.7  # MEASURED: 2.96-4.04 mm/px across the workspace (agentview)
 
+# GROUND TRUTH for the can, one entry per init_state (`probe_init_positions.py`).
+# The can sits at the same spot for init states 0-7; only the basket moves, so the
+# table is small and stable. Used to answer the question the whole 档 D line is about:
+# the model's own "I am still N cm away" versus how far away it really is.
+TRUTH_PATH = Path(__file__).resolve().parents[1] / "outputs" / "init_truth.json"
+
+
+def can_xy(init_idx: int | None) -> tuple[float, float] | None:
+    if init_idx is None or not TRUTH_PATH.exists():
+        return None
+    try:
+        entry = json.loads(TRUTH_PATH.read_text()).get(str(init_idx))
+    except (OSError, ValueError):
+        return None
+    can = (entry or {}).get("can")
+    return (float(can[0]), float(can[1])) if can else None
+
 
 def calls_in(path: Path) -> list[dict]:
     """Every tool call in an episode, with the text the model wrote before it."""
@@ -75,6 +92,7 @@ def calls_in(path: Path) -> list[dict]:
             "direction": str(requested.get("direction") or ""),
             "rung": measurement.get("move_size"),
             "distance_cm": requested.get("distance_cm"),
+            "eef_end": measurement.get("eef_end"),
             "status": sr.get("status"),
             "result": str(entry.get("result") or ""),
         })
@@ -181,6 +199,35 @@ def summarise(path: Path, verbose: bool = False) -> dict:
     median = overshoot[len(overshoot) // 2] if overshoot else 0.0
     over2 = sum(1 for v in overshoot if v >= 2.0)
 
+    # CLAIMED vs TRUE DISTANCE. The px quote is the model's own estimate of how far it
+    # still has to go; the truth comes from the can's recorded position and the end
+    # effector's own reported position. If the model's estimate is systematically SMALL,
+    # it will pick a rung that is too small EVERY time -- and that is not a ladder bug,
+    # it is an estimator bug the ladder merely exposes.
+    init_idx = None
+    parts = path.stem.split("_")
+    if len(parts) >= 2 and parts[0] == "episode":
+        try:
+            init_idx = int(parts[1])
+        except ValueError:
+            init_idx = None
+    truth_xy = can_xy(init_idx)
+    ratios: list[float] = []
+    if truth_xy:
+        for c in moves:
+            eef = c.get("eef_end")
+            claim_px = PX_CLAIM.search(c["text"])
+            if not (isinstance(eef, list) and len(eef) == 3 and claim_px):
+                continue
+            lo, hi = claim_px.group(1), claim_px.group(2)
+            px = (float(lo) + float(hi)) / 2.0 if lo and hi else float(claim_px.group(3) or claim_px.group(4))
+            claimed_cm = px * GLOBAL_MM_PER_PX / 10.0
+            true_cm = (((float(eef[0]) - truth_xy[0]) ** 2 + (float(eef[1]) - truth_xy[1]) ** 2) ** 0.5) * 100.0
+            if true_cm > 0.5:
+                ratios.append(claimed_cm / true_cm)
+    ratio_median = sorted(ratios)[len(ratios) // 2] if ratios else 0.0
+    under2 = sum(1 for v in ratios if v < 0.5)
+
     # Longest alternating run (ping-pong).
     longest = run = 0
     last_dir = None
@@ -208,6 +255,9 @@ def summarise(path: Path, verbose: bool = False) -> dict:
         "quoted": quoted,
         "overshoot_median": median,
         "overshoot_over2": over2,
+        "dist_ratios": len(ratios),
+        "dist_ratio_median": ratio_median,
+        "dist_under2": under2,
         "longest_pingpong": longest,
         "repeat_calls": identical,
         "gripper": dict(verdicts),
@@ -235,9 +285,12 @@ def main(argv: list[str]) -> int:
     mismatch_total = collections.Counter()
     quoted_total = over2_total = 0
     overshoots: list[float] = []
+    ratio_total = under2_total = 0
+    ratio_medians: list[float] = []
     print(f"{'episode':<28}{'moves':>6}{'far':>5}{'near':>6}{'fine':>6}"
           f"{'反转':>5}{'降档':>5}{'同档':>5}{'升档':>5}"
-          f"{'自称像素':>9}{'过冲中位':>9}{'过冲>=2x':>10}{'最长乒乓':>9}{'夹住':>5}{'成功':>5}")
+          f"{'自称像素':>9}{'过冲中位':>9}{'过冲>=2x':>10}"
+          f"{'自称/真值':>10}{'低估>=2x':>9}{'最长乒乓':>9}{'夹住':>5}{'成功':>5}")
     for path in paths:
         s = summarise(path, verbose=verbose)
         totals.update(s["rungs"])
@@ -246,16 +299,26 @@ def main(argv: list[str]) -> int:
         quoted_total += s["quoted"]
         over2_total += s["overshoot_over2"]
         overshoots.append(s["overshoot_median"])
+        ratio_total += s["dist_ratios"]
+        under2_total += s["dist_under2"]
+        if s["dist_ratios"]:
+            ratio_medians.append(s["dist_ratio_median"])
         print(f"{s['file']:<28}{s['moves']:>6}{s['rungs'].get('far', 0):>5}"
               f"{s['rungs'].get('near', 0):>6}{s['rungs'].get('fine', 0):>6}"
               f"{s['reversals']:>5}{s['after_reversal'].get('downshift', 0):>5}"
               f"{s['after_reversal'].get('same', 0):>5}{s['after_reversal'].get('upshift', 0):>5}"
               f"{s['quoted']:>9}{s['overshoot_median']:>9.2f}"
-              f"{s['overshoot_over2']:>10}{s['longest_pingpong']:>9}"
+              f"{s['overshoot_over2']:>10}{s['dist_ratio_median']:>10.2f}"
+              f"{s['dist_under2']:>9}{s['longest_pingpong']:>9}"
               f"{s['gripper'].get('grasped', 0):>5}{'✓' if s['success'] else '·':>5}")
     print()
     print(f"合计：{len(paths)} 回合，移动 {sum(totals.values())} 次  "
           f"far={totals.get('far', 0)} near={totals.get('near', 0)} fine={totals.get('fine', 0)}")
+    if ratio_total:
+        med = sorted(ratio_medians)[len(ratio_medians) // 2] if ratio_medians else 0.0
+        print(f"自称距离 ÷ 真值距离：{ratio_total} 次可比，逐回合中位 {med:.2f}x；"
+              f"低估 >= 2 倍的 {under2_total} 次（{100 * under2_total / ratio_total:.0f}%）"
+              f"——这个量 <1 说明它永远高估自己的接近程度，于是永远挑小档")
     total_rev = sum(after_total.values())
     if total_rev:
         print(f"反转后有 {total_rev} 次下一步：降档 {after_total.get('downshift', 0)}、"

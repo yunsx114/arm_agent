@@ -56,9 +56,10 @@ def main(argv: list[str]) -> int:
         print("no episodes given")
         return 1
 
-    print(f"{'episode':<30}{'init':>5}{'移动':>6}{'离罐心最近':>11}{'<22mm?':>8}"
-          f"{'结束时离罐':>11}{'夹住':>5}{'成功':>5}")
+    print(f"{'episode':<30}{'init':>5}{'移动':>6}{'XY最近':>9}{'<22mm?':>8}"
+          f"{'3D最近':>9}{'结束时XY':>10}{'夹住':>5}{'成功':>5}")
     best_all = []
+    best_xy_all = []
     for path in paths:
         parts = path.stem.split("_")  # episode_000_1791777689 -> ['episode','000','<ts>']
         # The run used INIT_STATE=0 and `init_idx = (INIT_STATE + episode_id) % 50`
@@ -71,23 +72,31 @@ def main(argv: list[str]) -> int:
             continue
         dists = [((p[0] - can[0]) ** 2 + (p[1] - can[1]) ** 2 + (p[2] - can[2]) ** 2) ** 0.5
                  for p in track]
+        # XY separately: the grasp is an XY alignment plus a descent, and the EEF origin
+        # sits ~2.4cm ABOVE the pads' grasp point (MEASURED: closing on the can reports
+        # eef z=0.061 while the can's body centre is z=0.038). Mixing that constant offset
+        # into a 3-D distance hides how well the model actually AIMED, so both are shown.
+        xy = [((p[0] - can[0]) ** 2 + (p[1] - can[1]) ** 2) ** 0.5 for p in track]
         best = min(dists)
+        best_xy = min(xy)
         best_all.append(best)
+        best_xy_all.append(best_xy)
         data = json.loads(path.read_text())
         result = data.get("result") or {}
         grasps = sum(
             1 for e in (data.get("transcript") or [])
             if (((e.get("structured_result") or {}).get("status")) == "grasped")
         )
-        print(f"{path.name:<30}{init_idx:>5}{len(track):>6}{best * 1000:>10.0f}mm"
-              f"{'✓' if best <= GRASP_TOL_M else '·':>8}"
-              f"{dists[-1] * 1000:>10.0f}mm{grasps:>5}"
+        print(f"{path.name:<30}{init_idx:>5}{len(track):>6}{best_xy * 1000:>8.0f}mm"
+              f"{'✓' if best_xy <= GRASP_TOL_M else '·':>8}"
+              f"{best * 1000:>8.0f}mm{xy[-1] * 1000:>9.0f}mm{grasps:>5}"
               f"{'✓' if result.get('success') else '·':>5}")
     if best_all:
         print()
-        print(f"{len(best_all)} 回合：最近距离中位 {sorted(best_all)[len(best_all) // 2] * 1000:.0f}mm、"
-              f"最小 {min(best_all) * 1000:.0f}mm、进入 22mm 容差的回合数 "
-              f"{sum(1 for b in best_all if b <= GRASP_TOL_M)}/{len(best_all)}")
+        n = len(best_all)
+        print(f"{n} 回合：XY 最近 中位 {sorted(best_xy_all)[n // 2] * 1000:.0f}mm、"
+              f"最小 {min(best_xy_all) * 1000:.0f}mm、进入 22mm 容差的 {sum(1 for b in best_xy_all if b <= GRASP_TOL_M)}/{n}；"
+              f"3D 最近 中位 {sorted(best_all)[n // 2] * 1000:.0f}mm、最小 {min(best_all) * 1000:.0f}mm")
     return 0
 
 
