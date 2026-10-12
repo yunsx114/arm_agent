@@ -32,7 +32,12 @@ sys.path.insert(0, str(REPO / "src"))
 
 from arm_agent.agent.harness import Harness
 from arm_agent.sim.client import SimClient
-from arm_agent.sim.pixel_grounding import AIM_MARK_COLOUR, Camera
+from arm_agent.sim.pixel_grounding import (
+    AIM_MARK_COLOUR,
+    ZOOM_CROP_PX,
+    ZOOM_SCALE,
+    Camera,
+)
 from arm_agent.sim.server import SimServer
 
 # Scene targets for init state 0 (GT from the E1 export; the dry run is allowed
@@ -290,6 +295,8 @@ class PixelPolicy:
         self.calls_made = 0
         # Frames that came back carrying an `aim` ring (see the pixel scan below).
         self.ring_frames = 0
+        # Magnified crops, keyed by the zoom key the server sends them under.
+        self.zoom_frames = 0
 
     def chat(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
         if not self.script:
@@ -309,6 +316,12 @@ class PixelPolicy:
                         self.sent.append(str(part.get("text", "")))
                     elif isinstance(part, dict) and part.get("type") == "image":
                         self.frames += 1
+                        # The magnifier is attached as a THIRD image, on the turns that
+                        # carried a pixel tool. Its size is what identifies it: 64 px at
+                        # 4x (see pixel_grounding.ZOOM_CROP_PX / ZOOM_SCALE), vs the
+                        # 256 px cameras.
+                        if np.asarray(part["image"]).shape[0] == ZOOM_CROP_PX * ZOOM_SCALE:
+                            self.zoom_frames += 1
                         # Annotation is drawn server-side, so the only honest check
                         # is on the PIXELS the model receives: one of the grid greys
                         # has to be present in a frame that is otherwise a normal
@@ -476,6 +489,7 @@ def pixel_leg(ipc_dir: Path) -> bool:
         "任务由 target 完成": bool(result.success),
         "画面带网格标注": bool(policy.images_annotated),
         "红圈画在了返回的画面上": policy.ring_frames >= 1,
+        "每张 aim/target 都附了放大图": policy.zoom_frames >= len(aim_results) + len(target_results),
     }
     for label, passed in checks.items():
         print(f"  [{'PASS' if passed else 'FAIL'}] {label}")

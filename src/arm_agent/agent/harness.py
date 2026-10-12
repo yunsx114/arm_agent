@@ -24,6 +24,7 @@ from typing import Any
 
 import numpy as np
 
+from arm_agent import contracts as C
 from arm_agent.agent.llm import prepare_for_model
 from arm_agent.agent.parser import (
     ToolCall, as_float, parse_tool_calls, truncate_to_first_call, validate_calls,
@@ -35,6 +36,12 @@ from arm_agent.agent.prompts import (
 )
 from arm_agent.agent.tool_protocol import canonical_name, structured_result
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
+
+# Key of the server's magnified crop, shared through `contracts` so neither process
+# has to import the other (the agent env has no robosuite). If this ever drifts from
+# the server's key, the zoom silently stops being attached and the model is left
+# judging a ring against an object at 1x while its prompt promises a magnifier.
+ZOOM_KEY = C.ZOOM_KEY
 
 SKILLS_DIRNAME = "skills"
 # Kept equal to `action_adapter.DESCEND_Z_TOL_M`: a descent that stops further
@@ -595,7 +602,7 @@ class Harness:
                     # newest turn -- older frames are already replaced by a text
                     # stub (see llm.prepare_for_model).
                     pair = outcome.get("images") or {}
-                    for cam in ("agent", "wrist"):
+                    for cam in ("agent", "wrist", ZOOM_KEY):
                         frame = pair.get(cam)
                         if frame is not None:
                             content.append({"type": "image", "image": frame})
@@ -1349,8 +1356,9 @@ def format_outcome(outcome: dict[str, Any]) -> str:
         mm_px = (outcome.get("measurement") or {}).get("mm_per_px")
         scale = f"，此处 1 像素≈{mm_px}mm" if mm_px else ""
         return (
-            f"[aim {camera} {where}] 红圈已画在你说的像素上（青色十字是夹爪自己）{scale}；"
-            "请对比红圈与目标、以及红圈与十字，满意就 target，不满意改像素再 aim"
+            f"[aim {camera} {where}] 红圈已画在你说的像素上（青色十字是夹爪自己）{scale}"
+            "；另附一张围绕红圈的 4 倍放大图：看红圈中心是否在目标内部、四边留边是否均匀，"
+            "满意就 target，不满意改像素再 aim"
         )
     if kind in ("target", "goto_pixel"):
         # The model gets back its OWN pixel and the local scale (mm/px) it needs to
@@ -1369,12 +1377,19 @@ def format_outcome(outcome: dict[str, Any]) -> str:
             "blocked": "中途被挡住/到不了",
         }.get(status, "结果未知")
         scale = f"，此处 1 像素≈{mm_px}mm" if mm_px else ""
+        # The magnifier is attached on every motion call as well, centred on the
+        # CROSSHAIR: after a short block the useful question is "how far is my hand
+        # from the object", and at 1x the answer is 4x harder to read.
+        zoom_note = "；另附围绕夹爪十字的放大图" if status != "rejected" else ""
         # `truncated` is the SHORT BLOCK running out, which is a different fact from
         # "blocked": the arm is fine, the model just stopped looking. Say which one it
         # is, or a short block reads as a failure to be worked around.
         if status == "short" and (outcome.get("measurement") or {}).get("truncated"):
-            return f"[{kind} {camera} {where}] {concept}：这一小段走完还没到，同一像素再 target 一次即可{scale}"
-        return f"[{kind} {camera} {where}] {concept}{scale}"
+            return (
+                f"[{kind} {camera} {where}] {concept}：这一小段走完还没到，"
+                f"同一像素再 target 一次即可{scale}{zoom_note}"
+            )
+        return f"[{kind} {camera} {where}] {concept}{scale}{zoom_note}"
     if kind in ("grasp", "release"):
         # Concept primitives: the model is told WHAT happened, not how many
         # millimetres the fingers travelled. The numbers are in the structured

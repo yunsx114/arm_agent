@@ -216,15 +216,51 @@ def ground_pixel(
 # ------------------------------------------------------------------ annotation
 # Marker geometry for `aim` (档 B v2).
 #
-# The first proposal was a 3x3 dot, and it is too small to be a reference the model
-# can judge against: at 256 px the can is ~16 px wide and one pixel is 3.7 mm, while
-# the measured pointing error is 30-50 px -- so the marker is not the measurement,
-# the GAP between marker and object is, and a 3 px dot hides inside a 16 px object.
-# A 6 px ring with a dark halo is the smallest thing that (a) stays visible on a
-# same-coloured object and (b) leaves the target's silhouette readable INSIDE it,
-# which is exactly what the model has to compare.
-AIM_MARK_RADIUS_PX = 6
+# The first proposal was a 3x3 dot: too small to judge a gap against when the model
+# has to SEE its own error (measured 30-50 px, while one pixel is 3.7 mm at 256 px).
+# The first implementation was a 6 px ring, and the first real aim run showed the other
+# failure mode: the can is only ~16 px wide (8 px radius), so a 6 px ring overlapping
+# its edge still reads as "the ring is on the can" -- the model stalled at 33-47 mm of
+# error while reporting the ring as centred. 4 px keeps the pointer meaningfully
+# smaller than the object it points at; the dark halo keeps it visible.
+AIM_MARK_RADIUS_PX = 4
 AIM_MARK_COLOUR = (255, 48, 48)
+# The magnifier (档 B v2, added after the first aim run). MEASURED why it is needed:
+# the model's ring corrections came in whole fine-cells (8-16 px) and it stopped at
+# 9-13 px of error (33-47 mm), i.e. at the resolution the full frame affords. At 4x a
+# 9 px error is 36 px of visible gap, so "is the ring's CENTRE on the object" stops
+# being a judgement call. The crop is centred on whatever the caller is judging (the
+# ring for `aim`, the gripper crosshair for `target`).
+ZOOM_CROP_PX = 64
+ZOOM_SCALE = 4
+
+
+def crop_zoom(
+    image_display: np.ndarray,
+    centre: tuple[float, float],
+    crop_px: int = ZOOM_CROP_PX,
+    scale: int = ZOOM_SCALE,
+) -> np.ndarray | None:
+    """Magnify a window around `centre`, nearest-neighbour (no invented pixels).
+
+    The window is SHIFTED to stay inside the frame rather than padded: padding would
+    put a black band where the world continues, and a model reading that band as
+    "nothing there" is exactly the class of quiet lie this module avoids. Returns
+    None when the frame is smaller than the window, so a caller can omit the image
+    instead of shipping a broken one.
+    """
+    from PIL import Image
+
+    arr = np.asarray(image_display)
+    height, width = arr.shape[:2]
+    size = int(min(crop_px, width, height))
+    if size < 8:
+        return None
+    u, v = float(centre[0]), float(centre[1])
+    left = round(min(max(u - size / 2.0, 0.0), width - size))
+    top = round(min(max(v - size / 2.0, 0.0), height - size))
+    crop = Image.fromarray(arr[top : top + size, left : left + size]).convert("RGB")
+    return np.asarray(crop.resize((size * int(scale), size * int(scale)), Image.NEAREST))
 
 
 def annotate_frame(

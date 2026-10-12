@@ -41,7 +41,8 @@ def main() -> int:
     ask_u, ask_v = need_u + OFFSET_PX, need_v
 
     outcome = server.aim({"camera": "agent", "u": float(ask_u), "v": float(ask_v)})
-    frames = server._images_b64(outcome.measurement["mark"])
+    mark = outcome.measurement["mark"]
+    frames = server._images_b64(mark, mark)
     for cam, data in frames.items():
         (Path("/tmp") / f"aim_{cam}.png").write_bytes(base64.b64decode(data))
     # The arm must not have moved: aim is a dry run, and this is the same assertion the

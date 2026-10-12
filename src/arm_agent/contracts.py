@@ -43,6 +43,11 @@ OBS_WRIST = "robot0_eye_in_hand_image"
 # MODEL uses in a tool call. 档 B needs the mapping in one place: the tool speaks
 # "agent"/"wrist" while the simulator speaks "agentview"/"robot0_eye_in_hand".
 CAMERA_NAMES = {"agent": "agentview", "wrist": "robot0_eye_in_hand"}
+# Key of the magnified crop in an image payload (档 B v2 `aim`/`target`). It lives
+# here because BOTH sides need it and neither may import the other: the agent process
+# has no robosuite, and the sim process has no model client. It is not a camera, so it
+# must never collide with a key of CAMERA_NAMES.
+ZOOM_KEY = "zoom"
 OBS_EEF_POS = "robot0_eef_pos"
 OBS_EEF_QUAT = "robot0_eef_quat"
 OBS_GRIPPER_QPOS = "robot0_gripper_qpos"

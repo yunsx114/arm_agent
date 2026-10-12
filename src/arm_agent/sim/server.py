@@ -50,8 +50,11 @@ from arm_agent.sim.pixel_grounding import (
     Camera,
     Grounding,
     annotate_frame,
+    crop_zoom,
     ground_pixel,
 )
+
+ZOOM_KEY = C.ZOOM_KEY
 
 
 class SimServer:
@@ -147,6 +150,11 @@ class SimServer:
         if kind == "act":
             action = cmd.get("action", {})
             act_kind = action.get("kind")
+            # Magnifier request for this command: `[camera_key, u, v]` or None. For
+            # `aim` it centres on the ring (the model is judging the ring vs the
+            # object); for `target` it centres on the GRIPPER crosshair (the model is
+            # judging where the hand ended up vs the object).
+            zoom: list[Any] | None = None
             if act_kind == "move":
                 outcome = self.adapter.move(
                     str(action["direction"]), float(action["distance_cm"])
@@ -209,11 +217,17 @@ class SimServer:
                 # into a SHORT BLOCK (`max_steps`); `goto_pixel` stays as the
                 # pre-v2 name of the same call so old transcripts still replay.
                 outcome = self.pixel_target(action, kind=str(act_kind))
+                eef = self.sim._obs.get(C.OBS_EEF_POS) if self.sim._obs else None
+                if eef is not None:
+                    u_eef, v_eef, _ = self._camera("agent").project(np.asarray(eef, dtype=float))
+                    if np.isfinite(u_eef) and np.isfinite(v_eef):
+                        zoom = ["agent", float(u_eef), float(v_eef)]
             elif act_kind == "aim":
                 # 档 B v2 dry run: ground the pixel, mark it, and DO NOT MOVE. The
                 # frame that comes back is the same frame `target` would use, so
                 # deciding from it is deciding from evidence, not from a guess.
                 outcome = self.aim(action)
+                zoom = outcome.measurement.get("mark")
             else:
                 raise ValueError(f"unknown action kind: {act_kind!r}")
             obs = self.sim.pack(self.sim._obs)  # type: ignore[arg-type]
@@ -221,7 +235,7 @@ class SimServer:
             return {
                 "outcome": outcome.to_dict(),
                 "obs": obs,
-                **self._image_payload(cmd_id, inline_images, mark=mark),
+                **self._image_payload(cmd_id, inline_images, mark=mark, zoom=zoom),
             }
         if kind == "look":
             return {
@@ -494,20 +508,27 @@ class SimServer:
         return None
 
     def _image_payload(
-        self, cmd_id: int, inline: bool, mark: list[Any] | None = None
+        self,
+        cmd_id: int,
+        inline: bool,
+        mark: list[Any] | None = None,
+        zoom: list[Any] | None = None,
     ) -> dict[str, Any]:
         """Camera frames for a response: base64-inline (TCP) or on disk (NFS).
 
-        `mark` is deliberately a parameter and not server state: a ring left over
-        from an earlier `aim` would read as "your point is here" on a frame the model
-        is using for a DIFFERENT decision, i.e. it would be a silently wrong target.
+        `mark` and `zoom` are deliberately parameters and not server state: a ring
+        left over from an earlier `aim` would read as "your point is here" on a frame
+        the model is using for a DIFFERENT decision, i.e. it would be a silently wrong
+        target. `zoom` is `[camera_key, u, v]`, the centre of the magnified crop.
         """
         if inline:
-            return {"images_b64": self._images_b64(mark)}
-        return {"images": self._save_images(cmd_id, mark)}
+            return {"images_b64": self._images_b64(mark, zoom)}
+        return {"images": self._save_images(cmd_id, mark, zoom)}
 
-    def _images_b64(self, mark: list[Any] | None = None) -> dict[str, str]:
-        """Both camera frames as base64 PNGs (display orientation)."""
+    def _images_b64(
+        self, mark: list[Any] | None = None, zoom: list[Any] | None = None
+    ) -> dict[str, str]:
+        """Both camera frames as base64 PNGs (display orientation) + the magnifier."""
         from PIL import Image
 
         self.sim.refresh_images()
@@ -515,11 +536,23 @@ class SimServer:
         for cam, frame in self.sim.images().items():
             buf = io.BytesIO()
             display = np.asarray(frame)[::-1]
-            Image.fromarray(self._annotate(cam, display, mark)).save(buf, format="PNG")
+            annotated = self._annotate(cam, display, mark)
+            Image.fromarray(annotated).save(buf, format="PNG")
             out[cam] = base64.b64encode(buf.getvalue()).decode("ascii")
+            if zoom and str(zoom[0]) == str(cam):
+                crop = crop_zoom(annotated, (float(zoom[1]), float(zoom[2])))
+                if crop is not None:
+                    zbuf = io.BytesIO()
+                    Image.fromarray(crop).save(zbuf, format="PNG")
+                    out[ZOOM_KEY] = base64.b64encode(zbuf.getvalue()).decode("ascii")
         return out
 
-    def _save_images(self, cmd_id: int, mark: list[Any] | None = None) -> dict[str, str]:
+    def _save_images(
+        self,
+        cmd_id: int,
+        mark: list[Any] | None = None,
+        zoom: list[Any] | None = None,
+    ) -> dict[str, str]:
         """Persist both camera frames as PNG; returns camera -> relative path."""
         from PIL import Image
 
@@ -534,8 +567,15 @@ class SimServer:
             # display orientation the E6 probe validated. Same annotation helper
             # as the TCP path, so the two transports cannot drift apart.
             display = np.asarray(frame)[::-1]
-            Image.fromarray(self._annotate(cam, display, mark)).save(self.ipc_dir / name)
+            annotated = self._annotate(cam, display, mark)
+            Image.fromarray(annotated).save(self.ipc_dir / name)
             paths[cam] = name
+            if zoom and str(zoom[0]) == str(cam):
+                crop = crop_zoom(annotated, (float(zoom[1]), float(zoom[2])))
+                if crop is not None:
+                    zname = f"img_{cmd_id}_{ZOOM_KEY}.png"
+                    Image.fromarray(crop).save(self.ipc_dir / zname)
+                    paths[ZOOM_KEY] = zname
         self._images_saved += 1
         return paths
 
