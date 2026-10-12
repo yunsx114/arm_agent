@@ -32,6 +32,7 @@ from arm_agent.agent.parser import (
 from arm_agent.agent.prompts import (
     get_system_prompt,
     get_tool_schemas,
+    ladder_appendix,
     mode_appendix,
 )
 from arm_agent.agent.tool_protocol import canonical_name, structured_result
@@ -54,6 +55,13 @@ SKILLS_DIRNAME = "skills"
 # one ends it earlier AND names the reason, which is the difference between a silent
 # timeout and a diagnosable failure.
 REPEAT_STALL_LIMIT = 12
+# A repeated call is only a STALL if nothing moved. The threshold is set from the
+# MEASURED behaviour of the two ends of the scale, not picked: a blocked `move` reports
+# an exact (0,0,0) displacement, while the smallest rung (档 D `fine`, a 1mm request)
+# advances 0.6-0.8mm per call -- the servo stops inside its own 0.5mm arrival window,
+# so it under-delivers every time and grinds forward slowly. 12 of those is 7mm of real
+# progress, not a loop, and killing the episode there was wrong.
+STALL_MOTION_M = 0.0003
 # Kept equal to `action_adapter.DESCEND_Z_TOL_M`: a descent that stops further
 # than this from the commanded z did not arrive, and saying it did is what makes
 # the model close on a rim instead of re-descending.
@@ -134,6 +142,7 @@ class Harness:
         history_messages: int | None = None,
         image_keep: int | None = None,
         observation_mode: str = "truth",
+        move_ladder: bool = False,
     ) -> None:
         self.client = client
         self.model = model
@@ -153,7 +162,15 @@ class Harness:
         # `pixels` = it does not, and the model targets pixels instead. The harness
         # mirrors the mode to keep the advertised schema and the prompt honest.
         self.observation_mode = str(observation_mode).strip().lower()
-        self.tool_schemas = get_tool_schemas(tool_protocol, self.observation_mode)
+        # 档 D: with the ladder on, `move` takes a NAMED rung (far/near/fine = 10cm/1cm/1mm)
+        # instead of a distance, so the magnitude is code-owned. The value the server
+        # receives is still `distance_cm` -- the ladder lives entirely on the agent
+        # side, because the simulator was never the thing that could not do the
+        # arithmetic. See contracts.MOVE_LADDER_CM.
+        self.move_ladder = bool(move_ladder)
+        self.tool_schemas = get_tool_schemas(
+            tool_protocol, self.observation_mode, move_ladder=self.move_ladder
+        )
         self.legacy_tools = str(tool_protocol).lower() != "v2"
         self.skills_dir = self.workspace / SKILLS_DIRNAME
         self.skills_dir.mkdir(parents=True, exist_ok=True)
@@ -332,7 +349,7 @@ class Harness:
                 )
 
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": get_system_prompt(self.prompt_mode, self.observation_mode) + self.shared_skill + mode_appendix(self.observation_mode) + self._skills_index()},
+                {"role": "system", "content": get_system_prompt(self.prompt_mode, self.observation_mode) + self.shared_skill + mode_appendix(self.observation_mode) + ladder_appendix(self.move_ladder) + self._skills_index()},
                 {
                     "role": "user",
                     "content": [
@@ -383,7 +400,10 @@ class Harness:
                 transcript.append({"turn": turn, "assistant": reply})
 
                 call_errors = validate_calls(
-                    calls, legacy=self.legacy_tools, observation_mode=self.observation_mode
+                    calls,
+                    legacy=self.legacy_tools,
+                    observation_mode=self.observation_mode,
+                    move_ladder=self.move_ladder,
                 )
                 if call_errors:
                     result.protocol_retries += 1
@@ -469,6 +489,15 @@ class Harness:
                         self._repeat_n += 1
                     else:
                         self._repeat_key, self._repeat_n = rep_key, 1
+                    # ...UNLESS THE ARM ACTUALLY MOVED. MEASURED (档 D dry run): a `+z near`
+                    # raise moved 8.3-9.3mm per call, twelve identical times in a row, and
+                    # the guard killed an episode that was working -- its note ("这期间没有
+                    # 任何动作，测量不会变化") would have been FALSE, and a false instrument is
+                    # worse than no instrument: the model reads it as "the arm is stuck" and
+                    # starts inventing workarounds. So the counter only counts calls that
+                    # changed nothing.
+                    if moved_m(outcome) >= STALL_MOTION_M:
+                        self._repeat_n = 1
                     if self._repeat_n >= 3:
                         # The ARGS are echoed on purpose. MEASURED (aim v3, episode 0):
                         # the model repeated `aim(58,134)` 76 times while its own 现状
@@ -977,10 +1006,17 @@ class Harness:
 
         if name in ("move", "rotate", "set_gripper"):
             if name == "move":
+                # 档 D: translate the rung into centimetres HERE, so the server-side
+                # protocol is byte-identical whether the ladder is on or not. A step
+                # the model could not do arithmetic for becomes a word it can pick.
+                ladder_cm = C.move_rung_cm(args.get("size", "")) if self.move_ladder else None
                 action = {
                     "kind": "move",
                     "direction": args["direction"],
-                    "distance_cm": as_float(args.get("distance_cm")),
+                    "distance_cm": (
+                        ladder_cm if ladder_cm is not None
+                        else as_float(args.get("distance_cm"))
+                    ),
                 }
             elif name == "rotate":
                 action = {
@@ -992,6 +1028,14 @@ class Harness:
                 action = {"kind": "gripper", "action": args["action"]}
             resp = self.client.act(action)
             outcome = resp.outcome
+            # 档 D instrument: label the step with the rung the model chose. The server
+            # never sees this field -- it is the agent's own note on its own action, so
+            # an audit can answer "which rung did it take, and did the rung do what it
+            # means" without re-deriving it from the distance. Without it the only trace
+            # of the ladder in a transcript would be a 10.0 that could also have been
+            # typed by hand.
+            if name == "move" and self.move_ladder:
+                outcome["ladder_size"] = str(args.get("size", "")).strip().lower()
             images = resp.images(self.client.ipc_dir)
             return {
                 "obs": resp.obs,
@@ -1085,6 +1129,14 @@ class Harness:
         if concept_status:
             status = concept_status
         measurement.update(outcome.get("measurement") or {})
+        # 档 D instrument: keep the RUNG in the transcript, both as the word the model
+        # picked and as the centimetres code turned it into. An audit that only saw
+        # `distance_cm: 10.0` could not tell a ladder step from a hand-typed one, and
+        # "did the rung mean what it says" is the question the experiment asks.
+        rung = outcome.get("ladder_size") or call.args.get("size")
+        if rung and canonical_name(call.name) == "move":
+            measurement["move_size"] = str(rung).strip().lower()
+            measurement["move_size_cm"] = C.move_rung_cm(str(rung))
         events: list[dict[str, Any]] = []
         # A motion that fell short is an EVENT, and both surfaces must say so with
         # the same vocabulary: `move` reports "只走了 Xcm" and `descend_to`
@@ -1404,6 +1456,27 @@ def format_state(obs: dict[str, Any], grasped: bool = False) -> str:
     return f"机械爪位置 {_fmt3(eef)} m；{hold}"
 
 
+def moved_m(outcome: dict[str, Any]) -> float:
+    """How far the END EFFECTOR moved, in metres, from a dispatched outcome.
+
+    Both sources are consulted on purpose, and getting this wrong has already cost one
+    diagnosis: `_dispatch` copies the ADAPTER's `measurement` dict (which only the
+    concept primitives fill), so for a plain `move` that dict is `{}` -- the numbers live
+    on the adapter object itself, kept under `raw`. Reading only one of the two is how
+    the stall guard came to call 8.3mm raises "no movement at all".
+    """
+    raw = outcome.get("raw")
+    delta = getattr(raw, "measured_delta_m", None)
+    if not delta:
+        delta = (outcome.get("measurement") or {}).get("measured_delta_m")
+    if not delta:
+        delta = ((outcome.get("result") or {}).get("measurement") or {}).get("measured_delta_m")
+    try:
+        return max((abs(float(v)) for v in delta), default=0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def format_outcome(outcome: dict[str, Any]) -> str:
     kind = outcome.get("kind")
     requested = outcome.get("requested", {})
@@ -1488,8 +1561,13 @@ def format_outcome(outcome: dict[str, Any]) -> str:
             str(requested.get("direction")), 0
         )
         got = abs(float(delta[axis]))
+        rung = outcome.get("ladder_size")
+        # With the ladder on, say the WORD as well as the centimetres: the model's
+        # downshift decision is "was that rung too big", and a bare 10.0 asks it to map
+        # a number back to the word it chose.
+        rung_tag = f" size={rung}" if rung else ""
         text = (
-            f"[move {requested.get('direction')} {requested.get('distance_cm')}cm] "
+            f"[move {requested.get('direction')}{rung_tag} {requested.get('distance_cm')}cm] "
             f"实测位移 {_fmt3(delta)} m（{ticks} ticks）；机械爪现在位于 {_fmt3(end)}"
         )
         if want > 0.005 and got < want * 0.5:

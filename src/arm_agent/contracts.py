@@ -48,6 +48,39 @@ CAMERA_NAMES = {"agent": "agentview", "wrist": "robot0_eye_in_hand"}
 # has no robosuite, and the sim process has no model client. It is not a camera, so it
 # must never collide with a key of CAMERA_NAMES.
 ZOOM_KEY = "zoom"
+
+# MOVE MAGNITUDE LADDER (档 D). When it is on, `move` takes one of three NAMED rungs
+# instead of a distance in centimetres, so the model decides a DIRECTION and a
+# GRANULARITY while the magnitude stays code-owned -- Jev's "scale magnitudes, never
+# replace a model-selected direction" (embodied_jev/hierarchical.py::assemble_motion,
+# whose own menu is 2/10/40 mm).
+#
+# WHY: measured, the model cannot do the arithmetic this replaces. In `pixels` mode its
+# absolute pixel reading carries a 30-50 px systematic bias (10-13 cm); in `raw` mode
+# it estimated the can at y=-0.10 when the truth is y=-0.24, i.e. a 14 cm error. Both
+# are the same missing ability -- turning what it sees into a world distance. Three
+# rungs also give it a natural closed loop: overshoot -> downshift, too little ->
+# upshift, with no numbers to get wrong.
+#
+# The intended use is `far` to cross the workspace, `near` to line up, `fine` to trim.
+# 1 mm is a REAL rung: `action_adapter.move` scales its arrival tolerance with the
+# request (`arrive_tol = min(MOVE_ARRIVE_TOL_M, request/2)`), which was added after a
+# 1 mm request was swallowed by the old fixed 2 mm window -- it ran 0 ticks and
+# reported a (0,0,0) displacement that looked exactly like "blocked".
+MOVE_LADDER_CM: dict[str, float] = {"far": 10.0, "near": 1.0, "fine": 0.1}
+# Literal spellings accepted as the same rung, because a schema enum is easier to
+# follow than a vocabulary to memorise -- and getting the word wrong costs a turn.
+MOVE_LADDER_ALIASES: dict[str, str] = {
+    "10cm": "far", "1cm": "near", "1mm": "fine",
+    "coarse": "far", "medium": "near", "mid": "near", "small": "fine", "tiny": "fine",
+}
+
+
+def move_rung_cm(size: str) -> float | None:
+    """Centimetres for a ladder rung (or None if the token is not a rung)."""
+    token = str(size).strip().lower()
+    rung = MOVE_LADDER_ALIASES.get(token, token)
+    return MOVE_LADDER_CM.get(rung)
 OBS_EEF_POS = "robot0_eef_pos"
 OBS_EEF_QUAT = "robot0_eef_quat"
 OBS_GRIPPER_QPOS = "robot0_gripper_qpos"

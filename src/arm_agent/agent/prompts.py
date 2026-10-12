@@ -191,6 +191,72 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
+# MOVE LADDER (档 D) -- the SAME `move` tool with a NAMED magnitude.
+#
+# WHY THIS SHAPE: measured, the model cannot turn what it sees into a world distance.
+# In `pixels` mode its absolute reading carried a 30-50 px systematic bias (10-13 cm);
+# in `raw` mode it put the can at y=-0.10 when the truth is y=-0.24. Both failures are
+# the same missing ability. So the magnitude is moved OUT of the model's hands: it
+# picks a direction (which it does well -- it names +y correctly) and a RUNG, and code
+# owns the number. This is Jev's rule in `embodied_jev/hierarchical.py::assemble_motion`
+# -- scale the magnitude a model chose, never replace the direction it chose.
+#
+# The three rungs also hand the model a closed loop it can run with no arithmetic at
+# all: overshot -> downshift, too little -> upshift. The literals are accepted as
+# aliases because a wrong word costs a turn and buys nothing.
+MOVE_LADDER_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "move",
+        "description": (
+            "沿世界坐标轴平移，距离只有三个档位（单位厘米）："
+            "size=far 就是 10 厘米；size=near 就是 1 厘米；size=fine 就是 0.1 厘米(1 毫米)。"
+            "direction:+x/-x/+y/-y/+z/-z；+z 向上，-z 向下。**这是唯一能改变高度的工具**。"
+            "不需要也不允许自己算距离，只能从这三档里挑一档（也可以直接写 10cm/1cm/1mm）。"
+            "返回实测位移：可能少于请求值。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "enum": ["+x", "-x", "+y", "-y", "+z", "-z"]},
+                "size": {
+                    "type": "string",
+                    "enum": ["far", "near", "fine"],
+                    "description": "far=10厘米；near=1厘米；fine=0.1厘米(1毫米)",
+                },
+            },
+            "required": ["direction", "size"],
+        },
+    },
+}
+
+# The instruction that makes the ladder usable. It has to say the UPSHIFT/DOWNSHIFT rule
+# explicitly, because "pick a rung" is meaningless without one: a model that always
+# picks `near` will simply never arrive, and one that always picks `far` will orbit the
+# target. The rule is stated as an error-budget decision so it stays a policy, not a
+# number to compute.
+MOVE_LADDER_APPENDIX = """
+
+## 距离档位（本模式只有三个档）
+
+`move` 不接受距离数字，只接受三档之一：
+
+| size | 实际距离 | 什么时候用 |
+| --- | --- | --- |
+| `far` | 10 厘米 | 目标还很远，先大步靠近 |
+| `near` | 1 厘米 | 快到了，用来对准 |
+| `fine` | 1 毫米 | 已经对准，只差一点点 |
+
+用法就是「估档位，走，再看图，再估」：
+
+- 走完发现**越过**了目标，或者来回摆动：说明档位太大，**降一档**（far→near→fine）。
+- 走完发现几乎没动、离目标还是那么远：说明档位太小，**升一档**（fine→near→far）。
+
+不要试图把距离换算成档位。你只需要判断「还差得远 / 差一点 / 就差一丝」，
+分别对应 far / near / fine。一次走完再看图，比一次猜准更容易。
+"""
+
+
 LEGACY_TOOL_SCHEMAS = TOOL_SCHEMAS
 # v2 surface. The descriptions now state the SAME limits the validator enforces
 # (`tool_protocol.REQUIRED` / `ENUMS`, the 0.1-15 cm and +-90 deg ranges). They
@@ -632,6 +698,11 @@ def mode_appendix(observation_mode: str) -> str:
     return ""
 
 
+def ladder_appendix(move_ladder: bool) -> str:
+    """The distance-ladder instructions, appended only when the ladder is on."""
+    return MOVE_LADDER_APPENDIX if move_ladder else ""
+
+
 # `raw` mode's own system prompt. It is the LONGEST tool description in the project
 # precisely because the surface is the smallest: with no localisation aid, the only
 # thing the harness can still give the model is the measured relationship between what
@@ -682,15 +753,23 @@ SYSTEM_PROMPT_V2_RAW = """你是机械臂任务决策核心。目标是完成当
 """
 
 
-def get_tool_schemas(protocol: str = "v2", observation_mode: str = "truth") -> list[dict[str, Any]]:
+def get_tool_schemas(
+    protocol: str = "v2", observation_mode: str = "truth", move_ladder: bool = False
+) -> list[dict[str, Any]]:
     """The tool surface actually advertised to the model.
 
     A WHITELIST per observation mode (`tool_protocol.MODE_TOOLS`). Schemas for every
     tool stay in this file so re-enabling one is a one-line change in that table;
     what the model sees is what its mode can actually honour. The `raw` mode keeps
     exactly `move`, `gripper`, `verify` -- no localisation aid by name or by pixel.
+
+    With `move_ladder`, the `move` entry is swapped for the version whose magnitude is
+    a NAMED rung (档 D). Nothing else changes -- the ladder is about how big a step is,
+    not about which tools exist.
     """
     schemas = TOOL_SCHEMAS_V2 if str(protocol).strip().lower() == "v2" else LEGACY_TOOL_SCHEMAS
+    if move_ladder:
+        schemas = [MOVE_LADDER_SCHEMA if s["function"]["name"] == "move" else s for s in schemas]
     if str(protocol).strip().lower() != "v2":
         return schemas
     surface = tools_for_mode(observation_mode)

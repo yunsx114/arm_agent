@@ -567,7 +567,7 @@ def concept_leg(ipc_dir: Path) -> bool:
     return all(checks.values())
 
 
-def raw_next_call(server: SimServer) -> tuple[str, dict[str, Any]]:
+def raw_next_call(server: SimServer, ladder: bool = False) -> tuple[str, dict[str, Any]]:
     """The next `move`/`gripper` call a controller would make, from TRUTH.
 
     Privileged on purpose (same as the other legs): this answers "are two tools enough
@@ -577,6 +577,12 @@ def raw_next_call(server: SimServer) -> tuple[str, dict[str, Any]]:
 
     The shape of the controller is also the recipe the `raw` prompt teaches: one small
     step, then look again (the state is re-read from the simulator on every turn).
+
+    With `ladder=True` the SAME controller emits `size` instead of `distance_cm`, picking
+    the rung from the remaining error (>3cm -> far, >3mm -> near, else fine). That is the
+    model's whole job under 档 D, so if the task still completes here, the ladder is
+    sufficient for the task and the only open question is whether the model picks rungs
+    sensibly.
     """
     obs = server.sim._obs
     eef = np.asarray(obs[C.OBS_EEF_POS], dtype=float)
@@ -586,14 +592,62 @@ def raw_next_call(server: SimServer) -> tuple[str, dict[str, Any]]:
     width = float(np.abs(np.asarray(obs[C.OBS_GRIPPER_QPOS])).mean())
     carried, _ = server.adapter.held_object()
 
+    def step_cm(cm: float) -> dict[str, Any]:
+        """The distance argument for a DELIBERATE step of intent `cm`.
+
+        A caller that has already decided "raise by 5cm" gets the rung that is closest
+        without exceeding it: 5cm -> `near` (1cm), repeated by the loop.
+        """
+        if not ladder:
+            return {"distance_cm": f"{cm:.1f}"}
+        if cm >= 10.0:
+            return {"size": "far"}
+        if cm >= 1.0:
+            return {"size": "near"}
+        return {"size": "fine"}
+
     def toward(target: np.ndarray, tol: float) -> tuple[str, dict[str, Any]] | None:
         dx, dy = target[0] - eef[0], target[1] - eef[1]
         if abs(dx) > tol or abs(dy) > tol:
             axis, delta = ("x", dx) if abs(dx) >= abs(dy) else ("y", dy)
-            step = min(5.0, max(1.0, abs(delta) * 100.0))
-            return "move", {"direction": f"{'+' if delta > 0 else '-'}{axis}",
-                            "distance_cm": f"{step:.1f}"}
+            error_cm = abs(delta) * 100.0
+            if not ladder:
+                step = min(5.0, max(1.0, error_cm))
+                return "move", {"direction": f"{'+' if delta > 0 else '-'}{axis}",
+                                "distance_cm": f"{step:.1f}"}
+            # Largest rung that does NOT overshoot the remaining error. A controller that
+            # picked `far` for a 4cm error would orbit forever (measured while writing
+            # this leg: 64 consecutive `far` steps, 0 far from arriving) -- the rung must
+            # be chosen from the error, which is exactly the judgement the model has to
+            # make and exactly what this leg is not allowed to get wrong.
+            if error_cm >= 10.0:
+                rung = "far"
+            elif error_cm >= 1.0:
+                rung = "near"
+            else:
+                rung = "fine"
+            return "move", {"direction": f"{'+' if delta > 0 else '-'}{axis}", "size": rung}
         return None
+
+    def rung_for_z(error_cm: float, *, up: bool) -> dict[str, Any]:
+        """The rung for a VERTICAL step.
+
+        Asymmetric on purpose, and the asymmetry is a MEASURED property of the scene, not
+        a preference: raising is free (nothing is in the way), while descending with the
+        coarse rung drove the gripper 9.7cm in one call -- straight through the 3cm margin
+        the close-on-the-can rule is built around. So `up` may use the whole ladder and
+        `down` is capped at `near`. A 1cm descent costs turns; a 10cm one costs the can.
+        """
+        if up:
+            return step_cm(error_cm)
+        if ladder:
+            return {"size": "fine" if error_cm < 1.0 else "near"}
+        # Clamped to 0.5cm: MEASURED failure from an unclamped version -- an error of
+        # 0.04cm formatted as "0.0", which the protocol correctly rejects as out of range
+        # (move takes 0.1~15), so the same rejected call repeated until the turn cap
+        # (27 retries, episode lost). Under the ladder this cannot happen at all: the
+        # model picks a WORD and the code owns the number.
+        return {"distance_cm": f"{max(0.5, min(3.0, error_cm)):.1f}"}
 
     # ORDER MATTERS, and getting it wrong produced a z-oscillation (measured while
     # building this leg): a blanket "keep z above the travel height" rule checked
@@ -606,19 +660,24 @@ def raw_next_call(server: SimServer) -> tuple[str, dict[str, Any]]:
         step = toward(can, tol=0.012)
         if step:
             if eef[2] < 0.24:  # travel height before moving sideways
-                return "move", {"direction": "+z", "distance_cm": "5"}
+                return "move", {"direction": "+z", **rung_for_z(5.0, up=True)}
             return step
         if eef[2] > can[2] + 0.030:
-            return "move", {"direction": "-z", "distance_cm": "3"}
+            return "move", {"direction": "-z", **rung_for_z((eef[2] - can[2]) * 100.0, up=False)}
         return "gripper", {"action": "close"}
     # carrying: up, across, down, open, and let the ENV judge.
-    step = toward(basket, tol=0.015)
+    # 2.2cm for the drop, not 1.5cm: the ladder's 0.92cm `near` step couples ~1cm of
+    # off-axis drift per call (measured), so a 1.5cm window could not be settled -- the
+    # scripted run ping-ponged for 99 `near` calls and ran out of turns. 2.2cm is the
+    # MEASURED grasp tolerance of this scene, i.e. an honest allowance rather than a
+    # number bent to make the leg pass.
+    step = toward(basket, tol=0.022)
     if step:
         if eef[2] < 0.25:
-            return "move", {"direction": "+z", "distance_cm": "10"}
+            return "move", {"direction": "+z", **rung_for_z(10.0, up=True)}
         return step
     if eef[2] > 0.20:
-        return "move", {"direction": "-z", "distance_cm": "5"}
+        return "move", {"direction": "-z", **rung_for_z((eef[2] - 0.20) * 100.0, up=False)}
     return "gripper", {"action": "open"}
 
 
@@ -636,6 +695,10 @@ class RawPolicy:
         ("target", {"u": "64", "v": "128"}),
         ("approach", {"target": "alphabet soup"}),
     )
+    # Extra calls emitted BEFORE the geometry loop: the ladder leg puts its rung
+    # calibration here. `SCRIPT` is what the loop below walks.
+    CALIBRATION: tuple = ()
+    LADDER = False
 
     def __init__(self, server: SimServer) -> None:
         self.server = server
@@ -645,8 +708,16 @@ class RawPolicy:
         self.frames = 0
         self.opens = 0
         self.done = False
+        self.system = ""
+
+    @property
+    def SCRIPT(self) -> tuple:  # noqa: N802 - mirrors the class-level tuple
+        return self.PRELUDE + self.CALIBRATION
 
     def chat(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+        for message in messages:
+            if message.get("role") == "system":
+                self.system = str(message.get("content", ""))
         if sum(1 for m in messages if m.get("role") == "assistant") > 0:
             for message in messages:
                 if message.get("role") != "user":
@@ -663,19 +734,14 @@ class RawPolicy:
                                 self.grid_frames += 1
                     elif isinstance(part, str):
                         self.sent.append(part)
-        done_calls = sum(1 for c in self.calls if c not in ("aim", "target", "approach"))
-        if len(self.calls) < len(self.PRELUDE):
-            name, args = self.PRELUDE[len(self.calls)]
+        if len(self.calls) < len(self.SCRIPT):
+            name, args = self.SCRIPT[len(self.calls)]
             self.calls.append(name)
             return "现状：脚本化步骤。\n判定：试探被禁工具。\n动作：调用工具。\n" + _call(name, args)
-        if done_calls == 0:
-            # The prelude was refused, so no tool has actually run yet; nothing to do
-            # but keep asking for a legal one.
-            pass
         if self.done:
             name, args = "verify", {"claim": "placed"}
         else:
-            name, args = raw_next_call(self.server)
+            name, args = raw_next_call(self.server, ladder=self.LADDER)
             if name == "gripper" and args["action"] == "open":
                 self.opens += 1
                 # open(pads) -> carry -> open(over the basket): the third open is the
@@ -749,6 +815,150 @@ def raw_leg(ipc_dir: Path) -> bool:
     return all(checks.values())
 
 
+def ladder_leg(ipc_dir: Path) -> bool:
+    """档 D: `move` takes a NAMED rung (far/near/fine = 10cm/1cm/1mm) instead of a distance.
+
+    Three things are asserted, and each one is the reason the ladder exists:
+
+    1. The advertised `move` schema has `size` and NOT `distance_cm`, and the system
+       prompt carries the upshift/downshift rule.
+    2. A call that still tries to pass a distance is REFUSED, not silently converted --
+       otherwise the model could keep doing the arithmetic it demonstrably gets wrong
+       (raw mode: 14cm y error) and the ladder would hide it.
+    3. The rungs mean what they say. A calibration of three explicit rung moves measures
+       ~10cm / ~1cm / ~1mm, and the whole task still completes with every move coming
+       from the three rungs.
+    """
+    server = SimServer(
+        ipc_dir=ipc_dir,
+        suite_name="libero_object",
+        task_id=0,
+        cam_size=256,
+        observation_mode="raw",
+        pixel_grid_px=32,
+    )
+    thread = threading.Thread(target=server.serve_forever, kwargs={"idle_exit_s": 120}, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    client = SimClient(ipc_dir)
+    policy = LadderPolicy(server=server)
+    harness = Harness(
+        client=client,
+        model=policy,
+        workspace=REPO,
+        # The ladder costs TURNS: a 1cm rung cannot cross the ~25cm to the basket in one
+        # call, and each coarse step couples ~1.2cm of off-axis drift (measured) that the
+        # next step has to pay back. 70 turns ran out mid-carry; the real question for a
+        # model run is whether MAXTURNS=80 is enough, which this leg deliberately leaves
+        # unanswered -- it measures sufficiency, not budget.
+        max_turns=120,
+        tool_protocol="v2",
+        log=False,
+        observation_mode="raw",
+        move_ladder=True,
+    )
+    move_schema = next(s["function"] for s in harness.tool_schemas if s["function"]["name"] == "move")
+    advertised_props = sorted(move_schema["parameters"]["properties"])
+    result = harness.run_episode(init_state_idx=0, episode_id=996)
+    transcript = json.loads(Path(result.transcript_path).read_text())["transcript"]
+    final_obs = client.state().obs
+    client.close()
+    time.sleep(0.3)
+
+    texts = [e["result"] for e in transcript if e.get("result")]
+    # A refused call never dispatches, so the ONLY place the refusal exists is the retry
+    # note the harness hands back to the model -- which is what `policy.sent` collected.
+    joined = "\n".join(policy.sent)
+    # Per executed move: which rung, what was requested, what actually happened.
+    moves = []
+    for entry in transcript:
+        sr = entry.get("structured_result") or {}
+        if sr.get("tool") != "move":
+            continue
+        measurement = sr.get("measurement") or {}
+        requested = sr.get("requested") or {}
+        delta = measurement.get("measured_delta_m") or [0, 0, 0]
+        # Measure ON THE COMMANDED AXIS. MEASURED while writing this leg: a `+x far`
+        # step reports (-0.0089, 0.0006, -0.0118) -- the OSC couples a 1.2cm z excursion
+        # into a horizontal move, so "the biggest component" would score a 1cm `near`
+        # step as 1.31cm and a 1mm `fine` step as whatever the wobble happened to be.
+        # The rung's contract is about the axis it names.
+        axis = {"x": 0, "y": 1, "z": 2}.get(str(requested.get("direction", ""))[-1], 0)
+        moves.append({
+            "rung": measurement.get("move_size"),
+            "requested_cm": float(requested.get("distance_cm") or 0.0),
+            "moved_cm": abs(float(delta[axis])) * 100.0,
+            "wobble_cm": max(abs(float(v)) for v in delta) * 100.0,
+        })
+    # Calibration = the first three moves that actually RAN (a refused call produces
+    # none), in order: +x far, -x near, -x fine.
+    calibration = moves[:3]
+    by_rung = {m["rung"]: m for m in calibration}
+    nominal = {"far": 10.0, "near": 1.0, "fine": 0.1}
+    # Tolerance per rung: 25% or 0.5mm, whichever is larger -- a 1mm rung measured
+    # through a 1kHz OSC servo is not going to be 1.000mm.
+    rung_ok = {}
+    for rung, want in nominal.items():
+        got = by_rung.get(rung, {}).get("moved_cm")
+        rung_ok[rung] = got is not None and abs(got - want) <= max(0.25 * want, 0.05)
+    requested_values = {round(m["requested_cm"], 3) for m in moves}
+    checks = {
+        "move 的 schema 只有 size（没有 distance_cm）": advertised_props == ["direction", "size"],
+        "档位值写进了参数描述": "far=10厘米" in move_schema["parameters"]["properties"]["size"]["description"],
+        "提示词里有档位升降规则": "降一档" in policy.system and "升一档" in policy.system,
+        "仍然传 distance_cm 的调用被拒（不静默换算）": "ladder_rejects" in joined,
+        "乱编的档位名被拒": "invalid_enum" in joined and "size=huge" in joined,
+        "被拒的调用没有动机械爪（标定就是头三次 move）": [
+            m["rung"] for m in calibration
+        ] == ["far", "near", "fine"],
+        "三个档位实测量≈10cm/1cm/1mm": all(rung_ok.values()),
+        "所有实际执行的 move 都来自三档之一": requested_values <= {10.0, 1.0, 0.1} and bool(moves),
+        "结果里带上了档位名与实测位移": all(m["rung"] in nominal for m in moves),
+        "raw 模式画面仍然不带网格": policy.grid_frames == 0 and policy.frames > 0,
+        "阶梯下两工具仍能完成任务": bool(result.success),
+    }
+    for label, passed in checks.items():
+        print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
+    print(f"  阶梯腿：success={result.success} source={result.success_source} "
+          f"turns={result.turns} retries={result.protocol_retries} error={result.error!r}")
+    print(f"  标定：{ {r: round(by_rung.get(r, {}).get('moved_cm', -1), 2) for r in nominal} }")
+    print(f"  执行的 move {len(moves)} 次，档位分布："
+          f"{ {r: sum(1 for m in moves if m['rung'] == r) for r in nominal} }")
+    print(f"  重试提示：{[t for t in policy.sent if 'ladder_rejects' in t or 'invalid_enum' in t][:2]}")
+    print(f"  终局：can={[round(float(v), 4) for v in (final_obs.get('objects') or {}).get('alphabet_soup_1', [])]} "
+          f"basket={[round(float(v), 4) for v in (final_obs.get('objects') or {}).get('basket_1', [])]}")
+    if texts:
+        print(f"  示例：{texts[0][:80]}")
+    return all(checks.values())
+
+
+class LadderPolicy(RawPolicy):
+    """档 D: the same task, but every move must name a rung.
+
+    The prelude changes meaning here: instead of tools this mode removed, it asks for
+    the vocabulary the ladder removed -- a `move` carrying `distance_cm` (the exact
+    arithmetic the ladder replaces) and a `move` with an invented rung. Both must be
+    refused, because the ladder's value depends on the model NOT being able to fall
+    back to numbers it gets wrong.
+
+    Then three calibration calls, one per rung, in +x and back. They are what turns
+    "the enum exists" into "the rung is 10cm / 1cm / 1mm" -- the claim the model is
+    being asked to reason with.
+    """
+
+    LADDER = True
+    PRELUDE = (
+        ("move", {"direction": "+x", "distance_cm": "5"}),
+        ("move", {"direction": "+x", "size": "huge"}),
+        ("aim", {"u": "64", "v": "128"}),
+    )
+    CALIBRATION = (
+        ("move", {"direction": "+x", "size": "far"}),
+        ("move", {"direction": "-x", "size": "near"}),
+        ("move", {"direction": "-x", "size": "fine"}),
+    )
+
+
 def main() -> int:
     ipc_dir = REPO / "runtime" / "ipc_dryrun"
     shutil.rmtree(ipc_dir, ignore_errors=True)
@@ -800,6 +1010,8 @@ def main() -> int:
     ok = pixel_leg(REPO / "runtime" / "ipc_dryrun3") and ok
     print("\n=== raw 腿（唯 move/gripper/verify，无定位工具，无网格，无 LLM）===")
     ok = raw_leg(REPO / "runtime" / "ipc_dryrun4") and ok
+    print("\n=== 阶梯腿（档 D：move 只有 far/near/fine 三档）===")
+    ok = ladder_leg(REPO / "runtime" / "ipc_dryrun5") and ok
     print("PLUMBING OK" if ok else "PLUMBING PROBLEM")
     return 0 if ok else 1
 

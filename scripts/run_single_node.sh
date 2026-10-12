@@ -122,6 +122,10 @@ BACKEND_ARGS=(--backend "${BACKEND:-local}")
 [ -n "${STRATA_URL:-}" ] && BACKEND_ARGS+=(--strata-url "$STRATA_URL")
 # The run side must agree with the server's observation mode (see SCENE_ARGS).
 [ -n "${OBS_MODE:-}" ] && BACKEND_ARGS+=(--observation-mode "$OBS_MODE")
+# MOVE_LADDER=1 turns `move`'s distance into three named rungs (far/near/fine =
+# 10cm/1cm/1mm). Agent-side only -- the sim server is deliberately NOT told, because
+# the thing that could not do the arithmetic is the model, not the simulator.
+[ -n "${MOVE_LADDER:-}" ] && BACKEND_ARGS+=(--move-ladder)
 [ -n "${REASONING_EFFORT:-}" ] && BACKEND_ARGS+=(--reasoning-effort "$REASONING_EFFORT")
 [ -n "${THINKING_EFFORT:-}" ] && BACKEND_ARGS+=(--thinking-effort "$THINKING_EFFORT")
 

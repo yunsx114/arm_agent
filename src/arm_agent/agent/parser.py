@@ -48,13 +48,21 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
 
 
 def validate_calls(
-    calls: list[ToolCall], *, legacy: bool = False, observation_mode: str = "truth"
+    calls: list[ToolCall],
+    *,
+    legacy: bool = False,
+    observation_mode: str = "truth",
+    move_ladder: bool = False,
 ) -> list[str]:
     """Validate call count and arguments before dispatch."""
     if len(calls) != 1:
         return [f"expected_exactly_one_call:got_{len(calls)}"]
     return validate_tool_call(
-        calls[0].name, calls[0].args, legacy=legacy, observation_mode=observation_mode
+        calls[0].name,
+        calls[0].args,
+        legacy=legacy,
+        observation_mode=observation_mode,
+        move_ladder=move_ladder,
     )
 
 

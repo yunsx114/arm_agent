@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from arm_agent import contracts as C
+
 CANONICAL_TOOLS = (
     "observe", "aim", "target", "approach", "move", "rotate", "gripper", "grasp", "release", "verify",
 )
@@ -112,7 +114,12 @@ def canonical_name(name: str) -> str:
 
 
 def validate_tool_call(
-    name: str, args: dict[str, str], *, legacy: bool = False, observation_mode: str = "truth"
+    name: str,
+    args: dict[str, str],
+    *,
+    legacy: bool = False,
+    observation_mode: str = "truth",
+    move_ladder: bool = False,
 ) -> list[str]:
     """Return explicit protocol errors; do not execute invalid calls."""
     allowed = LEGACY_TOOLS if legacy else CANONICAL_TOOLS
@@ -137,6 +144,27 @@ def validate_tool_call(
         for key in REQUIRED.get(canonical, ())
         if not str(normalized_args.get(key, "")).strip()
     ]
+    # MOVE LADDER (档 D): with the ladder on, `move` accepts a NAMED rung and nothing
+    # else. A distance in centimetres is rejected with a reason instead of being
+    # silently converted -- the whole point is that the model is not doing the
+    # arithmetic any more, and a silent conversion would hide it still trying to.
+    if canonical == "move" and move_ladder:
+        if str(normalized_args.get("distance_cm", "")).strip():
+            return ["ladder_rejects:distance_cm(use size=far|near|fine)"]
+        size = str(normalized_args.get("size", "")).strip().lower()
+        if not size:
+            return ["missing:size(far|near|fine)"]
+        if C.move_rung_cm(size) is None:
+            return [f"invalid_enum:size={size}(far|near|fine)"]
+        # The rung replaces the distance ONLY. `direction` is still the model's call
+        # and still has to be one of the six axes -- returning early here without this
+        # check would have silently accepted `direction="向着罐子"`.
+        direction = str(normalized_args.get("direction", "")).strip()
+        if not direction:
+            return ["missing:direction(+x|-x|+y|-y|+z|-z)"]
+        if direction not in ENUMS["move"]["direction"]:
+            return [f"invalid_enum:direction={direction}"]
+        return []
     for key, values in ENUMS.get(canonical, {}).items():
         value = str(normalized_args.get(key, "")).strip()
         if value and value not in values:

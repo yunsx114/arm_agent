@@ -120,6 +120,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         history_messages=args.history_messages,
         image_keep=args.image_keep,
         observation_mode=args.observation_mode,
+        move_ladder=args.move_ladder,
     )
     print(
         f"[run] backend={args.backend} "
@@ -127,6 +128,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"image_keep={harness.image_keep} prompt_mode={harness.prompt_mode} "
         f"tool_protocol={harness.tool_protocol} "
         f"observation_mode={harness.observation_mode} "
+        f"move_ladder={harness.move_ladder} "
         f"thinking={model.enable_thinking} max_new_tokens={model.max_new_tokens}",
         flush=True,
     )
@@ -326,6 +328,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--video-fps", type=int, default=2)
     p.add_argument("--video-dir", default=str(REPO / "outputs" / "videos"))
     p.add_argument("--keep-frames", action="store_true", help="keep per-turn PNG frames after encoding")
+    p.add_argument(
+        "--move-ladder",
+        action="store_true",
+        help="档 D：把 move 的距离换成三个固定档位（far=10cm / near=1cm / fine=1mm）。"
+        "模型只挑方向+档位，距离由代码决定；sim-server 不需要知道这个开关。",
+    )
     p.set_defaults(func=cmd_run)
 
     args = parser.parse_args(argv)
