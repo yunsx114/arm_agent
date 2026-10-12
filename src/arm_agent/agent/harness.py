@@ -182,6 +182,26 @@ def _final_eef(
     return [round(float(v), 4) for v in eef]
 
 
+def _count_sub_tools(entries: list[dict[str, Any]]) -> dict[str, int]:
+    """Tool histogram of a sub-episode, under the names the EXECUTOR used.
+
+    The sub runs `look` mode: the tool is advertised as `look` but recorded in the
+    transcript under its canonical name `observe`. Counting raw `tool` values printed
+    "look 0 次" on all 162 dispatches of the first planner run while the truth was 18
+    looks out of a 40-turn budget -- the planner was told the executor never looked and
+    had to reverse-engineer the number itself (it did, in its task text). Count what the
+    transcript records, label what the model called it (measured 2026-10-12).
+    """
+    counts: dict[str, int] = {}
+    for entry in entries:
+        name = (entry.get("structured_result") or {}).get("tool")
+        if name == "observe":
+            name = "look"
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
 def _summarise_gripper(entries: list[dict[str, Any]]) -> dict[str, int]:
     """Per-verdict counts of the sub-model's gripper calls (its only actuation report)."""
     counts: dict[str, int] = {}
@@ -425,6 +445,8 @@ class Harness:
         t_start = time.time()
         transcript: list[dict[str, Any]] = []
         last_images: dict[str, Any] = {}
+        # A fresh episode restarts the phase numbering (see `_run_subtask`).
+        self._sub_count = 0
         try:
             if init_state_idx is None:
                 # 档 E: continue in the CURRENT world (the executor of a dispatch).
@@ -992,6 +1014,9 @@ class Harness:
         task = str(call.args.get("task", "")).strip()
         budget = as_float(call.args.get("budget_turns"), None) or C.DISPATCH_BUDGET_DEFAULT
         budget = int(min(max(budget, C.DISPATCH_BUDGET_RANGE[0]), C.DISPATCH_BUDGET_RANGE[1]))
+        # Per EPISODE, not per run: the counter is what the report calls the phase
+        # ("dispatch #N") and what the executor's own episode id is built from, so a
+        # run-wide counter made episode 3's SECOND dispatch announce itself as #67.
         self._sub_count = getattr(self, "_sub_count", 0) + 1
         self._say(f"[turn ?] dispatch #{self._sub_count}：预算 {budget} 轮，任务：{task[:60]}…")
 
@@ -1018,25 +1043,26 @@ class Harness:
 
         entries = sub.captured
         verdicts = _summarise_gripper(entries)
-        tools = {}
-        for entry in entries:
-            structured = entry.get("structured_result") or {}
-            name_i = structured.get("tool")
-            if name_i:
-                tools[name_i] = tools.get(name_i, 0) + 1
+        tools = _count_sub_tools(entries)
         final_eef = _final_eef(entries, obs)
 
         grip_txt = "、".join(f"{k}×{v}" for k, v in sorted(verdicts.items())) or "没有合/开过夹爪"
         env_success = bool(sub_result.success)
         error_txt = f"；中途异常：{sub_result.error}" if sub_result.error else ""
+        # `env_success` is the SIM's verdict on the WHOLE episode, not on this phase, so
+        # printing its False said "环境判定：未完成" even on a phase that plainly
+        # succeeded (ep3 dispatch #3 ended 爪上：有物体 -- a clean grasp). Only a True is
+        # informative, and it means the episode itself is over. The phase signal the
+        # planner can actually use is 轮数 + look/move 配比 + 夹爪词表 + 最终爪心.
+        verdict_txt = "执行者宣布完成且环境判定通过。" if env_success else ""
+        hold_txt = format_state(obs, self._grasped).rsplit("；", 1)[-1].removeprefix("爪上：")
         report = (
             f"[dispatch #{self._sub_count} 完成] 任务“{task[:80]}”：\n"
             f"执行者用了 {sub_result.turns}/{budget} 轮（{sub_result.tool_calls} 次工具调用，"
             f"协议重试 {sub_result.protocol_retries}）；"
-            f".move {tools.get('move', 0)} 次、look {tools.get('look', 0)} 次、"
+            f"move {tools.get('move', 0)} 次、look {tools.get('look', 0)} 次、"
             f"gripper：{grip_txt}{error_txt}。\n"
-            f"最终爪心 {_fmt3(final_eef)}，爪上：{format_state(obs, self._grasped).split('；')[-1].strip()}。"
-            + (f"执行者报告环境判定：{'完成' if env_success else '未完成'}。" if sub_result.tool_calls else "")
+            f"最终爪心 {_fmt3(final_eef)}，爪上：{hold_txt}。{verdict_txt}"
             + "\n请验收：对照这个阶段的目标看上面的数字（必要时自己 look 再看一眼）。"
               "失败就把原因和要改的点写进新的 task 再 dispatch；不要原样重发同一个任务。"
         )

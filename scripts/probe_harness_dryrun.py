@@ -31,7 +31,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from arm_agent import contracts as C
-from arm_agent.agent.harness import Harness
+from arm_agent.agent.harness import Harness, _count_sub_tools
 from arm_agent.sim.client import SimClient
 from arm_agent.sim.pixel_grounding import (
     AIM_MARK_COLOUR,
@@ -1239,6 +1239,18 @@ def planner_leg(ipc_dir: Path) -> bool:
             moves and abs((moves[0].get("structured_result") or {}).get("measurement", {}).get("eef_start", [9])[0] - (-0.152)) < 0.03
         ),
         "预算生效（子回合数 ≤ 预算）": (not st) or st.get("sub_turns", 0) <= st.get("sub_turns_budget", 0),
+        # Regression guard for the two report bugs the first planner run exposed
+        # (2026-10-12): `look` is recorded canonically as `observe`, so the report
+        # read "look 0 次" on all 162 dispatches; and the held-state was pasted with
+        # its label twice ("爪上：爪上：空").
+        "报告里的 look 计数不是恒 0（observe 要按 look 报）": (
+            st.get("sub_tools") == _count_sub_tools(sub_entries)
+            and _count_sub_tools([{"structured_result": {"tool": "observe"}}]) == {"look": 1}
+        ),
+        "爪上状态只出现一次标签": "爪上：爪上" not in report,
+        # The executor never returns early, so an under-sized budget is a lost phase:
+        # the floor is enforced by validation (see contracts.DISPATCH_BUDGET_RANGE).
+        "预算下限拦住「做不完的阶段」": C.DISPATCH_BUDGET_RANGE[0] >= 20,
         "planner 自身回合数很小（外层只发号施令）": result.turns <= 4,
         "整体任务完成（执行者=已证明的 look 腿控制器）": bool(result.success),
     }

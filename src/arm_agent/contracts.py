@@ -48,8 +48,15 @@ CAMERA_NAMES = {"agent": "agentview", "wrist": "robot0_eye_in_hand"}
 # The sub-model's TURN budget -- after it, the sub-episode returns control no matter
 # what (the user's spec: "预算结束后自动返回"). The default lives with the schema
 # description; the range is checked by `validate_tool_call`.
-DISPATCH_BUDGET_RANGE = (5, 60)
-DISPATCH_BUDGET_DEFAULT = 30
+# MEASURED (planner run 2026-10-12, 8 episodes / 162 dispatches): the executor used
+# 100% of its budget in 139/162 dispatches and NEVER returned early -- it has the
+# `verify` exit available and used it zero times -- so a phase is not "cut short by a
+# lazy sub", it is cut short by US. Every phase therefore has to be sized for the whole
+# phase: the planner's 8- and 10-turn carry phases dropped the can mid-air, while the
+# 45-turn grasp phase in episode 3 succeeded. Floor raised from 5 to 20 so an
+# unfinishable phase is rejected at validation time instead of at the arm.
+DISPATCH_BUDGET_RANGE = (20, 80)
+DISPATCH_BUDGET_DEFAULT = 45
 # Key of the magnified crop in an image payload (档 B v2 `aim`/`target`). It lives
 # here because BOTH sides need it and neither may import the other: the agent process
 # has no robosuite, and the sim process has no model client. It is not a camera, so it
