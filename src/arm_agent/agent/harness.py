@@ -74,6 +74,36 @@ SHARED_SKILL_FILE = "scene_tools.md"
 # (keeping 1 would silently throw away half of the newest pair). Tokens: 2 x
 # 66 = 133 per turn, and only for the newest turn.
 HISTORY_IMAGE_KEEP = 2
+
+# CONTEXT COMPRESSION (M2) -- the model writes its own brief every N turns.
+#
+# WHY THIS REPLACES THE MECHANICAL TRIM: `compact_history` deletes the oldest messages
+# outright, keeping only system + task + the newest N-3, plus a one-line "N messages
+# omitted". Everything the episode LEARNED in those messages -- what was tried, what
+# failed, how far the arm got -- is gone, and an episode that has been circling a can for
+# 40 turns restarts that circle from scratch. MEASURED (4 arms, 24+8 episodes): the arm
+# random-walks, and every arm hits the turn cap rather than converging, i.e. the failure is
+# precisely what a self-written summary is supposed to catch.
+#
+# So instead: at the end of every N-turn block the harness asks the model three questions
+# (what have you done / are you stuck and why / what next) and REPLACES the whole block
+# with its answer. The questions are the user's, verbatim in intent: naming "stuck" and
+# "why" as a question the model has to answer is itself the anti-oscillation instrument.
+#
+# Cost: one extra LLM call per block (no episode turn is consumed). Failure is non-fatal:
+# if that call errors or comes back empty, the conversation is left EXACTLY as it was and
+# the mechanical cap still protects the context (never lose an episode to the summariser).
+SUMMARY_EVERY_TURNS = 32
+SUMMARY_ANSWER_TOKENS = 500
+CONTEXT_SUMMARY_PREFIX = "【上下文压缩】"
+SUMMARY_REQUEST = """先不要调用任何工具。用纯文本回答下面三个问题，作为到目前为止的对话的压缩记录（这就是你后面唯一能看到的历史，写漏了的信息就永久丢失）：
+
+1. 目前为止都做了什么？（按顺序列出你做过的关键动作和每一类动作的结果，比如你朝哪个方向走了多少次、每次实际走了多远、夹爪尝试了几次分别是什么结果、物体和爪心的相对位置怎么变化的）
+2. 当前是否卡住 / 陷入无法收敛的状态？原因是什么？（如果一直在两个方向之间来回、或者反复做同一件事而事情没有推进，直接说出来，并说清它为什么没推进）
+3. 接下来要做什么？（写具体：往哪个世界轴、大约多少距离、先做什么后做什么）
+
+格式：直接用「1. …\n2. …\n3. …」三段回答，不要画表格、不要写工具调用、不要重复任务描述。总长度控制在 400 字以内。"""
+
 # Conversation cap. MEASURED (probe_gpu_memory.py): the OOM allocation was
 # exactly one full-attention N x N matrix (2900^2 * 16 heads * 2 bytes = 266 MiB)
 # — on this Turing card SDPA has no mem-efficient kernel, so attention memory
@@ -128,6 +158,17 @@ class EpisodeResult:
     error: str = ""
 
 
+def summary_due(turn: int, every: int) -> bool:
+    """True at the FIRST turn of a new block (33, 65, ...), i.e. just after a block ended.
+
+    Pulled out of the loop so the arithmetic is testable without a model: the mechanical
+    message cap and this summariser run on the same list, and an off-by-one here means the
+    brief is written one turn too late -- or twice in a row at the boundary. `every=0`
+    disables it, which is the A/B control arm.
+    """
+    return bool(every) and turn > 1 and (turn - 1) % every == 0
+
+
 class Harness:
     def __init__(
         self,
@@ -143,6 +184,7 @@ class Harness:
         image_keep: int | None = None,
         observation_mode: str = "truth",
         move_ladder: bool = False,
+        summary_every: int | None = SUMMARY_EVERY_TURNS,
     ) -> None:
         self.client = client
         self.model = model
@@ -160,6 +202,16 @@ class Harness:
         # `pixels` = it does not, and the model targets pixels instead.
         self.observation_mode = str(observation_mode).strip().lower()
         self.auto_frames = self.observation_mode != "look"
+        # 0 or None disables the self-summary (A/B control arm); the mechanical cap then
+        # still applies, exactly as before.
+        self.summary_every = int(summary_every) if summary_every else 0
+        # THE TWO MECHANISMS HAVE TO AGREE. The mechanical cap trims messages BEFORE the
+        # summariser ever runs, so a 32-message window would make the first summary a
+        # compression of the last 16 turns while its prompt claims "so far" -- a silently
+        # wrong brief is worse than no brief. When summarisation is on and the caller did
+        # not ask for a specific window, widen it to hold a whole block with room to spare.
+        if self.summary_every and history_messages is None:
+            self.history_messages = max(MAX_HISTORY_MESSAGES, 2 * self.summary_every + 8)
         self.image_keep = int(image_keep) if image_keep is not None else (
             # -1 = NEVER elide a frame from the history (`llm.prepare_for_model`). In
             # `look` mode that is the whole point: the model paid a turn for each frame,
@@ -400,6 +452,22 @@ class Harness:
             for turn in range(1, self.max_turns + 1):
                 result.turns = turn
                 t_turn0 = time.time()
+                # CONTEXT COMPRESSION, once per N-turn block: the model writes the brief and
+                # the block is replaced by it (see SUMMARY_EVERY_TURNS). Turn 33 is the end
+                # of the first block, so the trigger is `(turn - 1) % N == 0`.
+                if summary_due(turn, self.summary_every):
+                    n_before = len(messages)
+                    compressed, summary = self._summarise_context(
+                        messages, turn=turn, recorder=recorder
+                    )
+                    if compressed is not None:
+                        messages = compressed
+                        transcript.append({
+                            "turn": turn,
+                            "context_summary": summary,
+                            "messages_before": n_before,
+                            "messages_after": len(compressed),
+                        })
                 # Two budgets, both from measurements (see MAX_HISTORY_MESSAGES and
                 # HISTORY_IMAGE_KEEP): cap the transcript so attention stays cheap
                 # (quadratic on this card), then elide all but the newest frames so
@@ -790,6 +858,75 @@ class Harness:
                     error=result.error,
                 )
         return result
+
+    def _summarise_context(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        turn: int,
+        recorder: EpisodeRecorder | None,
+    ) -> tuple[list[dict[str, Any]] | None, str]:
+        """Ask the model to write the brief that REPLACES the last block of turns.
+
+        Returns `(new_messages, summary)`; `(None, "")` means "leave the conversation
+        alone" -- every failure path here must be non-fatal, because a broken summariser
+        must not be able to end an episode that was still running.
+
+        The summary is requested with `tools=None` so the engine will not emit a tool call,
+        and it sees the SAME view the normal turn would (same image budget): we want the
+        model's compression of what it actually had, not of a differently-pruned context.
+        """
+        view = prepare_for_model(messages, self.image_keep)
+        request = {"role": "user", "content": [{"type": "text", "text": SUMMARY_REQUEST}]}
+        t0 = time.time()
+        try:
+            reply = self.model.chat(
+                [*view, request], tools=None, max_new_tokens=SUMMARY_ANSWER_TOKENS
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed summary is not a failed episode
+            self._say(f"[turn {turn}] 上下文压缩失败（保留原历史）：{type(exc).__name__}: {exc}")
+            return None, ""
+        # Strip anything tool-shaped: a model that ignores "不要调用任何工具" would
+        # otherwise write XML into the brief that the next turn then tries to parse.
+        # The tag pattern requires a NAME (`</function=move>` styles too), because a looser
+        # `<[^>]*>` also eats maths the model may legitimately write -- "爪心 < 0.22 且
+        # 物体 > 0.15" would lose everything between the two angle brackets.
+        summary = truncate_to_first_call(str(reply or ""))
+        summary = re.sub(r"</?[A-Za-z_][A-Za-z0-9_]*[^>]*>", " ", summary).strip()
+        summary = re.sub(r"[ \t]{2,}", " ", summary)
+        if len(summary) < 8:
+            # The gate exists to reject an EMPTY or tool-only reply, not to enforce brevity:
+            # a terse but honest brief ("没动过。没卡住。下一步 -y。") is still a brief, and
+            # discarding it would silently fall back to no compression at all.
+            self._say(f"[turn {turn}] 上下文压缩没有得到可用文本（保留原历史）：{summary!r}")
+            return None, ""
+        note = {
+            "role": "user",
+            "content": [{"type": "text", "text": (
+                f"{CONTEXT_SUMMARY_PREFIX}（截至第 {turn - 1} 轮的压缩记录，"
+                f"由你自己每 {self.summary_every} 轮重写一次；更早的原始消息与画面已省略）\n"
+                + summary
+                + "\n\n（以上是你自己写下的记录。现在按格式继续：现状/判定/动作，"
+                "紧接一个工具调用；不要重复回答上面的问题，也不要重复已经做过的动作。）"
+            )}],
+        }
+        # System prompt + the task message + the brief. Nothing else survives: that is the
+        # compression, and it is also what reclaims the images.
+        compressed = [messages[0], messages[1], note]
+        if recorder is not None:
+            recorder.record(
+                turn,
+                tool_call="(上下文压缩)",
+                result=summary,
+                status="上下文压缩",
+                status_color=YELLOW,
+                images={},
+            )
+        self._say(
+            f"[turn {turn}] 上下文压缩：{len(messages)} 条消息 → 3 条，"
+            f"摘要 {len(summary)} 字，用时 {time.time() - t0:.1f}s"
+        )
+        return compressed, summary
 
     def _dispatch(self, call: ToolCall, obs: dict[str, Any]) -> dict[str, Any]:
         name, args = call.name, call.args

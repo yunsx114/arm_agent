@@ -126,6 +126,9 @@ BACKEND_ARGS=(--backend "${BACKEND:-local}")
 # 10cm/1cm/1mm). Agent-side only -- the sim server is deliberately NOT told, because
 # the thing that could not do the arithmetic is the model, not the simulator.
 [ -n "${MOVE_LADDER:-}" ] && BACKEND_ARGS+=(--move-ladder)
+# SUMMARY_EVERY=32 (default) makes the model write its own context compression every 32
+# turns; SUMMARY_EVERY=0 turns the summariser off (the mechanical trim then applies).
+[ -n "${SUMMARY_EVERY:-}" ] && BACKEND_ARGS+=(--summary-every "$SUMMARY_EVERY")
 [ -n "${REASONING_EFFORT:-}" ] && BACKEND_ARGS+=(--reasoning-effort "$REASONING_EFFORT")
 [ -n "${THINKING_EFFORT:-}" ] && BACKEND_ARGS+=(--thinking-effort "$THINKING_EFFORT")
 

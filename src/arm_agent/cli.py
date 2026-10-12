@@ -121,6 +121,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         image_keep=args.image_keep,
         observation_mode=args.observation_mode,
         move_ladder=args.move_ladder,
+        summary_every=args.summary_every,
     )
     print(
         f"[run] backend={args.backend} "
@@ -129,6 +130,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"tool_protocol={harness.tool_protocol} "
         f"observation_mode={harness.observation_mode} "
         f"move_ladder={harness.move_ladder} "
+        f"summary_every={harness.summary_every} "
         f"thinking={model.enable_thinking} max_new_tokens={model.max_new_tokens}",
         flush=True,
     )
@@ -336,6 +338,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="档 D：把 move 的距离换成三个固定档位（far=10cm / near=1cm / fine=1mm）。"
         "模型只挑方向+档位，距离由代码决定；sim-server 不需要知道这个开关。",
+    )
+    p.add_argument(
+        "--summary-every",
+        type=int,
+        default=None,
+        help="每 N 轮让模型自己写一次上下文压缩（默认 32；0 = 关闭，回到机械裁剪）。"
+        "压缩内容是模型对「做过什么 / 是否卡住及原因 / 接下来做什么」的自述，"
+        "写完就把这 N 轮的消息整体替换为它。",
     )
     p.set_defaults(func=cmd_run)
 
