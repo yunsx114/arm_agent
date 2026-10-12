@@ -49,13 +49,10 @@ MODE_TOOLS: dict[str, frozenset[str]] = {
     "look": frozenset({"move", "gripper", "observe", "verify"}),
 }
 DEFAULT_MODE = "truth"
-# Registered in code, advertised in NO mode: the path stays (dispatch, aliases,
-# validation) but the model is neither shown the tool nor allowed to call it.
-#
-# `observe` has been off since 2026-10-10: every turn now carries BOTH camera frames,
-# so `observe <target>` would only re-add object coordinates, which is the thing the
-# observations modes exist to remove.
-UNREGISTERED_TOOLS: frozenset[str] = frozenset({"observe"})
+# NOTE (2026-10-12): there used to be an `UNREGISTERED_TOOLS = {"observe"}` here that was
+# never read by anything. It is gone: `observe` is advertised in exactly one place now
+# (`look` mode swaps its schema for `look`), and the whitelist plus the `observe.target`
+# validation is what enforces that -- a constant nobody reads is worse than no constant.
 
 
 def tools_for_mode(observation_mode: str) -> frozenset[str]:
@@ -151,8 +148,7 @@ def validate_tool_call(
             return [f"mode_blocked_tool:{name}"]
     canonical = canonical_name(name)
     normalized_args = dict(args)
-    if name in ("locate", "descend_to", "align_xy"):
-        normalized_args["target"] = args.get("name", "")
+    if name in ("locate", "descend_to", "align_xy"):        normalized_args["target"] = args.get("name", "")
     if name == "declare_done":
         normalized_args["claim"] = args.get("answer_note", "task_complete")
     errors = [
@@ -164,6 +160,21 @@ def validate_tool_call(
     # else. A distance in centimetres is rejected with a reason instead of being
     # silently converted -- the whole point is that the model is not doing the
     # arithmetic any more, and a silent conversion would hide it still trying to.
+    if canonical == "observe" and not legacy:
+        # `observe` has THREE branches, and only the camera one belongs on a pixel/frame
+        # surface: `observe(target=...)` returns GROUND-TRUTH object coordinates (it is the
+        # old `locate`). MEASURED (audit 2026-10-12): `look` mode has `observe` in its surface
+        # because `look` is an alias of it, so `look(target="alphabet soup")` PASSED this
+        # validator and reached `_locate`, i.e. one stray argument was a full locator -- the
+        # exact affordance every non-truth mode exists to remove. v1 keeps it (that surface
+        # advertises `locate` on purpose).
+        if str(normalized_args.get("target", "")).strip() or str(
+            normalized_args.get("name", "")
+        ).strip():
+            return [
+                "mode_blocked_arg:observe.target（本模式不提供物体坐标；"
+                "要定位只能 look 看画面，参数只有 camera）"
+            ]
     if canonical == "move" and move_ladder:
         if str(normalized_args.get("distance_cm", "")).strip():
             return ["ladder_rejects:distance_cm(use gap_px or size=far|near|fine)"]

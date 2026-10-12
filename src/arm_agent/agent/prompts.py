@@ -325,7 +325,7 @@ TOOL_SCHEMAS_V2: list[dict[str, Any]] = [
     {"type": "function", "function": {
         "name": "gripper",
         "description": (
-            "开/关夹爪（raw 模式使用；truth/pixels 模式由 grasp/release 取代）。"
+            "开/关夹爪（raw/look 模式使用；truth/pixels 模式由 grasp/release 取代）。"
             "close = 合上直到碰到东西；open = 张开（空手时就是复位）。**只回报概念**："
             "grasped（两指都碰到物体）/ empty（指间是空的）/ slipped（只碰到一侧）/"
             "released（已张开且指间无物）/ still_carrying（张不开，还夹着）。"

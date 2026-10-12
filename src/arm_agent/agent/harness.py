@@ -945,7 +945,15 @@ class Harness:
                 cam = args.get("camera", "agent")
                 return {
                     "obs": resp.obs,
-                    "text": f"[observe] refreshed {cam} view",
+                    "text": (
+                        f"[look {cam}] 已返回 {cam} 视角的新画面（见随附图片）；"
+                        + (
+                            "agent = 全局第三人称（看位置关系），青色十字是夹爪自己"
+                            if str(cam) == "agent"
+                            else "wrist = 腕部俯视（看夹爪正下方有什么）"
+                        )
+                        + "。画面不会自动刷新，要看再 look 一次。"
+                    ),
                     "image": images.get(cam),
                     "images": images,
                     "done": False,
@@ -1367,6 +1375,12 @@ class Harness:
         ablation (`--no-images` is the other half of that pair).
         """
         objects: dict[str, Any] = obs.get("objects", {})
+        # SECOND LAYER (see the validator's `observe.target` check): this whole method
+        # returns ground truth, so it must refuse outside `truth` even if a future surface
+        # re-advertises some path to it. `pack()` always ships `objects`, so the whitelist
+        # (plus this guard) is the only thing keeping the modes honest.
+        if not self.legacy_tools and self.observation_mode != "truth":
+            return "[locate] 本模式不提供物体坐标（没有按名字定位的工具）。"
         if not objects:
             return "[locate] 当前没有物体信息（服务器未提供）。"
 
