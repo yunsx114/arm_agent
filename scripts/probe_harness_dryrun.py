@@ -714,6 +714,14 @@ class RawPolicy:
     def SCRIPT(self) -> tuple:  # noqa: N802 - mirrors the class-level tuple
         return self.PRELUDE + self.CALIBRATION
 
+    def _next_call(self) -> tuple[str, dict[str, Any]]:
+        """The next call. Overridden by `look`'s policy to insert looks."""
+        return raw_next_call(self.server, ladder=self.LADDER)
+
+    def _capture(self, messages) -> None:  # noqa: ANN001
+        """(unused hook kept for subclasses that need the raw message list)"""
+        del messages
+
     def chat(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
         for message in messages:
             if message.get("role") == "system":
@@ -741,7 +749,7 @@ class RawPolicy:
         if self.done:
             name, args = "verify", {"claim": "placed"}
         else:
-            name, args = raw_next_call(self.server, ladder=self.LADDER)
+            name, args = self._next_call()
             if name == "gripper" and args["action"] == "open":
                 self.opens += 1
                 # open(pads) -> carry -> open(over the basket): the third open is the
@@ -980,6 +988,134 @@ class LadderPolicy(RawPolicy):
     )
 
 
+class LookPolicy(RawPolicy):
+    """`look` mode: the same minimal surface, but SEEING is an action.
+
+    Three things this leg has to prove, because each is the reason the mode exists:
+
+    1. The task message carries NO frame -- the model opens blind and must decide to look.
+    2. Frames arrive ONLY as the result of a `look` call (never attached to a turn that ran
+       `move`/`gripper`).
+    3. No frame is ever elided: the number of images in the prompt KEEPS GROWING with the
+       number of looks. With the old `image_keep=2` budget it would plateau at 2, which is
+       exactly why "did my last step take me past it?" was unanswerable.
+    """
+
+    LADDER = False
+    PRELUDE = (
+        ("aim", {"u": "64", "v": "128"}),          # banned here: no pixel tools
+        ("look", {"camera": "agent"}),             # the only legal way to see
+    )
+
+    def __init__(self, server: SimServer) -> None:
+        super().__init__(server)
+        self.looks = 0
+        self.frames_before_look = 0
+        self.max_images_seen = 0
+        self.last_seen_images = 0
+        self.image_series: list[int] = []
+        self.initial_message_images = -1
+
+    def chat(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+        total_images = sum(
+            sum(1 for it in (m.get("content") or []) if isinstance(it, dict) and it.get("type") == "image")
+            for m in messages
+            if isinstance(m.get("content"), list)
+        )
+        self.max_images_seen = max(self.max_images_seen, total_images)
+        self.last_seen_images = total_images
+        self.image_series.append(total_images)
+        if self.initial_message_images < 0:
+            self.initial_message_images = total_images
+        # "Before the first look" means before a `look` CALL was ever emitted -- whoever
+        # emitted it (the script's prelude counts too). Using the subclass's own counter
+        # here flagged the frames from the scripted look as a violation.
+        if self.calls.count("look") == 0:
+            for message in messages[1:]:
+                content = message.get("content")
+                if isinstance(content, list) and any(
+                    isinstance(it, dict) and it.get("type") == "image" for it in content
+                ):
+                    self.frames_before_look += 1
+        return super().chat(messages, tools=tools, **kwargs)
+
+    def _next_call(self) -> tuple[str, dict[str, Any]]:
+        """Geometry, but stop and LOOK every few steps like the prompt teaches."""
+        if self.calls.count("look") < 3 and len(self.calls) % 9 == 0:
+            self.looks += 1
+            return "look", {"camera": "wrist" if self.calls.count("look") % 2 else "agent"}
+        return raw_next_call(self.server, ladder=False)
+
+
+def look_leg(ipc_dir: Path) -> bool:
+    """档 E: `move` + `gripper` + `look` + `verify`, no frames unless the model looks."""
+    server = SimServer(
+        ipc_dir=ipc_dir,
+        suite_name="libero_object",
+        task_id=0,
+        cam_size=256,
+        observation_mode="look",
+        pixel_grid_px=32,
+    )
+    thread = threading.Thread(target=server.serve_forever, kwargs={"idle_exit_s": 120}, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    client = SimClient(ipc_dir)
+    policy = LookPolicy(server=server)
+    harness = Harness(
+        client=client,
+        model=policy,
+        workspace=REPO,
+        max_turns=70,
+        tool_protocol="v2",
+        log=False,
+        observation_mode="look",
+        # The MESSAGE cap also removes images (it removes whole messages), so a
+        # 32-message window erases the frames a walk-and-look policy needs: MEASURED in
+        # this leg, the image count per prompt went 0,2,2,...,2,0,0,0 -- the last three
+        # looks had fallen out of the tail. With the cap raised past the episode length
+        # the count is monotonically NON-DECREASING, which is the property the mode is
+        # supposed to have. (VRAM is not the constraint here: Stratas holds the KV.)
+        history_messages=200,
+    )
+    advertised = sorted(s["function"]["name"] for s in harness.tool_schemas)
+    result = harness.run_episode(init_state_idx=0, episode_id=994)
+    transcript = json.loads(Path(result.transcript_path).read_text())["transcript"]
+    client.close()
+    time.sleep(0.3)
+
+    texts = [e["result"] for e in transcript if e.get("result")]
+    joined = "\n".join(policy.sent)
+    checks = {
+        "工具面是 move/gripper/look/verify": advertised == ["gripper", "look", "move", "verify"],
+        "没有像素工具、也没有 approach": all(
+            n not in advertised for n in ("aim", "target", "approach", "grasp", "release")
+        ),
+        "任务消息不带任何画面（开局是盲的）": policy.initial_message_images == 0,
+        "没 look 之前不会出现画面": policy.frames_before_look == 0,
+        "look 之后才有画面（每张 look 都留下）": policy.max_images_seen >= 2 * policy.looks > 0,
+        "历史图片没有被清理（图片数只增不减）": (
+            bool(policy.image_series)
+            and all(b >= a for a, b in zip(policy.image_series, policy.image_series[1:]))
+            and policy.image_series[-1] >= 2 * policy.calls.count("look")
+        ),
+        "look 被拒绝前的试探给出协议重试": sum(1 for e in transcript if e.get("protocol_retry")) >= 1,
+        "aim 在本模式被拒（拒绝理由回到模型）": "mode_blocked_tool" in joined,
+        "画面不带网格": policy.grid_frames == 0 and policy.frames > 0,
+        "三工具仍能完成任务": bool(result.success),
+    }
+    for label, passed in checks.items():
+        print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
+    print(f"  look 腿：success={result.success} source={result.success_source} "
+          f"turns={result.turns} retries={result.protocol_retries} error={result.error!r}")
+    print(f"  look 次数={policy.calls.count('look')} 最多同时可见图片={policy.max_images_seen} "
+          f"最后一轮提示里图片数={policy.last_seen_images} 收到的帧={policy.frames}")
+    print(f"  每轮提示里的图片数序列（前 6 / 后 6）：{policy.image_series[:6]} … {policy.image_series[-6:]}")
+    if texts:
+        print(f"  示例：{texts[0][:80]}")
+    return all(checks.values())
+
+
 def main() -> int:
     ipc_dir = REPO / "runtime" / "ipc_dryrun"
     shutil.rmtree(ipc_dir, ignore_errors=True)
@@ -1033,6 +1169,8 @@ def main() -> int:
     ok = raw_leg(REPO / "runtime" / "ipc_dryrun4") and ok
     print("\n=== 阶梯腿（档 D：move 只有 far/near/fine 三档）===")
     ok = ladder_leg(REPO / "runtime" / "ipc_dryrun5") and ok
+    print("\n=== look 腿（model 自己决定何时看图，历史图不清理）===")
+    ok = look_leg(REPO / "runtime" / "ipc_dryrun6") and ok
     print("PLUMBING OK" if ok else "PLUMBING PROBLEM")
     return 0 if ok else 1
 

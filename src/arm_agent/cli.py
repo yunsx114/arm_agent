@@ -188,10 +188,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--observation-mode",
         default="truth",
-        choices=["truth", "pixels", "raw"],
+        choices=["truth", "pixels", "raw", "look"],
         help="truth = 允许按名字取仿真真值坐标；pixels = 断掉那条路，"
         "只接受 aim/target 给像素，并把带网格+夹爪准线的画面送给模型；"
-        "raw = 连像素工具也断掉，只剩 move + gripper + verify（画面上只留夹爪准线）",
+        "raw = 连像素工具也断掉，只剩 move + gripper + verify（画面上只留夹爪准线）；"
+        "look = 同 raw，但**不再每轮自动给图**，改由模型自己调 look 工具取图（且历史图不清理）",
     )
     p.add_argument(
         "--pixel-grid",
@@ -300,7 +301,8 @@ def main(argv: list[str] | None = None) -> int:
         "--image-keep",
         type=int,
         default=None,
-        help="how many recent frames stay as pixels; omit for harness.HISTORY_IMAGE_KEEP",
+        help="how many recent frames stay as pixels; -1 = 一张也不清理（look 模式的默认值）；"
+        "omit for harness.HISTORY_IMAGE_KEEP",
     )
     p.add_argument("--record", action="store_true", help="record an mp4 per episode (cameras + model I/O)")
     p.add_argument(
@@ -313,9 +315,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--observation-mode",
         default="truth",
-        choices=["truth", "pixels", "raw"],
-        help="truth = 仿真提供物体坐标（A/B 基线）；pixels = 不提供任何物体坐标，"
-        "模型用带网格的画面给 aim/target 传像素；raw = 只有 move/gripper/verify。"
+        choices=["truth", "pixels", "raw", "look"],
+        help="truth = 仿真提供物体坐标（A/B 基线）；pixels = 不提供任何物体坐标 ，"
+        "模型用带网格的画面给 aim/target 传像素；raw = 只有 move/gripper/verify ；"
+        "look = 同 raw，但画面要模型自己 look（不自动给、历史图不清理）。"
         "必须同时给 sim-server 同样的值。",
     )
     p.add_argument(

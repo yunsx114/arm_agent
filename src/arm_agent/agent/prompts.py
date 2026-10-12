@@ -13,7 +13,12 @@ conversation is Chinese and the template output is bilingual-tolerant.
 from __future__ import annotations
 
 from typing import Any
-from arm_agent.agent.tool_protocol import CANONICAL_TOOLS, MODE_TOOLS, tools_for_mode
+from arm_agent.agent.tool_protocol import (
+    CANONICAL_TOOLS,
+    MODE_TOOLS,
+    canonical_name,
+    tools_for_mode,
+)
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -672,6 +677,86 @@ PROMPT_MODES = {
 }
 
 
+# `look` mode's own schema: ONE camera at a time, and it is the only way to see anything.
+# The v2 `observe` schema is a three-in-one tool (object coordinates / frames / state) and
+# two of its three branches are exactly what this mode removes.
+LOOK_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "look",
+        "description": (
+            "看一次相机，返回一张新画面。**不移动机械臂。**"
+            "camera=agent 是全局第三人称视角（看位置关系、看它现在在哪），"
+            "camera=wrist 是腕部俯视（看细节、看夹爪正下方有什么）。"
+            "**本模式不会再自动给你图**：你看到的每一张画都是你自己 look 出来的，"
+            "而且它**会留在对话里**（后面的回合还能回头对比'走这步之前/之后'）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "camera": {"type": "string", "enum": ["agent", "wrist"],
+                           "description": "要看哪个相机；省略则为 agent"},
+            },
+            "required": [],
+        },
+    },
+}
+
+
+LOOKS_APPENDIX = """
+
+## 附：本模式的词汇换算
+- 随附的场景事实里的 `approach(<名字>)` / `aim` / `target` 在本模式下**不存在**；
+  `grasp()` / `release()` 在本模式下就是 `gripper close` / `gripper open`。
+- 本模式**不会自动给你画面**。要看就 `look`。你不看的时候手里只有数字。
+"""
+
+
+# `look` mode's system prompt. It is the `raw` prompt minus the promise of frames, plus
+# the one thing the model has to understand: seeing is now an ACTION it takes, and the
+# frames it takes stay in the conversation, so "did that step take me past it?" is now a
+# question it can actually answer by comparing two frames it asked for.
+SYSTEM_PROMPT_V2_LOOK = """你是机械臂任务决策核心。目标是完成当前任务。
+
+每次只调用一个工具。工具结果是环境测量，不是行动建议；不要假设动作一定完成。
+不要发明工具、参数或并行调用。verify 的成功与否只由环境验证。
+
+**本模式只有四个工具**：`look`（看相机，唯一的信息来源）、`move`（世界轴平移，
+唯一能改变高度的手段）、`gripper`（open/close，只回报概念）、`verify`（问环境完成没有）。
+
+**你不会自动获得任何画面。** 想看就自己 `look`：
+
+- 想知道“东西现在在哪儿、我走到哪了” → `look(agent)`；
+- 想知道“夹爪正下方是什么” → `look(wrist)`。
+
+**你 look 出来的画面会留在对话里**，所以有两种用法：一直 look，也可以走几步再 look
+一次、然后**回头对比“走之前”和“走之后”两张图**——这就是你判断自己一步走了多远、
+会不会过头的手段。宁可多 look 一次，也不要盲走。
+
+输出格式：每次回复严格按下面三段写，三段都要有，标题照抄：
+现状：（你最近看到的画面里的事实，或“本轮没看图”；不要编造你没看过的画面）
+判定：（目标相对爪心偏哪个方向、你打算怎么动；或该开/关夹爪）
+动作：（下一步调用哪个工具、参数是多少；必须与上面的判定一致）
+三段写完后，紧接写出完整的工具调用。除这三段外不要写任何其他内容。
+
+任务结构（括号内是这一步用的工具）：
+先 `look(agent)` 找到目标 → `gripper open` 张开夹爪 → 用小步 `move` 靠近它，
+**每走到不确定的时候先 look 再看** → `look(wrist)` 确认夹爪就在它上方 →
+`move -z` 降到刚好碰到它（降不动了就停）→ `gripper close` →
+看回报是「夹住了」还是「夹空了」：夹空就 `move +z` 抬起 5cm、重新对齐再试 →
+`move +z` 抬到 0.25 以上 → 移动到容器上方（到了先 `look` 确认）→ 降到合适高度 →
+`gripper open` → 抬高一点 → `verify`
+
+## 事实（都是测量的，不是建议）
+- `gripper close` 只回概念：「夹住了」= 两指都碰到了物体；「夹空了」= 指间是空的；
+  「接触不稳」= 只碰到一侧。**夹空时不要原地再关，先抬起再重新对准。**
+- 抬高/降低只能用 `move ±z`；单次上限 15cm。横移前爪心要 ≥0.22，因为手里物体底部在爪心下方约 5cm。
+- 结果里写「未到达 / 只走了 X cm / ⚠」都表示那个动作没有完全达成；以实测数字为准。
+
+坐标系：世界坐标中 +z 向上，位置单位米。
+"""
+
+
 def get_system_prompt(
     mode: str = "full", observation_mode: str = "truth", move_ladder: bool = False
 ) -> str:
@@ -694,6 +779,8 @@ def get_system_prompt(
         return SYSTEM_PROMPT_V2_PIXELS
     if mode_o == "raw" and mode_l == "v2":
         return raw_prompt(move_ladder)
+    if mode_o == "look" and mode_l == "v2":
+        return SYSTEM_PROMPT_V2_LOOK
     return PROMPT_MODES.get(mode_l, SYSTEM_PROMPT)
 
 
@@ -740,6 +827,8 @@ def mode_appendix(observation_mode: str) -> str:
         return PIXELS_APPENDIX
     if mode == "raw":
         return RAWS_APPENDIX
+    if mode == "look":
+        return LOOKS_APPENDIX
     return ""
 
 
@@ -826,7 +915,11 @@ def get_tool_schemas(
     schemas = TOOL_SCHEMAS_V2 if str(protocol).strip().lower() == "v2" else LEGACY_TOOL_SCHEMAS
     if move_ladder:
         schemas = [MOVE_LADDER_SCHEMA if s["function"]["name"] == "move" else s for s in schemas]
+    if str(observation_mode).strip().lower() == "look":
+        # `look` replaces the three-in-one `observe`: one camera per call, and the only
+        # source of pixels. Names, positions and object coordinates stay absent.
+        schemas = [LOOK_SCHEMA if s["function"]["name"] == "observe" else s for s in schemas]
     if str(protocol).strip().lower() != "v2":
         return schemas
     surface = tools_for_mode(observation_mode)
-    return [s for s in schemas if s["function"]["name"] in surface]
+    return [s for s in schemas if canonical_name(s["function"]["name"]) in surface]

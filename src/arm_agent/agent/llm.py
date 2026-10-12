@@ -275,7 +275,14 @@ def prepare_for_model(
     carries two cameras, and a stub costs ~20 tokens, so per-image stubs would
     make the 32-message tail pay ~600 extra tokens for information that is gone
     either way.
+
+    `keep_recent_images < 0` means KEEP EVERY FRAME. That is `look` mode: the model paid a
+    turn for each frame, and its whole method for judging whether a step was too big is to
+    compare the frame it took before the step with the one after -- eliding either one
+    destroys the comparison, not just some detail.
     """
+    if keep_recent_images < 0:
+        return messages
     total = sum(
         sum(1 for item in message["content"] if isinstance(item, dict) and item.get("type") == "image")
         for message in messages

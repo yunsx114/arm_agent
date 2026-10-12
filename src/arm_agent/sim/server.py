@@ -87,7 +87,7 @@ class SimServer:
         # The mode is enforced here, at the single place that owns the truth, so a
         # "raw" run cannot silently fall back to names.
         self.observation_mode = str(observation_mode).strip().lower()
-        if self.observation_mode not in ("truth", "pixels", "raw"):
+        if self.observation_mode not in ("truth", "pixels", "raw", "look"):
             raise ValueError(f"unknown observation_mode {observation_mode!r}")
         self.pixel_grid_px = int(pixel_grid_px)
         self.cam_size = int(cam_size)
@@ -542,7 +542,7 @@ class SimServer:
                 self.pixel_grid_px,
                 mark=ring,
                 mark_radius=self.aim_mark_px,
-                draw_grid=self.observation_mode != "raw",
+                draw_grid=self.observation_mode not in ("raw", "look"),
             )
         except Exception as exc:  # noqa: BLE001 - annotation must never break a step
             print(f"[server] annotate failed: {type(exc).__name__}: {exc}", flush=True)

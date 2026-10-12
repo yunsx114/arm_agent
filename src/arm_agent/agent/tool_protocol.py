@@ -12,7 +12,7 @@ from typing import Any
 from arm_agent import contracts as C
 
 CANONICAL_TOOLS = (
-    "observe", "aim", "target", "approach", "move", "rotate", "gripper", "grasp", "release", "verify",
+    "observe", "look", "aim", "target", "approach", "move", "rotate", "gripper", "grasp", "release", "verify",
 )
 # WHICH TOOLS EACH OBSERVATION MODE ADVERTISES AND ACCEPTS (v2).
 #
@@ -33,6 +33,20 @@ MODE_TOOLS: dict[str, frozenset[str]] = {
     "truth": frozenset({"approach", "move", "rotate", "grasp", "release", "verify"}),
     "pixels": frozenset({"aim", "target", "move", "rotate", "grasp", "release", "verify"}),
     "raw": frozenset({"move", "gripper", "verify"}),
+    # `look`: the same minimal surface as `raw`, plus ONE thing the model controls --
+    # when to see. NO frame is attached to a turn automatically; a frame exists only as
+    # the result of a `look` call, and no frame is ever elided from the history (see
+    # harness.image_keep = -1 for this mode).
+    #
+    # WHY (the user's diagnosis, 2026-10-12): the every-turn frame pair was a legacy of
+    # the 4-bit local model's VRAM ceiling, not a design choice -- and it forced the model
+    # to attend to two fresh images at every step while every older image was replaced by
+    # a text stub. On a pointing task that is exactly backwards: "did my last 10cm step
+    # take me past the object?" is a COMPARISON between two frames, and the comparison was
+    # structurally unavailable. Measured over 4 arms: direction correctness 47-51% (a
+    # validated instrument; the truth-driven scripted control scores 94%), i.e. a random
+    # walk -- consistent with a policy that cannot see what its own steps did.
+    "look": frozenset({"move", "gripper", "observe", "verify"}),
 }
 DEFAULT_MODE = "truth"
 # Registered in code, advertised in NO mode: the path stays (dispatch, aliases,
@@ -101,6 +115,8 @@ ENUMS = {
     # point in the hand frame, so it travels with the gripper and can never be
     # reached).
     "aim": {"camera": {"agent", "wrist"}},
+    # `look` shares the `observe` schema (alias), so the camera enum is the same one.
+    "look": {"camera": {"agent", "wrist"}},
     "target": {"camera": {"agent"}},
     "move": {"direction": {"+x", "-x", "+y", "-y", "+z", "-z"}},
     "rotate": {"axis": {"yaw", "pitch", "roll"}},

@@ -153,15 +153,24 @@ class Harness:
         # Both budgets are overridable per run: the right cap depends on the
         # card (see MAX_HISTORY_MESSAGES). None = use the module default.
         self.history_messages = int(history_messages) if history_messages else MAX_HISTORY_MESSAGES
-        self.image_keep = int(image_keep) if image_keep is not None else HISTORY_IMAGE_KEEP
+        # `look` mode sets auto_frames/image_keep, so the mode has to be resolved FIRST.
+        # (Cost one debugging round: the image budget was computed before the mode existed
+        # and the ctor raised AttributeError.)
+        # 档 B: `truth` = the simulator owns object positions (the A/B baseline);
+        # `pixels` = it does not, and the model targets pixels instead.
+        self.observation_mode = str(observation_mode).strip().lower()
+        self.auto_frames = self.observation_mode != "look"
+        self.image_keep = int(image_keep) if image_keep is not None else (
+            # -1 = NEVER elide a frame from the history (`llm.prepare_for_model`). In
+            # `look` mode that is the whole point: the model paid a turn for each frame,
+            # and comparing the frame it took before a step with the one after is how it
+            # judges whether the step was too big.
+            -1 if self.observation_mode == "look" else HISTORY_IMAGE_KEEP
+        )
         # "full" = the accumulated scene-specific prompt; "plain" = task +
         # frame + tool semantics only (see prompts.get_system_prompt).
         self.prompt_mode = "v2" if tool_protocol == "v2" and prompt_mode == "full" else prompt_mode
         self.tool_protocol = tool_protocol
-        # 档 B: `truth` = the simulator owns object positions (the A/B baseline);
-        # `pixels` = it does not, and the model targets pixels instead. The harness
-        # mirrors the mode to keep the advertised schema and the prompt honest.
-        self.observation_mode = str(observation_mode).strip().lower()
         # 档 D: with the ladder on, `move` takes a NAMED rung (far/near/fine = 10cm/1cm/1mm)
         # instead of a distance, so the magnitude is code-owned. The value the server
         # receives is still `distance_cm` -- the ladder lives entirely on the agent
@@ -354,20 +363,32 @@ class Harness:
                     images=last_images,
                 )
 
+            # `look` mode: the task message carries NO frame. Seeing is an action the model
+            # takes, and the very first thing it must do is decide to take it -- otherwise
+            # it opens with two frames of context it did not ask for and never learns that
+            # looking is something it controls.
+            initial_images = [
+                *(
+                    [{"type": "image", "image": images[cam]} for cam in ("agent", "wrist") if images.get(cam) is not None]
+                    or [{"type": "image", "image": images["agent"]}]
+                )
+            ] if self.auto_frames else []
+            initial_note = (
+                "[上图：全局相机 + 腕部相机（从上往下看夹爪下方，用来判断自己在哪）]\n"
+                if self.auto_frames
+                else "[本模式不附画面：想看图就调用 look。]\n"
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": get_system_prompt(self.prompt_mode, self.observation_mode, self.move_ladder) + self.shared_skill + mode_appendix(self.observation_mode) + ladder_appendix(self.move_ladder) + self._skills_index()},
                 {
                     "role": "user",
                     "content": [
-                        *(
-                            [{"type": "image", "image": images[cam]} for cam in ("agent", "wrist") if images.get(cam) is not None]
-                            or [{"type": "image", "image": images["agent"]}]
-                        ),
+                        *initial_images,
                         {
                             "type": "text",
                             "text": (
                                 f"任务：{result.language}\n"
-                                f"[上图：全局相机 + 腕部相机（从上往下看夹爪下方，用来判断自己在哪）]\n"
+                                f"{initial_note}"
                                 f"{format_state(obs)}\n"
                                 "请开始。记住：每次只调用一个工具。"
                             ),
@@ -680,7 +701,11 @@ class Harness:
                 # (open before close; do not descend onto your own payload) now
                 # live in the system prompt instead.
                 content: list[dict[str, Any]] = []
-                if self.attach_images:
+                # In `look` mode a frame is attached ONLY when the model asked for one:
+                # `self.auto_frames` is False there, so the guard needs the second clause.
+                if self.attach_images and (
+                    self.auto_frames or canonical_name(str(call.name)) in ("observe", "look")
+                ):
                     # BOTH cameras, every step that has fresh frames.
                     #
                     # MEASURED 2026-10-10: only the agent view was ever attached,
