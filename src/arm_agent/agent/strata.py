@@ -43,6 +43,11 @@ from typing import Any
 
 DEFAULT_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_MODEL = "strata"
+# How long to wait before retrying a 5xx / after a failed warm-up. See `_warm_up` and the
+# HTTPError branch of `chat`: the engine is restarted lazily by the next request and that
+# restart takes tens of seconds, so the socket-error backoff (2 s) is far too short.
+ENGINE_RESTART_WAIT_S = 20.0
+ENGINE_5XX_RETRIES = 3
 
 
 def _data_url(image: Any) -> str:
@@ -145,6 +150,27 @@ class StrataAgentModel:
         self.enable_thinking = self.reasoning_effort != "none"
 
     # ------------------------------------------------------------------ load
+    def _warm_up(self) -> None:
+        """Force the engine to actually start BEFORE episode 0 needs it.
+
+        MEASURED (2026-10-12): `/health` says `loaded: true` while the engine PROCESS is
+        gone (it was stopped by `/unload`), and the first real request is what restarts it --
+        the first such request always dies with a 503 and only the NEXT one works. Left
+        alone this costs one episode per run (episode 0: turns=1, elapsed 7 s, empty
+        transcript, `success=False`), which is also a silently wrong data point in any table
+        that counts episodes. Two throwaway one-token requests make it go away.
+        """
+        for attempt in range(3):
+            try:
+                self.chat(
+                    [{"role": "user", "content": "ok"}], tools=None, max_new_tokens=1
+                )
+                print(f"[llm] strata warm-up ok（第 {attempt + 1} 次）", flush=True)
+                return
+            except Exception as exc:  # noqa: BLE001 - warm-up must never be fatal
+                print(f"[llm] strata warm-up 第 {attempt + 1} 次失败：{exc}", flush=True)
+                time.sleep(ENGINE_RESTART_WAIT_S)
+
     def load_model(self) -> None:
         """Wait for the server. No weights to load here -- the engine owns them."""
         deadline = time.time() + 600.0
@@ -165,6 +191,7 @@ class StrataAgentModel:
                             "frames will be ignored (reinstall with --vision yes)",
                             flush=True,
                         )
+                    self._warm_up()
                     return
                 last = "not loaded yet"
             except Exception as exc:  # noqa: BLE001 - the server may still be starting
@@ -214,6 +241,25 @@ class StrataAgentModel:
                 break
             except urllib.error.HTTPError as exc:
                 detail = exc.read()[:400].decode("utf-8", "replace")
+                # A 5xx IS THE ENGINE'S OWN PROBLEM, AND THE ENGINE FIXES IT BY ITSELF:
+                # MEASURED (2026-10-12, right after `POST /load`) the FIRST request comes
+                # back 503 'the engine stopped unexpectedly (exit code 1); the next request
+                # restarts it'. Raising here threw away a whole episode (turns=1, 7 s,
+                # empty transcript) in every run that had not happened to send a request
+                # first -- while the very next request would have worked. A 4xx is still a
+                # client error and must fail loudly.
+                if exc.code >= 500 and attempt < max(self.retries, ENGINE_5XX_RETRIES):
+                    last_error = RuntimeError(f"Strata HTTP {exc.code}: {detail}")
+                    print(
+                        f"[llm] strata {exc.code}，等引擎自愈后重试（第 {attempt + 1} 次）："
+                        f"{detail[:120]}",
+                        flush=True,
+                    )
+                    # The engine is restarted lazily BY the next request, and that restart
+                    # is what takes tens of seconds -- hence a longer wait than the
+                    # socket-error path.
+                    time.sleep(ENGINE_RESTART_WAIT_S)
+                    continue
                 raise RuntimeError(f"Strata HTTP {exc.code}: {detail}") from exc
             except Exception as exc:  # noqa: BLE001 - one retry for a transient socket error
                 last_error = exc
