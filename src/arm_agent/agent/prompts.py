@@ -13,7 +13,7 @@ conversation is Chinese and the template output is bilingual-tolerant.
 from __future__ import annotations
 
 from typing import Any
-from arm_agent.agent.tool_protocol import CANONICAL_TOOLS, UNREGISTERED_TOOLS
+from arm_agent.agent.tool_protocol import CANONICAL_TOOLS, MODE_ONLY_TOOLS, UNREGISTERED_TOOLS
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -265,6 +265,22 @@ TOOL_SCHEMAS_V2: list[dict[str, Any]] = [
         ),
         "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {
+        "name": "goto_pixel",
+        "description": (
+            "把一个画面像素当成目标：代码用相机标定 + 深度把该像素反投影成世界点，"
+            "再加上你给的 clearance（offset_mm，世界系 xyz 毫米），然后把夹爪伺服到那里。"
+            "不再需要物体名或物体坐标。像素用带网格的画面读（例：u=128, v=96）。"
+            "返回概念：arrived / short / blocked（是否到位）。"
+        ),
+        "parameters": {"type": "object", "properties": {
+            "camera": {"type": "string", "enum": ["agent", "wrist"],
+                       "description": "agent=全局第三人称（视野宽、精度约 3~4mm/像素）；wrist=腕部朝下（只有靠近时才看得见目标，精度约 1mm/像素）"},
+            "u": {"type": "number", "description": "像素列，画面左上为 0"},
+            "v": {"type": "number", "description": "像素行，画面左上为 0"},
+            "offset_mm": {"type": "array", "items": {"type": "number"},
+                          "description": "在反投影像素点上再加的位移（世界系 xyz，毫米）。只想悬停在表面上方就加大 z（例：[0,0,120]）。默认 [0,0,0]"},
+        }, "required": ["u", "v"]}}},
+    {"type": "function", "function": {
         "name": "verify",
         "description": "请求环境验证任务是否完成。成功与否只由环境真值决定，claim 只是标签，不影响判定。",
         "parameters": {"type": "object", "properties": {
@@ -438,6 +454,25 @@ SYSTEM_PROMPT_V2 = """你是机械臂任务决策核心。目标是完成当前�
 """
 
 
+# Appended to the system prompt ONLY in `pixels` mode (档 B). It has to override
+# rather than extend: both the v2 prompt and skills/scene_tools.md are written
+# around `approach(<名字>)`, which that mode removes.
+PIXELS_APPENDIX = """
+
+## 本回合的观测模式：pixels（无物体坐标）
+- **没有任何物体坐标，也没有物体名可以调用**：`approach(<名字>)` 在本模式下不存在。
+  取而代之的是 `goto_pixel`：你在带网格的画面上指定一个像素，代码用相机标定 + 深度把
+  它反投影成世界点，再加上你给的 clearance，然后把夹爪伺服过去。
+- 画面上的青色十字是**夹爪自己**当前所在的像素（不是目标）：看你在目标的哪一侧。
+- 像素精度：第三人称约 3~4 mm/像素，腕部近距约 1 mm/像素。需要毫米级对准时，先粗对准
+  第三人称下的像素，再靠近后用腕部画面里的像素做第二次对准（腕部相机朝下，看得见夹爪
+  正下方的东西）。
+- 反投影落点在物体**可见表面**（比物体中心近 2~9cm，取决于形状）。因此 clearance 由你
+  给：只想悬在表面上方就传 `offset_mm: [0,0,120]`（向，上 12cm）。
+- 下面提到的 `approach(...)` 一律读作 `goto_pixel(...)`：先用像素到达目标附近，再下压/下降。
+"""
+
+
 PROMPT_MODES = {
     "full": SYSTEM_PROMPT,
     "plain": SYSTEM_PROMPT_PLAIN,
@@ -450,11 +485,22 @@ def get_system_prompt(mode: str = "full") -> str:
     return PROMPT_MODES.get(str(mode).strip().lower(), SYSTEM_PROMPT)
 
 
-def get_tool_schemas(protocol: str = "v2") -> list[dict[str, Any]]:
+def pixels_appendix(observation_mode: str) -> str:
+    """Mode-specific appendix (档 B). Empty unless the mode is `pixels`."""
+    return PIXELS_APPENDIX if str(observation_mode).strip().lower() == "pixels" else ""
+
+
+def get_tool_schemas(protocol: str = "v2", observation_mode: str = "truth") -> list[dict[str, Any]]:
     """The tool surface actually advertised to the model.
 
     Schemas for unregistered tools stay in this file (see UNREGISTERED_TOOLS) so
-    re-enabling one is a one-line change; they are filtered out here.
+    re-enabling one is a one-line change; they are filtered out here. The same
+    filter drops tools that the current observation mode cannot honour (档 B:
+    `approach` needs the simulator's object positions, which `pixels` mode does
+    not have).
     """
     schemas = TOOL_SCHEMAS_V2 if str(protocol).strip().lower() == "v2" else LEGACY_TOOL_SCHEMAS
-    return [s for s in schemas if s["function"]["name"] not in UNREGISTERED_TOOLS]
+    blocked = set(UNREGISTERED_TOOLS) | set(
+        MODE_ONLY_TOOLS.get(str(observation_mode).strip().lower(), frozenset())
+    )
+    return [s for s in schemas if s["function"]["name"] not in blocked]

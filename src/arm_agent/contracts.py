@@ -39,6 +39,10 @@ GRIPPER_CLOSED_QPOS = 0.0
 # ---------------------------------------------------------------------------
 OBS_AGENTVIEW = "agentview_image"  # 256x256x3 uint8, display-oriented (flip v)
 OBS_WRIST = "robot0_eye_in_hand_image"
+# MuJoCo camera names (for calibration / depth rendering), keyed by the name the
+# MODEL uses in a tool call. 档 B needs the mapping in one place: the tool speaks
+# "agent"/"wrist" while the simulator speaks "agentview"/"robot0_eye_in_hand".
+CAMERA_NAMES = {"agent": "agentview", "wrist": "robot0_eye_in_hand"}
 OBS_EEF_POS = "robot0_eef_pos"
 OBS_EEF_QUAT = "robot0_eef_quat"
 OBS_GRIPPER_QPOS = "robot0_gripper_qpos"

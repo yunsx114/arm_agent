@@ -165,6 +165,55 @@ held = 存在 body b，使 (leftfinger,b) 与 (rightfinger,b) 都在接触表里
 * **概念反馈会掩盖细节**（滑到指间外侧、被口沿卡住）：用 `slip` 事件 + 腕部图像补，**不再加浮点**。
 * **拒绝通道**：动作不可执行时要回"拒绝 + 理由 + 你现在能做什么"，不退化成静默重试（§1 第 5 条）。
 
+## 7. 档 B 已完成（2026-10-12）
+
+### 7.1 先测误差预算（`scripts/probe_pixel_grounding.py`，CPU，纯几何）
+
+判据用**256 个网格点打平面**（平面必须回来还是平面），而不是拿少量物体比对——
+第一版就是后者，结果手腕相机只看到自己的爪子（单样本），把行序判反了两次。
+
+| 判据 | 结果 |
+|---|---|
+| 深度缓冲行序 | **row0=bottom（OpenGL）**：桌面平面 MAD **4.7mm（第三人称）/ 0.1mm（腕部）**；反向 526mm / 33.7mm |
+| 数学正确性 | 往返 u/v 误差 **0.000px**；平面散布 0.1–4.7mm ⇒ 反投影与标定自洽 |
+| 第三人称精度 | **2.96–4.04 mm/px**；±1px=3.6mm、±2px=7.4mm；网格 4px=2.8mm、8px=9.5mm、16px=32mm |
+| 腕部（抓取高度，罐子在正下方） | **1.10 mm/px**；±1px=1.1mm；网格 4px=2.0mm、8px=5.0mm |
+| 表面 vs 中心 | 可见表面比物体中心近 **+20…+90mm**（篮子 +90mm）⇒ **clearance 必须由模型给** |
+
+⇒ 结论：第三人称只能做粗对准（~1cm），**抓取所需的 ~2mm 必须靠腕部近距离**（或图像闭环）。
+所以 `goto_pixel` 做成"像素 + 模型给的 offset"的一次到位原语，**由模型分两段用**。
+
+### 7.2 实现了什么
+
+| 层 | 内容 |
+|---|---|
+| 新模块 `sim/pixel_grounding.py` | `Camera`（**世界系** `data.cam_xpos/cam_xmat`；`model.cam_pos` 对挂在手部的相机是局部坐标）、`depth_metres`、`sample_depth`（3×3 中值 + 量程校验）、`backproject`、`ground_pixel`（**不可用就带理由拒绝**）、`annotate_frame`（网格 + 夹爪准线，无任何语义标注） |
+| `sim/server.py` | 新动作 `goto_pixel`；`observation_mode`（`truth`/`pixels`）**在服务端强制**：pixels 下按名字的 `descend`/`align` 直接抛错并给替代；两种传输的图像路径都加标注 |
+| `sim/action_adapter.py` | `classify_descent`（arrived/short/blocked 的**唯一**判词来源，避免两处各自解释 note） |
+| 工具面 | `goto_pixel` 登记；`MODE_ONLY_TOOLS` 让 pixels 模式**不广告也不接受** `approach`，拒绝时提示改用 `goto_pixel` |
+| `harness.py` | `goto_pixel` 的 dispatch；`parse_vec3`（模型给的向量常是字符串 `"[0,0,120]"`，逐字符迭代会发出 14 个数被拒）；`format_outcome` 只回概念 + mm/px；**`model_view`**：pixels 模式下把 `measurement.object_body` 从**给模型的那份**里剥掉（转写保留） |
+| CLI/脚本 | `--observation-mode`、`--pixel-grid`（服务端与 run 两侧都必须一致）；`run_single_node.sh` 支持 `OBS_MODE`/`PIXEL_GRID` |
+
+### 7.3 守卫与实测（`probe_harness_dryrun.py` 的"像素腿"，无 LLM，~40s）
+
+7 项断言全 PASS，且 `success=True source=env turns=9`：
+工具面里没有 `approach` / `goto_pixel` 多次调用且给概念 / **工具结果与状态行里没有物体名** /
+**没有物体坐标** / `approach` 被拒且提示替代 / 任务由像素完成 / **画面确实带网格标注**
+（按收到的像素里网格颜色计数验证，不是"代码里画了"）。
+
+这套断言就是**行为版的 sensor-rights 守卫**（Jev 的 `SensorWorld` 是静态版：读禁字段即抛错）。
+它当场抓到一个真泄漏：档 A 的接触判定把 `object_body="alphabet_soup_1_main"` 写进了每个工具结果的结构化
+JSON 里，而 pixels 模式的全部意义就是"没有物体身份"。
+
+### 7.4 版图的粗糙处（已知）
+
+* pixels 模式下 skill 文件仍以 `approach(<名字>)` 叙述，靠提示词附录里一句"一律读作
+  `goto_pixel`"过渡。**下一步**：给 pixels 模式写一份独立 skill（把 `approach` 的段落换成像素流程）。
+* `rgbd` 档（颜色/深度检测出物体坐标）**没有做**：它需要一个知道物体颜色/大小的**场景专用检测器**
+  ——Jev 自己也写着"换了颜色或形状，需要调整检测器"。现在只做 `truth`/`pixels` 两档。
+* 第三人称的 3.7mm/px 决定了"一次到位"不可行；`goto_pixel` 不做自动再观察，由模型自己分两段。
+* 尚未用真模型跑过（需要 GPU）。预期的新失败形态：模型读网格读不准、或忘了给 clearance。
+
 ## 8. 参考
 
 * 计划与教训：[`docs/P0_stripdown.md`](P0_stripdown.md)（该剥/不该剥的边界）

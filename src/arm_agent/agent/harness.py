@@ -31,6 +31,7 @@ from arm_agent.agent.parser import (
 from arm_agent.agent.prompts import (
     get_system_prompt,
     get_tool_schemas,
+    pixels_appendix,
 )
 from arm_agent.agent.tool_protocol import canonical_name, structured_result
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
@@ -115,6 +116,7 @@ class Harness:
         tool_protocol: str = "v1",
         history_messages: int | None = None,
         image_keep: int | None = None,
+        observation_mode: str = "truth",
     ) -> None:
         self.client = client
         self.model = model
@@ -130,7 +132,11 @@ class Harness:
         # frame + tool semantics only (see prompts.get_system_prompt).
         self.prompt_mode = "v2" if tool_protocol == "v2" and prompt_mode == "full" else prompt_mode
         self.tool_protocol = tool_protocol
-        self.tool_schemas = get_tool_schemas(tool_protocol)
+        # 档 B: `truth` = the simulator owns object positions (the A/B baseline);
+        # `pixels` = it does not, and the model targets pixels instead. The harness
+        # mirrors the mode to keep the advertised schema and the prompt honest.
+        self.observation_mode = str(observation_mode).strip().lower()
+        self.tool_schemas = get_tool_schemas(tool_protocol, self.observation_mode)
         self.legacy_tools = str(tool_protocol).lower() != "v2"
         self.skills_dir = self.workspace / SKILLS_DIRNAME
         self.skills_dir.mkdir(parents=True, exist_ok=True)
@@ -300,7 +306,7 @@ class Harness:
                 )
 
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": get_system_prompt(self.prompt_mode) + self.shared_skill + self._skills_index()},
+                {"role": "system", "content": get_system_prompt(self.prompt_mode) + self.shared_skill + pixels_appendix(self.observation_mode) + self._skills_index()},
                 {
                     "role": "user",
                     "content": [
@@ -350,7 +356,9 @@ class Harness:
                 messages.append({"role": "assistant", "content": reply})
                 transcript.append({"turn": turn, "assistant": reply})
 
-                call_errors = validate_calls(calls, legacy=self.legacy_tools)
+                call_errors = validate_calls(
+                    calls, legacy=self.legacy_tools, observation_mode=self.observation_mode
+                )
                 if call_errors:
                     result.protocol_retries += 1
                     # Tell a CUT-OFF reply apart from one that simply has no tool
@@ -367,6 +375,11 @@ class Harness:
                         f"工具协议错误：{', '.join(call_errors)}。"
                         "请只输出一个合法工具调用，并修正参数。"
                     )
+                    if any(str(e).startswith("mode_blocked_tool:") for e in call_errors):
+                        note += (
+                            " 本观测模式里没有物体坐标可用：请改用 goto_pixel 给像素坐标"
+                            "（在带网格的面上读，例：u=128, v=96），或用 move 沿世界轴小步移动。"
+                        )
                     messages.append({"role": "user", "content": note})
                     transcript.append({"turn": turn, "protocol_retry": True})
                     self._say(f"[turn {turn}] protocol retry (calls={len(calls)})")
@@ -599,7 +612,11 @@ class Harness:
                     "type": "text",
                     "text": (
                         outcome["text"] + "\n"
-                        + json.dumps(outcome["result"], ensure_ascii=False, separators=(",", ":"))
+                        + json.dumps(
+                            model_view(outcome["result"], self.observation_mode),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
                         + "\n" + format_state(obs, self._grasped)
                     ),
                 })
@@ -702,6 +719,33 @@ class Harness:
                 "note": f"{outcome.get('status', '')}",
                 "status": outcome.get("status", ""),
                 "held": outcome.get("held"),
+                "measurement": outcome.get("measurement") or {},
+                "requested": outcome.get("requested") or {},
+            }
+
+        if name == "goto_pixel":
+            # 档 B: the model names a PIXEL; the simulator grounds it. The harness
+            # never sees an object position on this path.
+            payload: dict[str, Any] = {
+                "kind": "goto_pixel",
+                "camera": args.get("camera", "agent"),
+                "u": as_float(args.get("u"), 0.0),
+                "v": as_float(args.get("v"), 0.0),
+                "offset_mm": parse_vec3(args.get("offset_mm")),
+            }
+            resp = self.client.act(payload)
+            outcome = resp.outcome
+            images = resp.images(self.client.ipc_dir)
+            return {
+                "obs": resp.obs,
+                "text": format_outcome(outcome),
+                "image": (images or {}).get("wrist"),
+                "images": images,
+                "done": False,
+                "tool": name,
+                "kind": outcome.get("kind", name),
+                "note": str(outcome.get("note", "")),
+                "status": outcome.get("status", ""),
                 "measurement": outcome.get("measurement") or {},
                 "requested": outcome.get("requested") or {},
             }
@@ -1089,6 +1133,61 @@ def _fmt3(vec: Any) -> str:
     return f"({vec[0]:.4f}, {vec[1]:.4f}, {vec[2]:.4f})"
 
 
+# Keys that identify a SCENE OBJECT rather than describe geometry. They stay in the
+# transcript (the offline audits read `measurement`) but are dropped from the copy
+# the model is shown when the observation mode claims not to know about objects.
+MODEL_HIDDEN_KEYS = ("object_body",)
+
+
+def model_view(result: dict[str, Any], observation_mode: str) -> dict[str, Any]:
+    """The structured result as the MODEL sees it (档 B).
+
+    HISTORY, because this is a leak that was found by a test rather than by
+    reading: every tool result carries its structured JSON, and 档 A's grasp concept
+    put the contact-derived body name in it (`measurement.object_body =
+    "alphabet_soup_1_main"`). In `pixels` mode that hands the model the simulator's
+    object identity on a path whose whole point is that it has none.
+    """
+    if str(observation_mode).strip().lower() != "pixels":
+        return result
+    view = dict(result)
+    measurement = dict(view.get("measurement") or {})
+    for key in MODEL_HIDDEN_KEYS:
+        measurement.pop(key, None)
+    if measurement:
+        view["measurement"] = measurement
+    else:
+        view.pop("measurement", None)
+    return view
+
+
+def parse_vec3(value: Any, default: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> list[float]:
+    """Parse a 3-vector the model may hand over in any of the shapes seen.
+
+    The tool arguments arrive as STRINGS (they come out of the XML/JSON tool call),
+    so `offset_mm` shows up as `"[0, 0, 120]"`, `"0,0,120"` or `"0 0 120"` about
+    equally often. MEASURED: without this the harness iterated the characters of the
+    string, sent 14 numbers, and the server rejected the call -- the model saw
+    "offset_mm 需要三个数" for an argument that looks correct in its own message.
+    """
+    if value is None or value == "":
+        return list(default)
+    if isinstance(value, (list, tuple)):
+        items: list[Any] = list(value)
+    else:
+        text = str(value).strip().strip("[](){} ")
+        items = [chunk for chunk in re.split(r"[,\s]+", text) if chunk]
+    numbers: list[float] = []
+    for item in items:
+        try:
+            numbers.append(float(str(item).strip()))
+        except (TypeError, ValueError):
+            continue
+    if len(numbers) != 3:
+        return list(default)
+    return numbers
+
+
 def _z_err(note: str) -> float | None:
     """Pull 'z err 65.9 mm' out of an adapter note and return it in metres."""
     m = re.search(r"z err ([-0-9.]+) mm", note or "")
@@ -1157,6 +1256,21 @@ def format_outcome(outcome: dict[str, Any]) -> str:
     delta = outcome.get("measured_delta_m", [0, 0, 0])
     end = outcome.get("eef_end", [0, 0, 0])
     ticks = outcome.get("steps", 0)
+    if kind == "goto_pixel":
+        # The model gets back its OWN pixel and the local scale (mm/px) it needs to
+        # plan the next click -- never the object's position, which is the whole
+        # point of the mode.
+        camera = str((requested or {}).get("camera", ""))
+        pixel = (requested or {}).get("pixel") or []
+        where = f"像素({pixel[0]},{pixel[1]})" if len(pixel) == 2 else ""
+        mm_px = (outcome.get("measurement") or {}).get("mm_per_px")
+        concept = {
+            "arrived": "已到位",
+            "short": "没到位（还差一点）",
+            "blocked": "中途被挡住/到不了",
+        }.get(str(outcome.get("status", "")), "结果未知")
+        scale = f"，此处 1 像素≈{mm_px}mm" if mm_px else ""
+        return f"[goto_pixel {camera} {where}] {concept}{scale}"
     if kind in ("grasp", "release"):
         # Concept primitives: the model is told WHAT happened, not how many
         # millimetres the fingers travelled. The numbers are in the structured

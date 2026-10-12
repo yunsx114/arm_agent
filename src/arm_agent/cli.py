@@ -37,6 +37,8 @@ def cmd_sim_server(args: argparse.Namespace) -> int:
         task_id=args.task_id,
         cam_size=args.cam,
         seed=args.seed,
+        observation_mode=args.observation_mode,
+        pixel_grid_px=args.pixel_grid,
     )
     if getattr(args, "tcp_port", None):
         server.serve_tcp(port=args.tcp_port, idle_exit_s=args.idle_exit)
@@ -116,12 +118,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         tool_protocol=args.tool_protocol,
         history_messages=args.history_messages,
         image_keep=args.image_keep,
+        observation_mode=args.observation_mode,
     )
     print(
         f"[run] backend={args.backend} "
         f"history_messages={harness.history_messages} "
         f"image_keep={harness.image_keep} prompt_mode={harness.prompt_mode} "
         f"tool_protocol={harness.tool_protocol} "
+        f"observation_mode={harness.observation_mode} "
         f"thinking={model.enable_thinking} max_new_tokens={model.max_new_tokens}",
         flush=True,
     )
@@ -178,6 +182,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cam", type=int, default=256)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--idle-exit", type=float, default=7200.0)
+    p.add_argument(
+        "--observation-mode",
+        default="truth",
+        choices=["truth", "pixels"],
+        help="truth = 允许按名字取仿真真值坐标；pixels = 断掉那条路，"
+        "只接受 goto_pixel，并把带网格+夹爪准线的画面送给模型",
+    )
+    p.add_argument(
+        "--pixel-grid",
+        type=int,
+        default=32,
+        help="pixels 模式下画面网格间距（像素）",
+    )
     p.add_argument(
         "--tcp-port",
         type=int,
@@ -281,6 +298,20 @@ def main(argv: list[str] | None = None) -> int:
         help="turn on the chat template's reasoning block. Off by default: it costs "
         "1-3k tokens/turn (~30-70 s here) and can eat max-new-tokens before the "
         "tool call is emitted. Raise --max-new-tokens when using it.",
+    )
+    p.add_argument(
+        "--observation-mode",
+        default="truth",
+        choices=["truth", "pixels"],
+        help="truth = 仿真提供物体坐标（A/B 基线）；pixels = 不提供任何物体坐标，"
+        "模型用带网格的画面给 goto_pixel 传像素。必须同时给 sim-server 同样的值。",
+    )
+    p.add_argument(
+        "--pixel-grid",
+        type=int,
+        default=32,
+        help="pixels 模式下画在画面上的网格间距（像素）。实测代价：4px≈2.8mm、"
+        "8px≈9.5mm、16px≈32mm（第三人称）；32px 仅用于标坐标。",
     )
     p.add_argument("--video-fps", type=int, default=2)
     p.add_argument("--video-dir", default=str(REPO / "outputs" / "videos"))

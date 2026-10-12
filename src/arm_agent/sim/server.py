@@ -37,8 +37,9 @@ from typing import Any
 import numpy as np
 
 from arm_agent import contracts as C
-from arm_agent.sim.action_adapter import ActionAdapter
+from arm_agent.sim.action_adapter import ActionAdapter, classify_descent
 from arm_agent.sim.libero_env import LiberoSim
+from arm_agent.sim.pixel_grounding import Camera, annotate_frame, ground_pixel
 
 
 class SimServer:
@@ -49,6 +50,8 @@ class SimServer:
         task_id: int = 0,
         cam_size: int = 256,
         seed: int = 0,
+        observation_mode: str = "truth",
+        pixel_grid_px: int = 32,
     ) -> None:
         self.ipc_dir = Path(ipc_dir)
         self.ipc_dir.mkdir(parents=True, exist_ok=True)
@@ -56,6 +59,19 @@ class SimServer:
         self.adapter = ActionAdapter(self.sim)
         self._images_saved = 0
         self._closing = False
+        # 档 B: which channel answers "where is the object".
+        #   truth  = the simulator's own body positions (what the harness used to
+        #            consume through `approach(<name>)`; kept as the A/B baseline)
+        #   pixels = NO object coordinates anywhere: the model names a pixel in an
+        #            annotated frame and the code grounds it (Camera + depth),
+        #            which is the only variant that could survive on real hardware.
+        # The mode is enforced here, at the single place that owns the truth, so a
+        # "pixels" run cannot silently fall back to names.
+        self.observation_mode = str(observation_mode).strip().lower()
+        if self.observation_mode not in ("truth", "pixels"):
+            raise ValueError(f"unknown observation_mode {observation_mode!r}")
+        self.pixel_grid_px = int(pixel_grid_px)
+        self.cam_size = int(cam_size)
 
     # ------------------------------------------------------------------ main
     def serve_forever(self, poll_s: float = C.IPC_POLL_INTERVAL_S, idle_exit_s: float = 3600.0) -> None:
@@ -134,6 +150,11 @@ class SimServer:
                 # Server-side primitive: servo the EEF x/y onto an object.
                 # See ActionAdapter.align_xy for why the LLM cannot do this.
                 name = str(action["name"])
+                if self.observation_mode == "pixels":
+                    raise ValueError(
+                        "observation_mode=pixels：不能按物体名对准（那需要仿真真值）。"
+                        "请改用 goto_pixel 给出像素坐标。"
+                    )
                 # NOTE (fixed): "objects" is SYNTHESISED by pack() from the raw
                 # `<name>_pos` keys; it does NOT exist in sim._obs. Reading it
                 # off _obs returned {} every time, so align/descend always
@@ -151,6 +172,11 @@ class SimServer:
                 # tick (align_xy + separate -z was measured to block at can-top
                 # height and close on air).
                 name = str(action["name"])
+                if self.observation_mode == "pixels":
+                    raise ValueError(
+                        "observation_mode=pixels：不能按物体名下降（那需要仿真真值）。"
+                        "请改用 goto_pixel 给出像素坐标。"
+                    )
                 # Same fix as the align branch: take objects from pack(), not
                 # from the raw _obs (which never has an "objects" key).
                 objects = self.sim.pack(self.sim._obs)["objects"] if self.sim._obs else {}
@@ -161,6 +187,11 @@ class SimServer:
                 z_offset_cm = float(action.get("z_offset_cm", 1.2))
                 z_target = pos[2] + z_offset_cm / 100.0
                 outcome = self.adapter.descend_to((pos[0], pos[1]), z_target)
+            elif act_kind == "goto_pixel":
+                # 档 B: the model names a PIXEL; the code grounds it with the
+                # camera + depth and servos there. No object name, no object
+                # position, no object size enters this path.
+                outcome = self.goto_pixel(action)
             else:
                 raise ValueError(f"unknown action kind: {act_kind!r}")
             obs = self.sim.pack(self.sim._obs)  # type: ignore[arg-type]
@@ -182,6 +213,64 @@ class SimServer:
             self._closing = True
             return {"closing": True}
         raise ValueError(f"unknown command: {kind!r}")
+
+    # ------------------------------------------------------------------ 档 B
+    def _camera(self, key: str) -> Camera:
+        cam_name = C.CAMERA_NAMES.get(str(key).strip().lower())
+        if cam_name is None:
+            raise ValueError(f"unknown camera {key!r}; use one of {sorted(C.CAMERA_NAMES)}")
+        # Built fresh on every call: the wrist camera's world pose changes with
+        # the arm, and `data.cam_xpos` is what carries that (see Camera.from_env).
+        return Camera.from_env(self.sim.env.env, cam_name, self.cam_size, self.cam_size)
+
+    def goto_pixel(self, action: dict[str, Any]):
+        """Ground one pixel and servo the gripper there (档 B's replacement for
+        `approach(<name>)`).
+
+        The model supplies the target pixel and the CLEARANCE (`offset_mm`, world
+        axes) -- measured reason: the back-projected point sits on the visible
+        surface, +20..+90 mm in front of an object's centre, so a hard-coded
+        clearance would be wrong for every object but one. An unusable pixel
+        (outside the frame, or depth out of range) is REJECTED WITH A REASON
+        instead of being quietly replaced by a different target.
+        """
+        camera = self._camera(action.get("camera", "agent"))
+        u = float(action["u"])
+        v = float(action["v"])
+        offset_mm = action.get("offset_mm") or [0.0, 0.0, 0.0]
+        grounding, reason = ground_pixel(self.sim.env.env, camera, u, v, offset_mm)
+        if grounding is None:
+            raise ValueError(f"goto_pixel 拒绝：{reason}")
+        target = grounding.target_xyz
+        outcome = self.adapter.descend_to((target[0], target[1]), target[2])
+        outcome.kind = "goto_pixel"
+        outcome.requested = {
+            "camera": camera.name,
+            "pixel": [grounding.pixel[0], grounding.pixel[1]],
+            "offset_mm": [round(float(x), 1) for x in offset_mm],
+            "target_xyz": [round(float(x), 4) for x in target],
+        }
+        outcome.measurement = grounding.measurement()
+        outcome.status = classify_descent(outcome)
+        outcome.note = f"goto_pixel {outcome.status}: {outcome.note}"
+        return outcome
+
+    def _annotate(self, cam_key: str, image_display: np.ndarray) -> np.ndarray:
+        """Grid + gripper crosshair, only in `pixels` mode.
+
+        The grid is what makes a pixel NAMEABLE by the model, and the crosshair is
+        where the gripper actually is (its own proprioception, projected) -- the
+        pair replaces "the tool told me where the object is".
+        """
+        if self.observation_mode != "pixels":
+            return image_display
+        try:
+            camera = self._camera(cam_key)
+            eef = self.sim._obs.get("robot0_eef_pos") if self.sim._obs else None
+            return annotate_frame(image_display, camera, eef, self.pixel_grid_px)
+        except Exception as exc:  # noqa: BLE001 - annotation must never break a step
+            print(f"[server] annotate failed: {type(exc).__name__}: {exc}", flush=True)
+            return image_display
 
     # ------------------------------------------------------------------ util
     @staticmethod
@@ -210,7 +299,8 @@ class SimServer:
         out: dict[str, str] = {}
         for cam, frame in self.sim.images().items():
             buf = io.BytesIO()
-            Image.fromarray(np.asarray(frame)[::-1]).save(buf, format="PNG")
+            display = np.asarray(frame)[::-1]
+            Image.fromarray(self._annotate(cam, display)).save(buf, format="PNG")
             out[cam] = base64.b64encode(buf.getvalue()).decode("ascii")
         return out
 
@@ -226,8 +316,10 @@ class SimServer:
             name = f"img_{cmd_id}_{cam}.png"
             # Frames are stored vertically flipped for display (LIBERO
             # convention); flip once here so every consumer sees the same
-            # display orientation the E6 probe validated.
-            Image.fromarray(np.asarray(frame)[::-1]).save(self.ipc_dir / name)
+            # display orientation the E6 probe validated. Same annotation helper
+            # as the TCP path, so the two transports cannot drift apart.
+            display = np.asarray(frame)[::-1]
+            Image.fromarray(self._annotate(cam, display)).save(self.ipc_dir / name)
             paths[cam] = name
         self._images_saved += 1
         return paths

@@ -59,6 +59,11 @@ echo "==> starting local simulator on 127.0.0.1:$TCP_PORT"
 # position could ever be correct. Being able to vary the scene is a precondition
 # for telling "the model cannot aim" apart from "the target moved".
 SCENE_ARGS=(--seed "${SEED:-0}" --task-id "${TASK_ID:-0}")
+# 档 B: `truth` lets the harness resolve object names through the simulator's own
+# positions; `pixels` removes that path entirely (goto_pixel only) and annotates
+# every frame with a coordinate grid + the gripper crosshair. The server ENFORCES
+# it, and the harness mirrors it so the advertised tool surface matches.
+SCENE_ARGS+=(--observation-mode "${OBS_MODE:-truth}" --pixel-grid "${PIXEL_GRID:-32}")
 SIM_EGL_MODE=${SIM_EGL_MODE:-hardware} \
     bash "$HERE/simenv.sh" -u -m arm_agent.cli sim-server \
     --ipc-dir "$IPC_DIR" --tcp-port "$TCP_PORT" --idle-exit 7200 \
@@ -106,6 +111,8 @@ GATE_ARGS=()
 # engine already holds ~31 GiB of VRAM -- so loading the 9B as well would OOM.
 BACKEND_ARGS=(--backend "${BACKEND:-local}")
 [ -n "${STRATA_URL:-}" ] && BACKEND_ARGS+=(--strata-url "$STRATA_URL")
+# The run side must agree with the server's observation mode (see SCENE_ARGS).
+[ -n "${OBS_MODE:-}" ] && BACKEND_ARGS+=(--observation-mode "$OBS_MODE")
 [ -n "${REASONING_EFFORT:-}" ] && BACKEND_ARGS+=(--reasoning-effort "$REASONING_EFFORT")
 [ -n "${THINKING_EFFORT:-}" ] && BACKEND_ARGS+=(--thinking-effort "$THINKING_EFFORT")
 

@@ -25,11 +25,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from arm_agent.agent.harness import Harness
 from arm_agent.sim.client import SimClient
+from arm_agent.sim.pixel_grounding import Camera
 from arm_agent.sim.server import SimServer
 
 # Scene targets for init state 0 (GT from the E1 export; the dry run is allowed
@@ -258,6 +261,171 @@ class ConceptPolicy:
         return reply
 
 
+class PixelPolicy:
+    """档 B leg: everything is aimed with PIXELS, never with an object name.
+
+    Privileged on purpose: it computes the pixels by projecting ground-truth
+    positions with the same camera maths the server uses -- that is the robot's
+    "eyes" for this test, exactly as a model would use its own. What is under test
+    is the PLUMBING (grounding, mode filtering, annotation, no GT leak into the
+    model's context), not perception quality.
+
+    It also records every model-facing text so the leg can assert that no object
+    name and no object coordinate ever reached the model -- the behavioural form
+    of the sensor-rights guard (Jev's SensorWorld does the static form by raising
+    on forbidden attribute reads).
+    """
+
+    OBJECT_TOKENS = ("alphabet_soup", "basket_1", "butter", "cream_cheese", "milk_1",
+                     "salad_dressing", "tomato_sauce")
+
+    def __init__(self, server: SimServer, build_script) -> None:
+        self.server = server
+        self.build_script = build_script
+        self.script: list[tuple[str, dict[str, Any]]] = []
+        self.sent: list[str] = []
+        self.calls: list[str] = []
+        self.frames = 0
+        self.images_annotated = False
+
+    def chat(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+        if not self.script:
+            self.script = self.build_script(self.server)
+        # Record only what comes AFTER the first assistant turn: the system prompt
+        # and the opening task message are not tool feedback, and the task string
+        # itself names the object (LIBERO: "pick up the alphabet soup ..."), so
+        # scanning them would report the GOAL as a leak.
+        if sum(1 for m in messages if m.get("role") == "assistant") > 0:
+            for message in messages:
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                parts = content if isinstance(content, list) else [content]
+                for part in parts:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        self.sent.append(str(part.get("text", "")))
+                    elif isinstance(part, dict) and part.get("type") == "image":
+                        self.frames += 1
+                        # Annotation is drawn server-side, so the only honest check
+                        # is on the PIXELS the model receives: the grid colour has to
+                        # be present in a frame that is otherwise a normal render.
+                        arr = np.asarray(part["image"]).reshape(-1, 3)
+                        grid = np.abs(arr.astype(int) - np.array([120, 130, 138])).sum(axis=1)
+                        if int((grid <= 6).sum()) > 200:
+                            self.images_annotated = True
+                    elif isinstance(part, str):
+                        self.sent.append(part)
+        turns = sum(1 for m in messages if m.get("role") == "assistant")
+        name, args = self.script[min(turns, len(self.script) - 1)]
+        self.calls.append(name)
+        return "现状：脚本化像素步骤。\n判定：按顺序执行。\n动作：调用工具。\n" + _call(name, args)
+
+
+def pixel_script(server: SimServer) -> list[tuple[str, dict[str, Any]]]:
+    """The pixel-only version of the task, built from where the objects are."""
+    env = server.sim.env.env
+    objects = server.sim.pack(server.sim._obs)["objects"]
+    agent = Camera.from_env(env, "agentview", 256, 256)
+
+    def px(name: str) -> tuple[int, int]:
+        u, v, _ = agent.project(np.asarray(objects[name], dtype=float))
+        return int(round(u)), int(round(v))
+
+    can_u, can_v = px("alphabet_soup_1")
+    basket_u, basket_v = px("basket_1")
+    return [
+        ("release", {}),
+        # `approach` must be refused in this mode. Asked EARLY on purpose: the
+        # refusal costs one protocol retry and executes nothing, so the task can
+        # still be finished afterwards (asked at the end it never runs, because
+        # the episode stops the moment the environment reports success).
+        ("approach", {"target": "basket", "height_offset_cm": "25"}),
+        # hover 12 cm above the can's visible surface, then 1.2 cm above it, i.e.
+        # the two-stage aim the pixel granularity forces (3.7 mm/px up here).
+        ("goto_pixel", {"camera": "agent", "u": can_u, "v": can_v,
+                         "offset_mm": [0, 0, 120]}),
+        ("goto_pixel", {"camera": "agent", "u": can_u, "v": can_v,
+                         "offset_mm": [0, 0, 12]}),
+        ("grasp", {}),
+        ("move", {"direction": "+z", "distance_cm": "15"}),
+        ("move", {"direction": "+z", "distance_cm": "10"}),
+        # 19 cm above the basket's visible floor: the payload's bottom then sits
+        # ~14 cm above the rim (rim 0.1513; payload bottom = EEF - 0.050).
+        ("goto_pixel", {"camera": "agent", "u": basket_u, "v": basket_v,
+                         "offset_mm": [0, 0, 190]}),
+        ("release", {}),
+    ]
+
+
+def pixel_leg(ipc_dir: Path) -> bool:
+    server = SimServer(
+        ipc_dir=ipc_dir,
+        suite_name="libero_object",
+        task_id=0,
+        cam_size=256,
+        observation_mode="pixels",
+        pixel_grid_px=32,
+    )
+    thread = threading.Thread(target=server.serve_forever, kwargs={"idle_exit_s": 120}, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    client = SimClient(ipc_dir)
+    policy = PixelPolicy(server=server, build_script=pixel_script)
+    harness = Harness(
+        client=client,
+        model=policy,
+        workspace=REPO,
+        max_turns=24,
+        tool_protocol="v2",
+        log=False,
+        observation_mode="pixels",
+    )
+    advertised = [s["function"]["name"] for s in harness.tool_schemas]
+    result = harness.run_episode(init_state_idx=0, episode_id=997)
+    transcript = json.loads(Path(result.transcript_path).read_text())["transcript"]
+    client.close()
+    time.sleep(0.3)
+
+    texts = [e["result"] for e in transcript if e.get("result")]
+    pixel_results = [t for t in texts if t.startswith("[goto_pixel")]
+    # Only TOOL RESULTS and state lines are scanned. The initial user message
+    # legitimately quotes the task (LIBERO's own task string is "pick up the
+    # alphabet soup and place it in the basket"), so a bare name search over the
+    # whole context would "find" the goal statement and cry wolf.
+    toolish = [t for t in policy.sent if t.startswith("[") or "爪上：" in t]
+    joined = "\n".join(toolish)
+    leaked_names = [tok for tok in PixelPolicy.OBJECT_TOKENS if tok in joined]
+    leaked_coords = re.findall(r"\(\s*[-+]?\d\.\d{3}\s*,\s*[-+]?\d\.\d{3}\s*,\s*[-+]?\d\.\d{3}\)", joined)
+    checks = {
+        "工具面里没有 approach": "approach" not in advertised and "goto_pixel" in advertised,
+        "goto_pixel 走了多次且给出了概念": len(pixel_results) >= 3
+        and all("已到位" in t or "没到位" in t or "被挡住" in t for t in pixel_results),
+        "工具结果/状态行里没有物体名": not leaked_names,
+        "工具结果里没有物体坐标（只有爪心）": not leaked_coords,
+        "approach 在 pixels 模式被拒且给了替代": any(
+            e.get("protocol_retry") for e in transcript
+        ),
+        "任务由 goto_pixel 完成": bool(result.success),
+        "画面带网格标注": bool(policy.images_annotated),
+    }
+    for label, passed in checks.items():
+        print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
+    print(f"  像素腿：success={result.success} source={result.success_source} "
+          f"turns={result.turns} retries={result.protocol_retries} error={result.error!r}")
+    print(f"  脚本调用: {policy.calls}")
+    if pixel_results:
+        print(f"  示例：{pixel_results[0]} / {pixel_results[-1]}")
+    if leaked_names:
+        print(f"  泄漏的物体名: {leaked_names}")
+        for text in toolish:
+            if any(tok in text for tok in leaked_names):
+                print(f"    命中：{text[:160]!r}")
+                break
+    if leaked_coords:
+        print(f"  泄漏的坐标: {leaked_coords[:4]}")
+    return all(checks.values())
+
+
 def concept_leg(ipc_dir: Path) -> bool:
     server = SimServer(ipc_dir=ipc_dir, suite_name="libero_object", task_id=0, cam_size=256)
     thread = threading.Thread(target=server.serve_forever, kwargs={"idle_exit_s": 120}, daemon=True)
@@ -301,7 +469,7 @@ def concept_leg(ipc_dir: Path) -> bool:
     for label, passed in checks.items():
         print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
     print(f"  概念腿：success={result.success} source={result.success_source} "
-          f"turns={result.turns} retries={result.protocol_retries}")
+          f"turns={result.turns} retries={result.protocol_retries} error={result.error!r}")
     if grasp_results:
         print(f"  示例：{grasp_results[0]}")
     if release_results:
@@ -362,6 +530,8 @@ def main() -> int:
     ok = result.tool_calls > 10 and result.protocol_retries == 0
     print("\n=== 档 A 概念腿（v2 grasp/release，无 LLM）===")
     ok = concept_leg(REPO / "runtime" / "ipc_dryrun2") and ok
+    print("\n=== 档 B 像素腿（pixels 模式 goto_pixel，无 LLM）===")
+    ok = pixel_leg(REPO / "runtime" / "ipc_dryrun3") and ok
     print("PLUMBING OK" if ok else "PLUMBING PROBLEM")
     return 0 if ok else 1
 

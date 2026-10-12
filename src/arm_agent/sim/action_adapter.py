@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -176,6 +177,25 @@ class ActionOutcome:
             "measurement": self.measurement,
             "held": self.held,
         }
+
+
+def classify_descent(outcome: ActionOutcome) -> str:
+    """One vocabulary for "did the descent get there": arrived / short / blocked.
+
+    `descend_to` writes the note (`xy err .. mm, z err .. mm`, or `stuck at (..)`)
+    and this is the ONLY place that interprets it. Two consumers read it -- the
+    legacy `approach` text path and the 档 B `goto_pixel` path -- and the P0f bug
+    (a key from one vocabulary compared against a value from another, with the
+    warning firing 0 times across two runs) is exactly what happens when two
+    places classify the same note independently.
+    """
+    note = str(outcome.note or "")
+    if "stuck" in note:
+        return "blocked"
+    match = re.search(r"z err ([0-9.]+) mm", note)
+    if match is None:
+        return "arrived" if outcome.steps else "short"
+    return "arrived" if float(match.group(1)) <= ActionAdapter.DESCEND_Z_TOL_M * 1000.0 else "short"
 
 
 class ActionAdapter:

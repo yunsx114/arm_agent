@@ -47,11 +47,15 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
     return calls
 
 
-def validate_calls(calls: list[ToolCall], *, legacy: bool = False) -> list[str]:
+def validate_calls(
+    calls: list[ToolCall], *, legacy: bool = False, observation_mode: str = "truth"
+) -> list[str]:
     """Validate call count and arguments before dispatch."""
     if len(calls) != 1:
         return [f"expected_exactly_one_call:got_{len(calls)}"]
-    return validate_tool_call(calls[0].name, calls[0].args, legacy=legacy)
+    return validate_tool_call(
+        calls[0].name, calls[0].args, legacy=legacy, observation_mode=observation_mode
+    )
 
 
 def truncate_to_first_call(text: str) -> str:

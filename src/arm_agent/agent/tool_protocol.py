@@ -9,7 +9,17 @@ from __future__ import annotations
 
 from typing import Any
 
-CANONICAL_TOOLS = ("observe", "approach", "move", "rotate", "gripper", "grasp", "release", "verify")
+CANONICAL_TOOLS = (
+    "observe", "approach", "goto_pixel", "move", "rotate", "gripper", "grasp", "release", "verify",
+)
+# Tool surfaces that are legal in ONE observation mode only (档 B). The mode is
+# owned by the simulator, so the harness mirrors it here purely to keep the
+# advertised schema honest: in `pixels` mode `approach` would have to read the
+# simulator's own object positions, which is exactly what that mode removes.
+MODE_ONLY_TOOLS: dict[str, frozenset[str]] = {
+    "pixels": frozenset({"approach"}),
+}
+# Registered here but blocked under v2 by UNREGISTERED_TOOLS below.
 # Temporarily UNREGISTERED surfaces: the code path stays (dispatch, aliases,
 # validation) but the model is neither shown the tool nor allowed to call it.
 #
@@ -47,6 +57,10 @@ ALIASES = {
 REQUIRED = {
     "observe": (),
     "approach": ("target",),
+    # `goto_pixel` requires the pixel and nothing else: the clearance offset is
+    # optional because 0 is a legitimate request ("ground this pixel and go")
+    # and the camera defaults to the third-person view.
+    "goto_pixel": ("u", "v"),
     "move": ("direction", "distance_cm"),
     "rotate": ("axis", "angle_deg"),
     "gripper": ("action",),
@@ -64,6 +78,7 @@ REQUIRED = {
 
 ENUMS = {
     "observe": {"camera": {"agent", "wrist"}},
+    "goto_pixel": {"camera": {"agent", "wrist"}},
     "move": {"direction": {"+x", "-x", "+y", "-y", "+z", "-z"}},
     "rotate": {"axis": {"yaw", "pitch", "roll"}},
     "gripper": {"action": {"open", "close"}},
@@ -75,11 +90,18 @@ def canonical_name(name: str) -> str:
     return ALIASES.get(name, name)
 
 
-def validate_tool_call(name: str, args: dict[str, str], *, legacy: bool = False) -> list[str]:
+def validate_tool_call(
+    name: str, args: dict[str, str], *, legacy: bool = False, observation_mode: str = "truth"
+) -> list[str]:
     """Return explicit protocol errors; do not execute invalid calls."""
     allowed = LEGACY_TOOLS if legacy else CANONICAL_TOOLS
     if name not in allowed:
         return [f"unknown_tool:{name}"]
+    # Mode-excluded tools are rejected HERE rather than silently dispatched, so a
+    # `pixels` run cannot answer a question it claims not to have the data for.
+    blocked_in_mode = MODE_ONLY_TOOLS.get(str(observation_mode).strip().lower(), frozenset())
+    if not legacy and (canonical_name(name) in blocked_in_mode or name in blocked_in_mode):
+        return [f"mode_blocked_tool:{name}"]
     # Scoped to the v2 surface on purpose: the legacy surface is the documented
     # A/B path (and the no-GPU `probe_harness_dryrun.py` regression), which must
     # keep working while this ablation is on. The ablation itself cannot leak
