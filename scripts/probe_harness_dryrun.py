@@ -906,6 +906,15 @@ def ladder_leg(ipc_dir: Path) -> bool:
         "move 的 schema 只有 size（没有 distance_cm）": advertised_props == ["direction", "size"],
         "档位值写进了参数描述": "far=10厘米" in move_schema["parameters"]["properties"]["size"]["description"],
         "提示词里有档位升降规则": "降一档" in policy.system and "升一档" in policy.system,
+        # The step rule must be SWAPPED, not appended to: raw's recipe says "一次只走一小段
+        # （1~5cm）", which the ladder cannot express (its steps are 1cm and 10cm), and a
+        # leftover "1~5cm" is what made the model reach for `far` on 4cm errors (MEASURED,
+        # 2.46x overshoot six times in a row).
+        "raw 的 1~5cm 配方被换成了档位换算表": (
+            "一次只走一小段（1~5cm）" not in policy.system
+            and "还差 3~25 像素" in policy.system
+            and "还差 25 像素以上" in policy.system
+        ),
         "仍然传 distance_cm 的调用被拒（不静默换算）": "ladder_rejects" in joined,
         "乱编的档位名被拒": "invalid_enum" in joined and "size=huge" in joined,
         "被拒的调用没有动机械爪（标定就是头三次 move）": [

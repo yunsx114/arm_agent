@@ -110,9 +110,37 @@ def claimed_error_cm(text: str) -> float | None:
     return px * GLOBAL_MM_PER_PX / 10.0
 
 
+def effective_rung(call: dict) -> str | None:
+    """The magnitude bucket of a move.
+
+    With the ladder on this is literally what the model asked for. Without it (`raw`
+    baseline episodes) the model picked a free distance, so it is binned on the same
+    10x scale the ladder uses: <= 0.5cm behaves like `fine`, <= 5cm like `near`, else
+    `far`. That is an approximation and is only for putting the two arms on one axis --
+    the baseline was free to write 0.4 or 4.9, and this rounds both to `near`.
+    """
+    if call.get("rung") in RUNG_ORDER:
+        return call["rung"]
+    try:
+        cm = abs(float(call.get("distance_cm")))
+    except (TypeError, ValueError):
+        return None
+    if cm <= 0.5:
+        return "fine"
+    if cm <= 5.0:
+        return "near"
+    return "far"
+
+
 def summarise(path: Path, verbose: bool = False) -> dict:
     calls = calls_in(path)
-    moves = [c for c in calls if c["tool"] == "move" and c["rung"] in RUNG_ORDER]
+    moves = []
+    for c in calls:
+        if c["tool"] != "move":
+            continue
+        rung = effective_rung(c)
+        if rung:
+            moves.append({**c, "rung": rung})
     counts = collections.Counter(c["rung"] for c in moves)
 
     # Reversals and the rung chosen right after one.

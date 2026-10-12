@@ -349,7 +349,7 @@ class Harness:
                 )
 
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": get_system_prompt(self.prompt_mode, self.observation_mode) + self.shared_skill + mode_appendix(self.observation_mode) + ladder_appendix(self.move_ladder) + self._skills_index()},
+                {"role": "system", "content": get_system_prompt(self.prompt_mode, self.observation_mode, self.move_ladder) + self.shared_skill + mode_appendix(self.observation_mode) + ladder_appendix(self.move_ladder) + self._skills_index()},
                 {
                     "role": "user",
                     "content": [

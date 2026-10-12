@@ -660,19 +660,49 @@ PROMPT_MODES = {
 }
 
 
-def get_system_prompt(mode: str = "full", observation_mode: str = "truth") -> str:
+def get_system_prompt(
+    mode: str = "full", observation_mode: str = "truth", move_ladder: bool = False
+) -> str:
     """Pick the system prompt. Unknown modes fall back to `full`.
 
     档 B: `pixels` mode gets its OWN v2 prompt instead of the name-based one, because
     the first real pixel run showed the model following the old recipe (blind
     `move -z` + repeated `grasp`, never the wrist view) while the pixel rules sat in
     an appendix underneath that recipe -- and a prompt IS a recipe.
+
+    档 D: the same lesson applied to the ladder. `raw`'s recipe says "一次只走一小段
+    （1~5cm）", which the ladder CANNOT express -- the available steps are 1cm and 10cm --
+    so leaving it in place left the model choosing `far` to satisfy "at least the 4cm it
+    says it needs" (MEASURED: 4.07cm error -> far, 2.46x overshoot, six times in a row).
+    The step rule is therefore SWAPPED, not appended to.
     """
-    if str(observation_mode).strip().lower() == "pixels" and str(mode).strip().lower() == "v2":
+    mode_l = str(mode).strip().lower()
+    mode_o = str(observation_mode).strip().lower()
+    if mode_o == "pixels" and mode_l == "v2":
         return SYSTEM_PROMPT_V2_PIXELS
-    if str(observation_mode).strip().lower() == "raw" and str(mode).strip().lower() == "v2":
-        return SYSTEM_PROMPT_V2_RAW
-    return PROMPT_MODES.get(str(mode).strip().lower(), SYSTEM_PROMPT)
+    if mode_o == "raw" and mode_l == "v2":
+        return raw_prompt(move_ladder)
+    return PROMPT_MODES.get(mode_l, SYSTEM_PROMPT)
+
+
+# The two sentences in the raw prompt that the ladder must REPLACE. Kept as their own
+# constants so the swap is a one-line lookup and a grep for either wording finds both
+# the rule and its ladder-aware version.
+RAW_NO_ARITHMETIC = "全靠你自己换算"
+RAW_NO_ARITHMETIC_LADDER = (
+    "全靠你自己判断；**但距离不用你算——只有 far(10cm) / near(1cm) / fine(1mm) 三档**"
+)
+RAW_STEP_RULE = "**一次只走一小段（1~5cm），然后重新看**。"
+RAW_STEP_RULE_LADDER = """**一次只走一档，然后重新看**。档位由"你还差几个像素"决定（全局图 1 像素 ≈ 3~4mm）：
+
+| 你自己估计还差的像素 | 该用哪一档 |
+| --- | --- |
+| 还差 25 像素以上（≥ 10cm） | `far`（10cm）——目标还很远、或者要跨过整张台面时 |
+| 还差 3~25 像素（1~10cm） | `near`（1cm），**连走几步**，每步都重新看图 |
+| 还差不到 3 像素（< 1cm） | `fine`（1mm）微调 |
+
+**实测教训：自称"还差 4cm"却发 `far`，一步就走成 10cm，于是来回摆 6 次都没停。**
+差几厘米就用 `near` 走几步；走了之后发现过头了就**降一档**，发现几乎没动就**升一档**。"""
 
 
 # Mode-specific appendix. It exists because the SHARED skill file
@@ -751,6 +781,17 @@ SYSTEM_PROMPT_V2_RAW = """你是机械臂任务决策核心。目标是完成当
 
 坐标系：世界坐标中 +z 向上，位置单位米，move 距离单位厘米。
 """
+
+
+def raw_prompt(move_ladder: bool = False) -> str:
+    """The `raw` system prompt, with the step rule matching the magnitude menu."""
+    if not move_ladder:
+        return SYSTEM_PROMPT_V2_RAW
+    return (
+        SYSTEM_PROMPT_V2_RAW
+        .replace(RAW_NO_ARITHMETIC, RAW_NO_ARITHMETIC_LADDER)
+        .replace(RAW_STEP_RULE, RAW_STEP_RULE_LADDER)
+    )
 
 
 def get_tool_schemas(
