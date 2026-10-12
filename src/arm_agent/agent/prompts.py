@@ -265,20 +265,37 @@ TOOL_SCHEMAS_V2: list[dict[str, Any]] = [
         ),
         "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {
-        "name": "goto_pixel",
+        "name": "aim",
         "description": (
-            "把一个画面像素当成目标：代码用相机标定 + 深度把该像素反投影成世界点，"
-            "再加上你给的 clearance（offset_mm，世界系 xyz 毫米），然后把夹爪伺服到那里。"
-            "不再需要物体名或物体坐标。像素用带网格的画面读（例：u=128, v=96）。"
-            "返回概念：arrived / short / blocked（是否到位）。"
+            "把一个像素画成红圈，**不移动机械臂**（干跑：不动手、不改物理状态）。"
+            "返回同一张带网格的画面：红圈画在你给的那个像素上，青色十字仍然是夹爪自己。"
+            "用它先确认「我说的就是这个像素」：看红圈与目标、以及红圈与十字的差距，"
+            "不满意就换个像素再 aim。画面外或读不到距离的像素会被拒绝并说明原因。"
+            "相机可选 agent 或 wrist（腕部更细，但腕部只能看、不能当 target 的目标）。"
         ),
         "parameters": {"type": "object", "properties": {
             "camera": {"type": "string", "enum": ["agent", "wrist"],
-                       "description": "agent=全局第三人称（视野宽、精度约 3~4mm/像素）；wrist=腕部朝下（只有靠近时才看得见目标，精度约 1mm/像素）"},
+                       "description": "agent=全局第三人称（约 3~4mm/像素）；wrist=夹爪上的腕部相机（约 1mm/像素，只能看不能动）"},
+            "u": {"type": "number", "description": "像素列，画面左上为 0"},
+            "v": {"type": "number", "description": "像素行，画面左上为 0"},
+        }, "required": ["u", "v"]}}},
+    {"type": "function", "function": {
+        "name": "target",
+        "description": (
+            "把像素当成**移动目标**：代码用相机标定 + 深度把该像素反投影成世界点，"
+            "再加上你给的 clearance（offset_mm，世界系 xyz 毫米），然后把夹爪伺服过去。"
+            "不再需要物体名或物体坐标。它只走一个**短动作块**（最多 8 个修正步，想更谨慎就传 1~3），"
+            "走完就返回：没到位就用同一像素再 target 一次（新画面里会用十字告诉你爪子到哪了）。"
+            "返回概念：arrived（到位）/ short（没到位）/ blocked（被挡住）。"
+        ),
+        "parameters": {"type": "object", "properties": {
+            "camera": {"type": "string", "enum": ["agent"],
+                       "description": "只能用 agent（全局第三人称）。腕部相机装在夹爪上，固定像素=相对手恒定的点，会随夹爪一起移动，无法作为移动目标"},
             "u": {"type": "number", "description": "像素列，画面左上为 0"},
             "v": {"type": "number", "description": "像素行，画面左上为 0"},
             "offset_mm": {"type": "array", "items": {"type": "number"},
                           "description": "在反投影像素点上再加的位移（世界系 xyz，毫米）。只想悬停在表面上方就加大 z（例：[0,0,120]）。默认 [0,0,0]"},
+            "max_steps": {"type": "number", "description": "本调用最多走几个修正步，1~8，默认 8：调小就是更频繁地重新看图"},
         }, "required": ["u", "v"]}}},
     {"type": "function", "function": {
         "name": "verify",
@@ -454,22 +471,94 @@ SYSTEM_PROMPT_V2 = """你是机械臂任务决策核心。目标是完成当前�
 """
 
 
-# Appended to the system prompt ONLY in `pixels` mode (档 B). It has to override
-# rather than extend: both the v2 prompt and skills/scene_tools.md are written
-# around `approach(<名字>)`, which that mode removes.
+# Short note appended in `pixels` mode, ON TOP of SYSTEM_PROMPT_V2_PIXELS. It exists
+# only because the shared skill file (`skills/scene_tools.md`) is still written
+# around `approach(<名字>)`; the pixel workflow itself lives in the dedicated
+# system prompt, not here.
 PIXELS_APPENDIX = """
 
-## 本回合的观测模式：pixels（无物体坐标）
-- **没有任何物体坐标，也没有物体名可以调用**：`approach(<名字>)` 在本模式下不存在。
-  取而代之的是 `goto_pixel`：你在带网格的画面上指定一个像素，代码用相机标定 + 深度把
-  它反投影成世界点，再加上你给的 clearance，然后把夹爪伺服过去。
-- 画面上的青色十字是**夹爪自己**当前所在的像素（不是目标）：看你在目标的哪一侧。
-- 像素精度：第三人称约 3~4 mm/像素，腕部近距约 1 mm/像素。需要毫米级对准时，先粗对准
-  第三人称下的像素，再靠近后用腕部画面里的像素做第二次对准（腕部相机朝下，看得见夹爪
-  正下方的东西）。
-- 反投影落点在物体**可见表面**（比物体中心近 2~9cm，取决于形状）。因此 clearance 由你
-  给：只想悬在表面上方就传 `offset_mm: [0,0,120]`（向，上 12cm）。
-- 下面提到的 `approach(...)` 一律读作 `goto_pixel(...)`：先用像素到达目标附近，再下压/下降。
+## 附：本模式的词汇换算
+- 随附的场景事实里提到的 `approach(<名字>, N)` 在本模式下**不存在**；请一律用像素表达同一个
+  意图：先 `aim(camera, u, v)` 确认（只画红圈、不动手），再 `target(camera, u, v, offset_mm)`
+  移过去（一个短动作块）。
+- 提到的「指宽」也不再给你了：夹爪状态只用概念告诉你（`grasp` → grasped/empty/slipped）。
+"""
+
+
+# `pixels` mode's own system prompt (档 B). It REPLACES the v2 prompt rather than
+# extending it, and the first real pixel run is the reason: with the pixel rules
+# appended below a prompt whose task structure says `approach(<名字>)`, the model
+# followed the OLD recipe -- 60 turns of `move -z` blind pressing and 10 `grasp`
+# pokes, 19/19 `goto_pixel` calls from the third-person view, not one from the
+# wrist view that the appendix named as the millimetre stage. A prompt is a
+# recipe; an appendix to a contradicting recipe is not read.
+SYSTEM_PROMPT_V2_PIXELS = """你是机械臂任务决策核心。目标是完成当前任务。
+
+每次只调用一个工具。工具结果是环境测量，不是行动建议；不要假设动作一定完成。
+如果动作被拒绝或只完成一部分，根据返回的状态和事件自行选择下一步。
+不要发明工具、参数或并行调用。verify 的成功与否只由环境验证。
+
+**本回合没有任何物体坐标**：没有定位工具，也不能按物体名对准。你只能*看*画面，
+再用像素说话。像素工具有两个，**先 aim 确认，再 target 移动**：
+- `aim(camera, u, v)`：把**红圈**画在你说的像素上，**不动手**。用来先确认"我指的就是这个"。
+- `target(camera, u, v, offset_mm, max_steps)`：真的把夹爪移过去（一个**短动作块**，最多 8 个修正步，走完就返回）。
+
+**你自己的绝对像素读数有系统性偏差**（实测偏 30~50 像素 = 10~13cm，反复读也一样），
+所以**不要指望一次算准**：aim 之后看红圈离目标差几个格子，就修几个格子，再 aim；
+通常 1~3 次就能把红圈放到目标上，满意了再 target。
+
+输出格式：每次回复严格按下面三段写，三段都要有，标题照抄：
+现状：（画面里的事实：青色十字是夹爪自己、红圈是你说的那个点；目标在它们的哪个方向、隔几个细格；爪上有没有东西）
+判定：（红圈与目标差多少、这个像素能不能用、clearance 够不够；是否已经可以 target）
+动作：（下一步调用哪个工具、参数是多少；必须与上面的判定一致）
+三段写完后，紧接写出完整的工具调用。除这三段外不要写任何其他内容。
+
+任务结构（括号内是这一步用的工具）：
+张开夹爪（release）→ aim 目标像素并调准（aim ×1~3）→ 用像素悬停到它上方
+（target，offset z 给大一点）→ **看腕部画面，用 move 沿世界轴分 1~3 小步把目标挪到十字上**
+（move）→ 合上夹爪（grasp）→ 抬高（move +z）→ aim+target 到容器开口上方
+→ 张开夹爪（release）→ 请求验证（verify）
+
+## 怎么读画面（这是本模式唯一的位置来源）
+- 画面有两种线：**细线每 8 像素一条**（用来数格子），**带数字的粗线每 32 像素一条**
+  （用来定位）。例：目标在竖线 64 右边 2 个细格、横线 128 上方 1 个细格 ⇒ u≈80, v≈120。
+- **青色十字 = 夹爪自己的像素位置**；**红圈 = 你 aim 的那个像素**。
+  红圈和十字重合，说明你指的正是爪子现在的位置；不重合，就把红圈挪到目标上再 target。
+- 第三人称精度实测 **1 像素 ≈ 3.7mm**（偏 5 个像素就是 1.9cm）。所以它只够做**粗对准**。
+- **腕部相机只能用来"看"**（`aim(camera=wrist)` 可以，`target(camera=wrist)` 会被拒绝）：
+  它装在夹爪上，固定像素=相对手恒定的点，会跟着夹爪一起移动，永远追不上。它只能**判断方向**，
+  执行靠 move。腕部画面实测（距目标 12cm 时，2cm 位移）：**+y → 向左 34 像素，
+  -y → 向右 34 像素；+x → 向上 34 像素，-x → 向下 33 像素；+z（抬高）→ 向下 25 像素**。
+  ⇒ 看目标在十字的哪一侧，就沿那个轴走 2~5cm，然后再看一眼；**不要一次算准**
+  （每像素多少毫米随深度变），走一步看一步通常 1~3 步就到位。
+- `offset_mm` 是"在反投影落点上再加的世界系位移（毫米）"。**落点在你看到的那层表面**，
+  所以想悬在它上方就传 `[0,0,150]`（上方 15cm）。
+  **两段式**：先用大 offset 悬停到上方，再用上面的腕部判断 + move 小步逼近。
+  只给一次大 offset 然后改用 `move -z` 硬压是错的：你看不见爪子下方，盲压会把物体推走。
+- `max_steps` 是"这次最多走几个修正步"（1~8，默认 8）。返回 `short` 表示这一小段走完还没到：
+  **用同一个像素再 target 一次**即可，不是失败，也不是要换目标。
+
+## 事实（都是测量的，不是建议）
+- `grasp` 返回 `empty`（没夹到）时，说明两指之间是空的：**回到上一段用像素重新对准**，
+  不要继续 `move -z` 盲压，也不要在原地反复 grasp。
+- `grasp` 返回 `grasped` 之后才抬高；抬高用 `move +z`（单次上限 15cm，需要更高就再走一次）。
+  横移前爪心要 ≥0.22：**手里物体底部在爪心下方约 5cm，容器口沿约 z=0.151**。
+- `release` 返回后「爪上：空」是预期的。只有在你没有 `release` 的情况下看到「爪上：空」，
+  才是运输中掉了。
+- `verify` 说没放好、而你已经松手：物体常常是先骑在容器口沿上再滑进去。用同一条像素
+  把 offset 调成 145mm 左右再压一下（爪心 0.145，仍在口沿 0.151 之上），然后 verify；
+  一旦通过就**立刻停手**。不要沉到口沿以下，也不要用像素去"找"已经进容器的物体。
+- 结果里写「未到达 / 卡住 / 没到位」都表示那个动作没有达成；以实测数字为准。
+
+坐标系：世界坐标中 +z 向上，位置单位米，move 距离单位厘米，offset_mm 单位毫米。
+工具职责：
+- aim：把像素画成红圈，**不移动机械臂**；用来确认自己指对了（可用 agent 或 wrist 画面）。
+- target：把像素（+ 你给的 offset）作为目标伺服过去，只走一个短动作块；只能用 agent 画面。
+- move：执行明确的相对平移（抬高/降低只能用它）。
+- rotate：执行明确的姿态旋转。
+- grasp：合上夹爪抓取，只回报概念（grasped / empty / slipped）。
+- release：张开夹爪（空手时就是复位/张开），只回报概念（released / still_carrying）。
+- verify：让环境检查任务是否完成。
 """
 
 
@@ -480,8 +569,16 @@ PROMPT_MODES = {
 }
 
 
-def get_system_prompt(mode: str = "full") -> str:
-    """Pick the system prompt. Unknown modes fall back to `full`."""
+def get_system_prompt(mode: str = "full", observation_mode: str = "truth") -> str:
+    """Pick the system prompt. Unknown modes fall back to `full`.
+
+    档 B: `pixels` mode gets its OWN v2 prompt instead of the name-based one, because
+    the first real pixel run showed the model following the old recipe (blind
+    `move -z` + repeated `grasp`, never the wrist view) while the pixel rules sat in
+    an appendix underneath that recipe -- and a prompt IS a recipe.
+    """
+    if str(observation_mode).strip().lower() == "pixels" and str(mode).strip().lower() == "v2":
+        return SYSTEM_PROMPT_V2_PIXELS
     return PROMPT_MODES.get(str(mode).strip().lower(), SYSTEM_PROMPT)
 
 

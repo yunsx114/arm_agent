@@ -10,14 +10,20 @@ from __future__ import annotations
 from typing import Any
 
 CANONICAL_TOOLS = (
-    "observe", "approach", "goto_pixel", "move", "rotate", "gripper", "grasp", "release", "verify",
+    "observe", "aim", "target", "approach", "move", "rotate", "gripper", "grasp", "release", "verify",
 )
 # Tool surfaces that are legal in ONE observation mode only (档 B). The mode is
 # owned by the simulator, so the harness mirrors it here purely to keep the
 # advertised schema honest: in `pixels` mode `approach` would have to read the
 # simulator's own object positions, which is exactly what that mode removes.
+#
+# `aim`/`target` are blocked in `truth` mode for the same class of reason, from the
+# other side: they are the pixel interface, and truth mode still has
+# `approach(<name>)`. The truth surface stays byte-identical to the one the 16-episode
+# A/B baseline ran on, so adding the pixel tools cannot move that baseline.
 MODE_ONLY_TOOLS: dict[str, frozenset[str]] = {
     "pixels": frozenset({"approach"}),
+    "truth": frozenset({"aim", "target"}),
 }
 # Registered here but blocked under v2 by UNREGISTERED_TOOLS below.
 # Temporarily UNREGISTERED surfaces: the code path stays (dispatch, aliases,
@@ -52,15 +58,22 @@ ALIASES = {
     "align_xy": "approach",
     "set_gripper": "gripper",
     "declare_done": "verify",
+    # 档 B v2 renamed `goto_pixel` to `target` (it now moves as a short block). The
+    # old name stays valid so a model with the old name in its history -- and every
+    # transcript, probe and skill file written before today -- still routes here
+    # instead of failing as an unknown tool.
+    "goto_pixel": "target",
 }
 
 REQUIRED = {
     "observe": (),
     "approach": ("target",),
-    # `goto_pixel` requires the pixel and nothing else: the clearance offset is
-    # optional because 0 is a legitimate request ("ground this pixel and go")
-    # and the camera defaults to the third-person view.
-    "goto_pixel": ("u", "v"),
+    # `aim` and `target` require the pixel and nothing else: the clearance offset is
+    # optional because 0 is a legitimate request ("ground this pixel and go"), the
+    # camera defaults to the third-person view, and the block length defaults to the
+    # short-block constant (see action_adapter.SHORT_BLOCK_ITERS).
+    "aim": ("u", "v"),
+    "target": ("u", "v"),
     "move": ("direction", "distance_cm"),
     "rotate": ("axis", "angle_deg"),
     "gripper": ("action",),
@@ -78,7 +91,14 @@ REQUIRED = {
 
 ENUMS = {
     "observe": {"camera": {"agent", "wrist"}},
-    "goto_pixel": {"camera": {"agent", "wrist"}},
+    # `aim` may look through EITHER camera: looking does not move the arm, and the
+    # wrist view is the fine-grained one (measured 1.10 mm/px at 12 cm vs 3.0-4.0
+    # from the third-person view). `target` is agent-only because an eye-in-hand
+    # pixel is a DEGENERATE servo target (measured: a fixed wrist pixel is a fixed
+    # point in the hand frame, so it travels with the gripper and can never be
+    # reached).
+    "aim": {"camera": {"agent", "wrist"}},
+    "target": {"camera": {"agent"}},
     "move": {"direction": {"+x", "-x", "+y", "-y", "+z", "-z"}},
     "rotate": {"axis": {"yaw", "pitch", "roll"}},
     "gripper": {"action": {"open", "close"}},
@@ -138,6 +158,16 @@ def validate_tool_call(
                 errors.append("out_of_range:angle_deg[-90,90]")
         except ValueError:
             errors.append("invalid_number:angle_deg")
+    if canonical == "target" and args.get("max_steps"):
+        # Bounded exactly like Jev's `max_motor_steps` (1..8): the block length is a
+        # knob on how often the model must look again, not a way to buy a long blind
+        # run -- 36 and 19 turns of blind motion were measured with an unbounded one.
+        try:
+            steps = int(float(args["max_steps"]))
+            if not 1 <= steps <= 8:
+                errors.append("out_of_range:max_steps[1,8]")
+        except (TypeError, ValueError):
+            errors.append("invalid_number:max_steps")
     return errors
 
 

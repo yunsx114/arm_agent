@@ -176,6 +176,10 @@ class Harness:
         # that has already produced one false alarm that cost a whole episode
         # (a deliberate `open` reported as "物体掉了", 2026-10-10).
         self._grasped = False
+        # The last pixel the model asked to `aim` at, with the camera it asked on.
+        # Used for one thing only: telling it that an identical aim cannot produce
+        # new evidence. Cleared by every tool that can move the arm or the scene.
+        self._last_aim: tuple[str, int, int] | None = None
         # Which container the executor last ran `approach` on. Feeds the
         # arithmetic instrument below (log only, never blocks).
         self._last_approach_target = ""
@@ -306,7 +310,7 @@ class Harness:
                 )
 
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": get_system_prompt(self.prompt_mode) + self.shared_skill + pixels_appendix(self.observation_mode) + self._skills_index()},
+                {"role": "system", "content": get_system_prompt(self.prompt_mode, self.observation_mode) + self.shared_skill + pixels_appendix(self.observation_mode) + self._skills_index()},
                 {
                     "role": "user",
                     "content": [
@@ -377,8 +381,17 @@ class Harness:
                     )
                     if any(str(e).startswith("mode_blocked_tool:") for e in call_errors):
                         note += (
-                            " 本观测模式里没有物体坐标可用：请改用 goto_pixel 给像素坐标"
+                            " 本观测模式里没有物体坐标可用：请改用 aim 确认像素、再用 target 移动"
                             "（在带网格的面上读，例：u=128, v=96），或用 move 沿世界轴小步移动。"
+                        )
+                    if any(str(e).startswith("invalid_enum:camera") for e in call_errors):
+                        # The wrist camera is mounted on the hand: a fixed pixel there
+                        # is a fixed point in the hand's frame, so it can never be a
+                        # target (measured: the grounded point travels with the
+                        # gripper). Saying WHY saves a turn of blind retries.
+                        note += (
+                            " 腕部相机装在夹爪上，不能用来指定目标（固定像素=相对手恒定的点，会跟着夹爪一起动）；"
+                            "给像素请用 camera=agent，腕部画面只用来判断方向，再用 move 沿世界轴走 2~5cm。"
                         )
                     messages.append({"role": "user", "content": note})
                     transcript.append({"turn": turn, "protocol_retry": True})
@@ -654,6 +667,10 @@ class Harness:
         name, args = call.name, call.args
         original_name = name
         canonical = canonical_name(name)
+        # Only `aim` is allowed to keep the "same pixel as last time" memory: any
+        # other tool can have moved the arm, the object or the frame since.
+        if canonical != "aim":
+            self._last_aim = None
         if canonical == "observe":
             if args.get("target") or original_name == "locate":
                 return {"obs": obs, "text": self._locate(args.get("target", args.get("name", "")), obs), "image": None, "done": False}
@@ -682,6 +699,10 @@ class Harness:
         elif canonical == "gripper":
             name = "set_gripper"
         elif canonical in ("grasp", "release"):
+            name = canonical
+        elif canonical in ("aim", "target"):
+            # `goto_pixel` (the pre-v2 name) lands here too: ALIASES maps it to
+            # `target`, so old transcripts and old prompts keep working.
             name = canonical
         elif canonical == "verify":
             name = "declare_done"
@@ -723,23 +744,63 @@ class Harness:
                 "requested": outcome.get("requested") or {},
             }
 
-        if name == "goto_pixel":
-            # 档 B: the model names a PIXEL; the simulator grounds it. The harness
-            # never sees an object position on this path.
+        if name == "aim":
+            # 档 B v2 dry run: ground the pixel, draw the ring, DO NOT MOVE. The
+            # harness never sees an object position on this path either -- the
+            # simulator answers with the model's OWN pixel plus a concept.
             payload: dict[str, Any] = {
-                "kind": "goto_pixel",
+                "kind": "aim",
+                "camera": args.get("camera", "agent"),
+                "u": as_float(args.get("u"), 0.0),
+                "v": as_float(args.get("v"), 0.0),
+            }
+            resp = self.client.act(payload)
+            outcome = resp.outcome
+            images = resp.images(self.client.ipc_dir)
+            text = format_outcome(outcome)
+            # Re-aiming the identical pixel with no motion in between cannot produce
+            # new evidence (the frame and the ring are both unchanged), so say so
+            # instead of letting the model pay a turn to rediscover it.
+            key = (str(payload["camera"]), round(payload["u"]), round(payload["v"]))
+            if self._last_aim == key:
+                text += "（和上次 aim 完全相同，画面没有变化）"
+            self._last_aim = key
+            return {
+                "obs": resp.obs,
+                "text": text,
+                "image": (images or {}).get(payload["camera"]),
+                "images": images,
+                "done": False,
+                "tool": name,
+                "kind": outcome.get("kind", name),
+                "note": str(outcome.get("note", "")),
+                "status": outcome.get("status", ""),
+                "measurement": outcome.get("measurement") or {},
+                "requested": outcome.get("requested") or {},
+            }
+
+        if name == "target":
+            # 档 B: the model names a PIXEL; the simulator grounds it and servos a
+            # SHORT BLOCK (`max_steps`, default 3, max 8). The model must look again
+            # between blocks -- which costs nothing extra, since every action already
+            # brings fresh frames back (see `attach_images` above).
+            payload = {
+                "kind": "target",
                 "camera": args.get("camera", "agent"),
                 "u": as_float(args.get("u"), 0.0),
                 "v": as_float(args.get("v"), 0.0),
                 "offset_mm": parse_vec3(args.get("offset_mm")),
             }
+            if str(args.get("max_steps", "")).strip():
+                payload["max_steps"] = as_float(args.get("max_steps"), 0.0)
             resp = self.client.act(payload)
             outcome = resp.outcome
             images = resp.images(self.client.ipc_dir)
+            self._last_aim = None
             return {
                 "obs": resp.obs,
                 "text": format_outcome(outcome),
-                "image": (images or {}).get("wrist"),
+                "image": (images or {}).get("agent"),
                 "images": images,
                 "done": False,
                 "tool": name,
@@ -1133,10 +1194,27 @@ def _fmt3(vec: Any) -> str:
     return f"({vec[0]:.4f}, {vec[1]:.4f}, {vec[2]:.4f})"
 
 
-# Keys that identify a SCENE OBJECT rather than describe geometry. They stay in the
-# transcript (the offline audits read `measurement`) but are dropped from the copy
-# the model is shown when the observation mode claims not to know about objects.
-MODEL_HIDDEN_KEYS = ("object_body",)
+# Keys that identify a SCENE OBJECT, or hand over a world POSITION, rather than
+# describe what happened. They stay in the transcript (the offline audits read
+# `measurement` at full resolution) but are dropped from the copy the model is shown
+# when the observation mode claims not to know about objects or coordinates.
+#
+# 档 B v2 added the coordinate keys. Until then `target`/`goto_pixel` results carried
+# `surface_xyz` (the grounded point), `target_xyz` (where the arm was sent) and
+# `offset_m` -- i.e. the model was handed the world position it had just asked for.
+# It is not scene truth (a depth camera would give the surface, and the offset is the
+# model's own input), but it is exactly the numeric form this mode exists to remove:
+# the model is supposed to decide from the ring in the picture, and 10-13 cm of
+# measured pointing bias says it reads POSITIONS badly anyway. `mm_per_px` deliberately
+# stays model-facing (it is the scale it needs to convert cells into centimetres).
+MODEL_HIDDEN_KEYS = (
+    "object_body",
+    "surface_xyz",
+    "target_xyz",
+    "offset_m",
+    "depth_m",
+    "mark",
+)
 
 
 def model_view(result: dict[str, Any], observation_mode: str) -> dict[str, Any]:
@@ -1256,7 +1334,25 @@ def format_outcome(outcome: dict[str, Any]) -> str:
     delta = outcome.get("measured_delta_m", [0, 0, 0])
     end = outcome.get("eef_end", [0, 0, 0])
     ticks = outcome.get("steps", 0)
-    if kind == "goto_pixel":
+    if kind == "aim":
+        # 档 B v2 dry run. The model gets back its OWN pixel, the concept of what
+        # happened to it, and the local scale -- never a position, which is the whole
+        # point of the mode (and `model_view` drops even the world point it asked for).
+        camera = str((requested or {}).get("camera", ""))
+        pixel = (requested or {}).get("pixel") or []
+        where = f"像素({pixel[0]},{pixel[1]})" if len(pixel) == 2 else ""
+        if str(outcome.get("status", "")) == "rejected":
+            return (
+                f"[aim {camera} {where}] 拒绝：{outcome.get('note', '')}"
+                "（这张图里没有画红圈，换个像素再 aim）"
+            )
+        mm_px = (outcome.get("measurement") or {}).get("mm_per_px")
+        scale = f"，此处 1 像素≈{mm_px}mm" if mm_px else ""
+        return (
+            f"[aim {camera} {where}] 红圈已画在你说的像素上（青色十字是夹爪自己）{scale}；"
+            "请对比红圈与目标、以及红圈与十字，满意就 target，不满意改像素再 aim"
+        )
+    if kind in ("target", "goto_pixel"):
         # The model gets back its OWN pixel and the local scale (mm/px) it needs to
         # plan the next click -- never the object's position, which is the whole
         # point of the mode.
@@ -1264,13 +1360,21 @@ def format_outcome(outcome: dict[str, Any]) -> str:
         pixel = (requested or {}).get("pixel") or []
         where = f"像素({pixel[0]},{pixel[1]})" if len(pixel) == 2 else ""
         mm_px = (outcome.get("measurement") or {}).get("mm_per_px")
+        status = str(outcome.get("status", ""))
+        if status == "rejected":
+            return f"[{kind} {camera} {where}] 拒绝：{outcome.get('note', '')}（爪子没有动）"
         concept = {
             "arrived": "已到位",
             "short": "没到位（还差一点）",
             "blocked": "中途被挡住/到不了",
-        }.get(str(outcome.get("status", "")), "结果未知")
+        }.get(status, "结果未知")
         scale = f"，此处 1 像素≈{mm_px}mm" if mm_px else ""
-        return f"[goto_pixel {camera} {where}] {concept}{scale}"
+        # `truncated` is the SHORT BLOCK running out, which is a different fact from
+        # "blocked": the arm is fine, the model just stopped looking. Say which one it
+        # is, or a short block reads as a failure to be worked around.
+        if status == "short" and (outcome.get("measurement") or {}).get("truncated"):
+            return f"[{kind} {camera} {where}] {concept}：这一小段走完还没到，同一像素再 target 一次即可{scale}"
+        return f"[{kind} {camera} {where}] {concept}{scale}"
     if kind in ("grasp", "release"):
         # Concept primitives: the model is told WHAT happened, not how many
         # millimetres the fingers travelled. The numbers are in the structured

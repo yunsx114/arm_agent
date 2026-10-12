@@ -99,6 +99,19 @@ GRIPPER_CONVERGE_EPS = 0.002
 # "open" too.
 GRIPPER_OPEN_WIDTH = 0.034
 GRIPPER_EMPTY_WIDTH = 0.006
+# Short action block (档 B v2). The full servo is allowed DESCEND_MAX_ITERS
+# corrections; a `target` call from the model is capped at SHORT_BLOCK_ITERS so the
+# arm can never run away from a plan it made without looking again (Jev bounds the
+# same thing with `max_motor_steps`, 1..8, and re-plans after every block).
+#
+# Default = the max, so `max_steps` is purely "be more cautious than usual": the
+# model asks for 1..3 when it is close and delicate, and otherwise gets one bounded
+# block. Measured motivation for ANY bound: the two real pixel runs spent 36 and 19
+# turns in blind `move`s after their one pixel call, and the old cap here was 80
+# corrections (~40 cm of travel) in a single call.
+DESCEND_MAX_ITERS = 80
+SHORT_BLOCK_ITERS = 8
+SHORT_BLOCK_MAX_ITERS = 8
 GRIPPER_SETTLE_AVG = 5  # finger must move < eps per step for this many steps
 GRIPPER_MAX_STEPS = 130  # measured: full sweep needs ~100 steps at 0.01/step
 # Extra full-power ticks after the pads stop moving on an object. The clamp
@@ -683,7 +696,11 @@ class ActionAdapter:
     DESCEND_Z_TOL_M = 0.005
 
     def descend_to(
-        self, xy_target: tuple[float, float], z_target: float, tol_xy: float = MOVE_ARRIVE_TOL_M
+        self,
+        xy_target: tuple[float, float],
+        z_target: float,
+        tol_xy: float = MOVE_ARRIVE_TOL_M,
+        max_iters: int = DESCEND_MAX_ITERS,
     ) -> ActionOutcome:
         """Servo to (x, y, z) with xy corrected before every descent step.
 
@@ -699,19 +716,32 @@ class ActionAdapter:
         This reuses the same structure: xy checked FIRST each iteration, each
         correction delegated to `move()` (its own closed loop), with a stuck
         detector so an unreachable target bails instead of burning ticks.
+
+        `max_iters` is the SHORT ACTION BLOCK (档 B v2, copied from Jev's
+        `max_motor_steps`): the caller can cut the servo off after N corrections and
+        make the model look again. One iteration = one xy/z correction, each of which
+        is its own closed loop of physics ticks, so this is a coarse-grained knob
+        (Jev's 1..8 range maps onto it), not a tick budget. When the block runs out
+        before convergence the outcome says so (`measurement.truncated`) instead of
+        pretending the shortfall was a blocked path.
         """
+        limit = max(1, int(max_iters))
         start = self._eef_now()
         outcome = ActionOutcome(
             kind="descend_to",
             requested={
                 "target_xy": [round(xy_target[0], 4), round(xy_target[1], 4)],
                 "z_target": round(z_target, 4),
+                "max_iters": limit,
             },
             eef_start=list(start),
         )
         last: list[float] | None = None
         still = 0
-        for _ in range(80):
+        converged = False
+        iters = 0
+        for _ in range(limit):
+            iters += 1
             x, y, z = self._eef_now()
             if last is not None:
                 # stuck detector (probe_grasp_height.py): no progress for six
@@ -733,6 +763,7 @@ class ActionAdapter:
             elif abs(dz) > self.DESCEND_Z_TOL_M:
                 outcome.steps += self.move("+z" if dz > 0 else "-z", min(5.0, abs(dz) * 100)).steps
             else:
+                converged = True
                 break
 
         end = self._eef_now()
@@ -742,6 +773,15 @@ class ActionAdapter:
         z_err = abs(end[2] - z_target)
         if not outcome.note:
             outcome.note = f"xy err {xy_err * 1000:.1f} mm, z err {z_err * 1000:.1f} mm"
+        # Two different shortfalls, two different sentences. "stuck" (unreachable)
+        # and "out of block" (the caller asked for a short move) both leave the arm
+        # short of the target, and the model is the one that has to tell them apart.
+        # Append AFTER the note, never instead of it: `classify_descent` parses
+        # "z err N mm" and "stuck" out of this string.
+        truncated = not converged and iters >= limit and "stuck" not in outcome.note
+        if truncated:
+            outcome.note += f" | 短块 {iters} 步用尽，未收敛"
+        outcome.measurement.update({"iterations": iters, "truncated": bool(truncated)})
         return outcome
 
     # ------------------------------------------------------------- accessors

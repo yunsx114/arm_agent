@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from arm_agent.agent.harness import Harness
 from arm_agent.sim.client import SimClient
-from arm_agent.sim.pixel_grounding import Camera
+from arm_agent.sim.pixel_grounding import AIM_MARK_COLOUR, Camera
 from arm_agent.sim.server import SimServer
 
 # Scene targets for init state 0 (GT from the E1 export; the dry run is allowed
@@ -287,6 +287,9 @@ class PixelPolicy:
         self.calls: list[str] = []
         self.frames = 0
         self.images_annotated = False
+        self.calls_made = 0
+        # Frames that came back carrying an `aim` ring (see the pixel scan below).
+        self.ring_frames = 0
 
     def chat(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
         if not self.script:
@@ -307,16 +310,33 @@ class PixelPolicy:
                     elif isinstance(part, dict) and part.get("type") == "image":
                         self.frames += 1
                         # Annotation is drawn server-side, so the only honest check
-                        # is on the PIXELS the model receives: the grid colour has to
-                        # be present in a frame that is otherwise a normal render.
-                        arr = np.asarray(part["image"]).reshape(-1, 3)
-                        grid = np.abs(arr.astype(int) - np.array([120, 130, 138])).sum(axis=1)
-                        if int((grid <= 6).sum()) > 200:
-                            self.images_annotated = True
+                        # is on the PIXELS the model receives: one of the grid greys
+                        # has to be present in a frame that is otherwise a normal
+                        # render. (Brighter lines + labels every 32 px, dim minor
+                        # lines every 8 px -- see pixel_grounding.annotate_frame.)
+                        arr = np.asarray(part["image"]).reshape(-1, 3).astype(int)
+                        for grey in ((96, 106, 116), (150, 158, 164)):
+                            hits = (np.abs(arr - np.array(grey)).sum(axis=1) <= 6).sum()
+                            if int(hits) > 200:
+                                self.images_annotated = True
+                        # The `aim` ring has to be on the PIXELS, not just in the
+                        # return value: the whole point of the tool is that the model
+                        # compares the ring against the object in the frame it gets
+                        # back. AIM_MARK_COLOUR with a generous tolerance (the PNG round
+                        # trip and the halo antialiasing both shift the value).
+                        ring = (np.abs(arr - np.array(AIM_MARK_COLOUR)).sum(axis=1) <= 60).sum()
+                        if int(ring) >= 10:
+                            self.ring_frames += 1
                     elif isinstance(part, str):
                         self.sent.append(part)
-        turns = sum(1 for m in messages if m.get("role") == "assistant")
-        name, args = self.script[min(turns, len(self.script) - 1)]
+        # Advance on CALL COUNT, not on the number of assistant messages in the
+        # history: `compact_history` drops old turns once the window fills, so
+        # counting messages made this policy saturate on one script entry forever
+        # (measured: 19 identical `target` calls at the end of a 32-turn leg, which
+        # looked exactly like a tool that could not finish).
+        index = min(self.calls_made, len(self.script) - 1)
+        self.calls_made += 1
+        name, args = self.script[index]
         self.calls.append(name)
         return "现状：脚本化像素步骤。\n判定：按顺序执行。\n动作：调用工具。\n" + _call(name, args)
 
@@ -340,19 +360,38 @@ def pixel_script(server: SimServer) -> list[tuple[str, dict[str, Any]]]:
         # still be finished afterwards (asked at the end it never runs, because
         # the episode stops the moment the environment reports success).
         ("approach", {"target": "basket", "height_offset_cm": "25"}),
+        # `aim` is the dry run: it must mark the frame and move NOTHING.
+        ("aim", {"camera": "agent", "u": can_u, "v": can_v}),
+        # ...it is also the only pixel tool allowed on the wrist view...
+        ("aim", {"camera": "wrist", "u": 128, "v": 128}),
+        # ...a pixel outside the frame is refused WITH A REASON (never clamped)...
+        ("aim", {"camera": "agent", "u": -4, "v": 900}),
+        # ...and MOVING to a wrist pixel is refused as a wrong-tool error.
+        ("target", {"camera": "wrist", "u": can_u, "v": can_v}),
         # hover 12 cm above the can's visible surface, then 1.2 cm above it, i.e.
         # the two-stage aim the pixel granularity forces (3.7 mm/px up here).
-        ("goto_pixel", {"camera": "agent", "u": can_u, "v": can_v,
-                         "offset_mm": [0, 0, 120]}),
-        ("goto_pixel", {"camera": "agent", "u": can_u, "v": can_v,
-                         "offset_mm": [0, 0, 12]}),
+        # Repeated because ONE CALL IS A SHORT BLOCK (<= 8 corrections, and each
+        # correction is a `move` capped at 5 cm); a repeat on a point that is
+        # already reached costs nothing and answers `arrived`.
+        ("target", {"camera": "agent", "u": can_u, "v": can_v,
+                    "offset_mm": [0, 0, 120]}),
+        ("target", {"camera": "agent", "u": can_u, "v": can_v,
+                    "offset_mm": [0, 0, 120]}),
+        ("target", {"camera": "agent", "u": can_u, "v": can_v,
+                    "offset_mm": [0, 0, 12]}),
+        ("target", {"camera": "agent", "u": can_u, "v": can_v,
+                    "offset_mm": [0, 0, 12]}),
         ("grasp", {}),
         ("move", {"direction": "+z", "distance_cm": "15"}),
         ("move", {"direction": "+z", "distance_cm": "10"}),
         # 19 cm above the basket's visible floor: the payload's bottom then sits
         # ~14 cm above the rim (rim 0.1513; payload bottom = EEF - 0.050).
-        ("goto_pixel", {"camera": "agent", "u": basket_u, "v": basket_v,
-                         "offset_mm": [0, 0, 190]}),
+        ("target", {"camera": "agent", "u": basket_u, "v": basket_v,
+                    "offset_mm": [0, 0, 190]}),
+        ("target", {"camera": "agent", "u": basket_u, "v": basket_v,
+                    "offset_mm": [0, 0, 190]}),
+        ("target", {"camera": "agent", "u": basket_u, "v": basket_v,
+                    "offset_mm": [0, 0, 190]}),
         ("release", {}),
     ]
 
@@ -375,7 +414,7 @@ def pixel_leg(ipc_dir: Path) -> bool:
         client=client,
         model=policy,
         workspace=REPO,
-        max_turns=24,
+        max_turns=32,
         tool_protocol="v2",
         log=False,
         observation_mode="pixels",
@@ -387,7 +426,19 @@ def pixel_leg(ipc_dir: Path) -> bool:
     time.sleep(0.3)
 
     texts = [e["result"] for e in transcript if e.get("result")]
-    pixel_results = [t for t in texts if t.startswith("[goto_pixel")]
+    aim_results = [t for t in texts if t.startswith("[aim")]
+    target_results = [t for t in texts if t.startswith("[target")]
+    # Every turn's structured envelope, for the assertions that need NUMBERS
+    # (did `aim` move the arm?) rather than the model-facing sentence.
+    envelopes = [e.get("structured_result") or {} for e in transcript if e.get("structured_result")]
+    aim_envelopes = [s for s in envelopes if s.get("tool") == "aim"]
+    target_envelopes = [s for s in envelopes if (s.get("tool") or "").endswith("target")]
+    aim_moved = [
+        s for s in aim_envelopes
+        if (s.get("measurement") or {}).get("eef_start")
+        != (s.get("measurement") or {}).get("eef_end")
+        or any(abs(v) > 1e-9 for v in ((s.get("measurement") or {}).get("measured_delta_m") or [0, 0, 0]))
+    ]
     # Only TOOL RESULTS and state lines are scanned. The initial user message
     # legitimately quotes the task (LIBERO's own task string is "pick up the
     # alphabet soup and place it in the basket"), so a bare name search over the
@@ -396,25 +447,43 @@ def pixel_leg(ipc_dir: Path) -> bool:
     joined = "\n".join(toolish)
     leaked_names = [tok for tok in PixelPolicy.OBJECT_TOKENS if tok in joined]
     leaked_coords = re.findall(r"\(\s*[-+]?\d\.\d{3}\s*,\s*[-+]?\d\.\d{3}\s*,\s*[-+]?\d\.\d{3}\)", joined)
+    # 档 B v2: the model must not receive the WORLD POINT it just asked for
+    # (`surface_xyz` / `target_xyz` / `offset_m`) or the marker echo. Those stay in
+    # the transcript; the model is supposed to decide from the ring in the picture.
+    leaked_keys = [key for key in ("surface_xyz", "target_xyz", "offset_m", "depth_m") if f'"{key}"' in joined]
+    short_blocks = [
+        s for s in target_envelopes
+        if (s.get("measurement") or {}).get("iterations") is not None
+    ]
+    bounded = [s for s in short_blocks if int((s.get("measurement") or {})["iterations"]) <= 8]
     checks = {
-        "工具面里没有 approach": "approach" not in advertised and "goto_pixel" in advertised,
-        "goto_pixel 走了多次且给出了概念": len(pixel_results) >= 3
-        and all("已到位" in t or "没到位" in t or "被挡住" in t for t in pixel_results),
+        "工具面里没有 approach，但有 aim/target": "approach" not in advertised
+        and "aim" in advertised and "target" in advertised,
+        "aim 只标注不动手": len(aim_results) >= 3 and not aim_moved,
+        "aim 可用腕部相机，target 不行": any("wrist" in t for t in aim_results)
+        and not any("wrist" in t for t in target_results)
+        and any(e.get("protocol_retry") for e in transcript),
+        "越界像素被拒且给了理由": any("拒绝" in t for t in aim_results),
+        "target 走了多次且给出了概念": len(target_results) >= 4
+        and all("已到位" in t or "没到位" in t or "被挡住" in t or "拒绝" in t for t in target_results),
+        "短动作块有上限（每次 <= 8 个修正步）": bool(short_blocks) and len(bounded) == len(short_blocks),
         "工具结果/状态行里没有物体名": not leaked_names,
         "工具结果里没有物体坐标（只有爪心）": not leaked_coords,
+        "不给模型世界坐标/深度键": not leaked_keys,
         "approach 在 pixels 模式被拒且给了替代": any(
             e.get("protocol_retry") for e in transcript
         ),
-        "任务由 goto_pixel 完成": bool(result.success),
+        "任务由 target 完成": bool(result.success),
         "画面带网格标注": bool(policy.images_annotated),
+        "红圈画在了返回的画面上": policy.ring_frames >= 1,
     }
     for label, passed in checks.items():
         print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
     print(f"  像素腿：success={result.success} source={result.success_source} "
           f"turns={result.turns} retries={result.protocol_retries} error={result.error!r}")
     print(f"  脚本调用: {policy.calls}")
-    if pixel_results:
-        print(f"  示例：{pixel_results[0]} / {pixel_results[-1]}")
+    if target_results:
+        print(f"  示例：{target_results[0]} / {target_results[-1]}")
     if leaked_names:
         print(f"  泄漏的物体名: {leaked_names}")
         for text in toolish:
@@ -530,7 +599,7 @@ def main() -> int:
     ok = result.tool_calls > 10 and result.protocol_retries == 0
     print("\n=== 档 A 概念腿（v2 grasp/release，无 LLM）===")
     ok = concept_leg(REPO / "runtime" / "ipc_dryrun2") and ok
-    print("\n=== 档 B 像素腿（pixels 模式 goto_pixel，无 LLM）===")
+    print("\n=== 档 B 像素腿（pixels 模式 aim/target，无 LLM）===")
     ok = pixel_leg(REPO / "runtime" / "ipc_dryrun3") and ok
     print("PLUMBING OK" if ok else "PLUMBING PROBLEM")
     return 0 if ok else 1

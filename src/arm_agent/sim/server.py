@@ -37,9 +37,21 @@ from typing import Any
 import numpy as np
 
 from arm_agent import contracts as C
-from arm_agent.sim.action_adapter import ActionAdapter, classify_descent
+from arm_agent.sim.action_adapter import (
+    SHORT_BLOCK_ITERS,
+    SHORT_BLOCK_MAX_ITERS,
+    ActionAdapter,
+    ActionOutcome,
+    classify_descent,
+)
 from arm_agent.sim.libero_env import LiberoSim
-from arm_agent.sim.pixel_grounding import Camera, annotate_frame, ground_pixel
+from arm_agent.sim.pixel_grounding import (
+    AIM_MARK_RADIUS_PX,
+    Camera,
+    Grounding,
+    annotate_frame,
+    ground_pixel,
+)
 
 
 class SimServer:
@@ -52,6 +64,7 @@ class SimServer:
         seed: int = 0,
         observation_mode: str = "truth",
         pixel_grid_px: int = 32,
+        aim_mark_px: int = AIM_MARK_RADIUS_PX,
     ) -> None:
         self.ipc_dir = Path(ipc_dir)
         self.ipc_dir.mkdir(parents=True, exist_ok=True)
@@ -72,6 +85,8 @@ class SimServer:
             raise ValueError(f"unknown observation_mode {observation_mode!r}")
         self.pixel_grid_px = int(pixel_grid_px)
         self.cam_size = int(cam_size)
+        # Radius of the `aim` ring, in pixels of the frame the model receives.
+        self.aim_mark_px = int(aim_mark_px)
 
     # ------------------------------------------------------------------ main
     def serve_forever(self, poll_s: float = C.IPC_POLL_INTERVAL_S, idle_exit_s: float = 3600.0) -> None:
@@ -153,7 +168,7 @@ class SimServer:
                 if self.observation_mode == "pixels":
                     raise ValueError(
                         "observation_mode=pixels：不能按物体名对准（那需要仿真真值）。"
-                        "请改用 goto_pixel 给出像素坐标。"
+                        "请改用 aim 确认像素、再用 target 移动。"
                     )
                 # NOTE (fixed): "objects" is SYNTHESISED by pack() from the raw
                 # `<name>_pos` keys; it does NOT exist in sim._obs. Reading it
@@ -175,7 +190,7 @@ class SimServer:
                 if self.observation_mode == "pixels":
                     raise ValueError(
                         "observation_mode=pixels：不能按物体名下降（那需要仿真真值）。"
-                        "请改用 goto_pixel 给出像素坐标。"
+                        "请改用 aim 确认像素、再用 target 移动。"
                     )
                 # Same fix as the align branch: take objects from pack(), not
                 # from the raw _obs (which never has an "objects" key).
@@ -187,18 +202,26 @@ class SimServer:
                 z_offset_cm = float(action.get("z_offset_cm", 1.2))
                 z_target = pos[2] + z_offset_cm / 100.0
                 outcome = self.adapter.descend_to((pos[0], pos[1]), z_target)
-            elif act_kind == "goto_pixel":
+            elif act_kind in ("target", "goto_pixel"):
                 # 档 B: the model names a PIXEL; the code grounds it with the
                 # camera + depth and servos there. No object name, no object
-                # position, no object size enters this path.
-                outcome = self.goto_pixel(action)
+                # position, no object size enters this path. 档 B v2 turns this
+                # into a SHORT BLOCK (`max_steps`); `goto_pixel` stays as the
+                # pre-v2 name of the same call so old transcripts still replay.
+                outcome = self.pixel_target(action, kind=str(act_kind))
+            elif act_kind == "aim":
+                # 档 B v2 dry run: ground the pixel, mark it, and DO NOT MOVE. The
+                # frame that comes back is the same frame `target` would use, so
+                # deciding from it is deciding from evidence, not from a guess.
+                outcome = self.aim(action)
             else:
                 raise ValueError(f"unknown action kind: {act_kind!r}")
             obs = self.sim.pack(self.sim._obs)  # type: ignore[arg-type]
+            mark = outcome.measurement.get("mark")
             return {
                 "outcome": outcome.to_dict(),
                 "obs": obs,
-                **self._image_payload(cmd_id, inline_images),
+                **self._image_payload(cmd_id, inline_images, mark=mark),
             }
         if kind == "look":
             return {
@@ -223,9 +246,128 @@ class SimServer:
         # the arm, and `data.cam_xpos` is what carries that (see Camera.from_env).
         return Camera.from_env(self.sim.env.env, cam_name, self.cam_size, self.cam_size)
 
-    def goto_pixel(self, action: dict[str, Any]):
+    def _log_aim(
+        self,
+        tool: str,
+        cam_key: str,
+        camera: Camera,
+        pixel: tuple[int, int],
+        grounding: Grounding | None,
+        reason: str = "",
+    ) -> None:
+        """The aim instrument: how far from the object did the model actually point?
+
+        LOG ONLY, and it reads ground truth on purpose -- which is why it must never
+        reach a result the model sees. It answers the question the two real pixel
+        runs left open: "the model cannot read the grid" and "the model reads the grid
+        fine but the object is 16 px wide" look identical without it.
+        """
+        if self.sim._obs is None:
+            return
+        if grounding is None:
+            print(
+                f"[aim] tool={tool} asked={pixel} cam={cam_key} REJECTED: {reason}",
+                flush=True,
+            )
+            return
+        objects = self.sim.pack(self.sim._obs).get("objects") or {}
+        target = np.asarray(grounding.target_xyz, dtype=float)
+        rows = []
+        for name, pos in objects.items():
+            gt = np.asarray(pos, dtype=float)
+            gu, gv, _ = camera.project(gt)
+            dx, dy = target[0] - gt[0], target[1] - gt[1]
+            rows.append(
+                (float(np.hypot(dx, dy)), name, (round(gu), round(gv)),
+                 (target[2] - gt[2]) * 1000.0)
+            )
+        rows.sort()
+        near = " | ".join(
+            f"{name} px={px} xy={xy * 1000:.0f}mm dz={dz:+.0f}mm"
+            for xy, name, px, dz in rows[:2]
+        )
+        print(
+            f"[aim] tool={tool} asked={pixel} cam={cam_key} "
+            f"target={target.round(3)} depth={grounding.depth_m:.3f}m :: {near}",
+            flush=True,
+        )
+
+    def _pixel_probe(
+        self, action: dict[str, Any]
+    ) -> tuple[str, Camera, float, float, Grounding | None, str]:
+        """Shared front half of `aim` and `target`: camera, pixel, grounding.
+
+        Returns the camera KEY (`agent`/`wrist`, the name the model used and is shown)
+        separately from the Camera, whose `.name` is the physical robosuite camera
+        (`agentview` / `robot0_eye_in_hand`). Both appear in the transcript -- the key
+        in `requested`, the physical name inside the grounding record -- but only the
+        key is ever shown to the model, so "which camera did I ask about" cannot come
+        back as a different word than the one it passed.
+
+        An unusable pixel comes back as a REASON, not as an exception: both tools
+        want the frame to travel back with the reason so the model can look at it and
+        pick another point in the same turn (an exception costs a protocol retry and
+        arrives without pixels). Nothing is ever substituted for the point the model
+        asked for -- Jev's rule, and its own test name says it best:
+        `test_invalid_pixels_cannot_be_clipped_into_another_target`.
+        """
+        key = str(action.get("camera", "agent")).strip().lower()
+        camera = self._camera(key)
+        u = float(action["u"])
+        v = float(action["v"])
+        if not camera.inside(u, v):
+            return key, camera, u, v, None, (
+                f"像素 ({u:.0f},{v:.0f}) 在 {key} 画面之外"
+                f"（画面 u 0..{camera.width - 1}, v 0..{camera.height - 1}）"
+            )
+        grounding, reason = ground_pixel(
+            self.sim.env.env, camera, u, v, action.get("offset_mm") or [0.0, 0.0, 0.0]
+        )
+        return key, camera, u, v, grounding, reason
+
+    def aim(self, action: dict[str, Any]) -> ActionOutcome:
+        """Ground a pixel and DRAW it, without moving anything (档 B v2).
+
+        WHY A TOOL THAT DOES NOTHING. The model's absolute pixel reading carries a
+        measured systematic bias (30-50 px = 10-13 cm, stable across four calls at
+        512 px), so "look once and jump" cannot be corrected by trying harder -- but
+        it CAN be corrected by seeing the error. The ring turns "am I pointing at the
+        can?" from an absolute estimate into a relative one ("the ring is two cells
+        left of the can"), and the arm pays nothing for the attempt: no motion, no
+        physics ticks, no risk of knocking the object it is trying to pick up.
+
+        The ring is drawn on the frame of the camera that was asked about, at exactly
+        the pixel the model named (see annotate_frame for why not the round trip).
+        """
+        cam_key, camera, u, v, grounding, reason = self._pixel_probe(action)
+        eef = list(self.sim._obs[C.OBS_EEF_POS]) if self.sim._obs else []
+        outcome = ActionOutcome(
+            kind="aim",
+            requested={"camera": cam_key, "pixel": [round(u), round(v)]},
+            eef_start=list(eef),
+            eef_end=list(eef),
+            measured_delta_m=[0.0, 0.0, 0.0],
+        )
+        self._log_aim("aim", cam_key, camera, (round(u), round(v)), grounding, reason)
+        if grounding is None:
+            outcome.status = "rejected"
+            outcome.note = reason
+            outcome.measurement = {
+                "camera": cam_key,
+                "pixel": [round(u), round(v)],
+                "mark": None,
+            }
+            return outcome
+        outcome.status = "marked"
+        outcome.note = "红圈已画在你指定的像素上"
+        outcome.measurement = grounding.measurement()
+        outcome.measurement["camera"] = cam_key
+        outcome.measurement["mark"] = [cam_key, round(u), round(v)]
+        return outcome
+
+    def pixel_target(self, action: dict[str, Any], kind: str = "target"):
         """Ground one pixel and servo the gripper there (档 B's replacement for
-        `approach(<name>)`).
+        `approach(<name>)`), as a SHORT ACTION BLOCK (档 B v2).
 
         The model supplies the target pixel and the CLEARANCE (`offset_mm`, world
         axes) -- measured reason: the back-projected point sits on the visible
@@ -233,41 +375,107 @@ class SimServer:
         clearance would be wrong for every object but one. An unusable pixel
         (outside the frame, or depth out of range) is REJECTED WITH A REASON
         instead of being quietly replaced by a different target.
+
+        `max_steps` bounds how many xy/z corrections this call may spend (Jev's
+        `max_motor_steps`, and its measured motivation on our side: 36 and 19 turns
+        of blind `move`s in the two real pixel runs). When the block runs out before
+        convergence the outcome says `短块走完还没到`, which is a different fact from
+        `blocked` -- the model has to re-look in both cases, but only one of them is
+        a reason to change strategy.
         """
-        camera = self._camera(action.get("camera", "agent"))
-        u = float(action["u"])
-        v = float(action["v"])
-        offset_mm = action.get("offset_mm") or [0.0, 0.0, 0.0]
-        grounding, reason = ground_pixel(self.sim.env.env, camera, u, v, offset_mm)
+        cam_key = str(action.get("camera", "agent")).strip().lower()
+        if cam_key == "wrist":
+            # MEASURED (scripts/probe_wrist_view.py + the first real pixel run): an
+            # eye-in-hand camera makes an absolute pixel DEGENERATE. A fixed pixel
+            # is a fixed point in the HAND's frame, so its grounded world point
+            # travels with the gripper (measured: pixel (48,150) always lands on
+            # the table ~20-30 cm from the pads, wherever the arm is), and no
+            # motion can ever remove the error. Episode 0 of the 2026-10-12 run
+            # issued 16 identical wrist calls and got `arrived` every time.
+            # `aim` is allowed on the wrist view (looking does not move the arm,
+            # and the wrist view is the 1.1 mm/px one) -- MOVING to a wrist pixel is
+            # not, and this is a wrong-tool error, not an unusable point, so it
+            # still raises with the fix in the message.
+            raise ValueError(
+                "target 拒绝 camera=wrist：腕部相机装在夹爪上，固定像素就是“相对手恒定”的一个点，"
+                "它随夹爪一起移动，永远追不上。用 camera=agent 给像素（第三人称）；"
+                "想看腕部细部就用 aim(camera=wrist) 只标注不移动，"
+                "再配 move 沿世界轴微调：腕部画面里 +y=向左、-y=向右、+x=向上、-x=向下。"
+            )
+        cam_key, camera, u, v, grounding, reason = self._pixel_probe(action)
+        max_steps = action.get("max_steps", SHORT_BLOCK_ITERS)
+        try:
+            max_steps = int(float(max_steps))
+        except (TypeError, ValueError):
+            max_steps = SHORT_BLOCK_ITERS
+        max_steps = min(max(max_steps, 1), SHORT_BLOCK_MAX_ITERS)
+        self._log_aim(kind, cam_key, camera, (round(u), round(v)), grounding, reason)
         if grounding is None:
-            raise ValueError(f"goto_pixel 拒绝：{reason}")
+            eef = list(self.sim._obs[C.OBS_EEF_POS]) if self.sim._obs else []
+            return ActionOutcome(
+                kind=kind,
+                requested={"camera": cam_key, "pixel": [round(u), round(v)]},
+                status="rejected",
+                note=reason,
+                eef_start=list(eef),
+                eef_end=list(eef),
+                measured_delta_m=[0.0, 0.0, 0.0],
+                measurement={"camera": cam_key, "pixel": [round(u), round(v)], "mark": None},
+            )
         target = grounding.target_xyz
-        outcome = self.adapter.descend_to((target[0], target[1]), target[2])
-        outcome.kind = "goto_pixel"
+        outcome = self.adapter.descend_to(
+            (target[0], target[1]), target[2], max_iters=max_steps
+        )
+        outcome.kind = kind
         outcome.requested = {
-            "camera": camera.name,
+            "camera": cam_key,
             "pixel": [grounding.pixel[0], grounding.pixel[1]],
-            "offset_mm": [round(float(x), 1) for x in offset_mm],
-            "target_xyz": [round(float(x), 4) for x in target],
+            "offset_mm": [round(float(x), 1) for x in action.get("offset_mm") or [0.0, 0.0, 0.0]],
+            "max_steps": max_steps,
         }
-        outcome.measurement = grounding.measurement()
+        # MERGE into the grounding record, never replace it: `descend_to` has already
+        # written `iterations` / `truncated` into this dict, and overwriting it is the
+        # same mistake that once hid `eef_start`/`eef_end` from the audit.
+        outcome.measurement = {**grounding.measurement(), **outcome.measurement}
+        outcome.measurement["camera"] = cam_key
+        for key in ("eef_start", "eef_end", "measured_delta_m", "steps"):
+            value = getattr(outcome, key, None)
+            if value is not None:
+                outcome.measurement[key] = value
         outcome.status = classify_descent(outcome)
-        outcome.note = f"goto_pixel {outcome.status}: {outcome.note}"
+        outcome.note = f"{kind} {outcome.status}: {outcome.note}"
         return outcome
 
-    def _annotate(self, cam_key: str, image_display: np.ndarray) -> np.ndarray:
-        """Grid + gripper crosshair, only in `pixels` mode.
+    def _annotate(
+        self,
+        cam_key: str,
+        image_display: np.ndarray,
+        mark: list[Any] | None = None,
+    ) -> np.ndarray:
+        """Grid + gripper crosshair (+ the caller's ring), only in `pixels` mode.
 
         The grid is what makes a pixel NAMEABLE by the model, and the crosshair is
         where the gripper actually is (its own proprioception, projected) -- the
-        pair replaces "the tool told me where the object is".
+        pair replaces "the tool told me where the object is". The optional `mark`
+        is `aim`'s dry run: `[camera_key, u, v]`, drawn on that camera only, so
+        "where I asked" and "where my hand is" can be compared in one frame.
         """
         if self.observation_mode != "pixels":
             return image_display
         try:
             camera = self._camera(cam_key)
             eef = self.sim._obs.get("robot0_eef_pos") if self.sim._obs else None
-            return annotate_frame(image_display, camera, eef, self.pixel_grid_px)
+            ring = None
+            if mark and str(mark[0]) == str(cam_key):
+                ring = (float(mark[1]), float(mark[2]))
+            return annotate_frame(
+                image_display,
+                camera,
+                eef,
+                self.pixel_grid_px,
+                mark=ring,
+                mark_radius=self.aim_mark_px,
+            )
         except Exception as exc:  # noqa: BLE001 - annotation must never break a step
             print(f"[server] annotate failed: {type(exc).__name__}: {exc}", flush=True)
             return image_display
@@ -285,13 +493,20 @@ class SimServer:
                 return key
         return None
 
-    def _image_payload(self, cmd_id: int, inline: bool) -> dict[str, Any]:
-        """Camera frames for a response: base64-inline (TCP) or on disk (NFS)."""
-        if inline:
-            return {"images_b64": self._images_b64()}
-        return {"images": self._save_images(cmd_id)}
+    def _image_payload(
+        self, cmd_id: int, inline: bool, mark: list[Any] | None = None
+    ) -> dict[str, Any]:
+        """Camera frames for a response: base64-inline (TCP) or on disk (NFS).
 
-    def _images_b64(self) -> dict[str, str]:
+        `mark` is deliberately a parameter and not server state: a ring left over
+        from an earlier `aim` would read as "your point is here" on a frame the model
+        is using for a DIFFERENT decision, i.e. it would be a silently wrong target.
+        """
+        if inline:
+            return {"images_b64": self._images_b64(mark)}
+        return {"images": self._save_images(cmd_id, mark)}
+
+    def _images_b64(self, mark: list[Any] | None = None) -> dict[str, str]:
         """Both camera frames as base64 PNGs (display orientation)."""
         from PIL import Image
 
@@ -300,11 +515,11 @@ class SimServer:
         for cam, frame in self.sim.images().items():
             buf = io.BytesIO()
             display = np.asarray(frame)[::-1]
-            Image.fromarray(self._annotate(cam, display)).save(buf, format="PNG")
+            Image.fromarray(self._annotate(cam, display, mark)).save(buf, format="PNG")
             out[cam] = base64.b64encode(buf.getvalue()).decode("ascii")
         return out
 
-    def _save_images(self, cmd_id: int) -> dict[str, str]:
+    def _save_images(self, cmd_id: int, mark: list[Any] | None = None) -> dict[str, str]:
         """Persist both camera frames as PNG; returns camera -> relative path."""
         from PIL import Image
 
@@ -319,7 +534,7 @@ class SimServer:
             # display orientation the E6 probe validated. Same annotation helper
             # as the TCP path, so the two transports cannot drift apart.
             display = np.asarray(frame)[::-1]
-            Image.fromarray(self._annotate(cam, display)).save(self.ipc_dir / name)
+            Image.fromarray(self._annotate(cam, display, mark)).save(self.ipc_dir / name)
             paths[cam] = name
         self._images_saved += 1
         return paths

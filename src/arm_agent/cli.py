@@ -39,6 +39,7 @@ def cmd_sim_server(args: argparse.Namespace) -> int:
         seed=args.seed,
         observation_mode=args.observation_mode,
         pixel_grid_px=args.pixel_grid,
+        aim_mark_px=args.aim_mark,
     )
     if getattr(args, "tcp_port", None):
         server.serve_tcp(port=args.tcp_port, idle_exit_s=args.idle_exit)
@@ -187,13 +188,20 @@ def main(argv: list[str] | None = None) -> int:
         default="truth",
         choices=["truth", "pixels"],
         help="truth = 允许按名字取仿真真值坐标；pixels = 断掉那条路，"
-        "只接受 goto_pixel，并把带网格+夹爪准线的画面送给模型",
+        "只接受 aim/target 给像素，并把带网格+夹爪准线的画面送给模型",
     )
     p.add_argument(
         "--pixel-grid",
         type=int,
         default=32,
         help="pixels 模式下画面网格间距（像素）",
+    )
+    p.add_argument(
+        "--aim-mark",
+        type=int,
+        default=6,
+        help="pixels 模式下 aim 红圈半径（像素）：实验变量，"
+        "6 是当前默认（3 太小、看不出红圈与目标的差距）",
     )
     p.add_argument(
         "--tcp-port",
@@ -304,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         default="truth",
         choices=["truth", "pixels"],
         help="truth = 仿真提供物体坐标（A/B 基线）；pixels = 不提供任何物体坐标，"
-        "模型用带网格的画面给 goto_pixel 传像素。必须同时给 sim-server 同样的值。",
+        "模型用带网格的画面给 aim/target 传像素。必须同时给 sim-server 同样的值。",
     )
     p.add_argument(
         "--pixel-grid",

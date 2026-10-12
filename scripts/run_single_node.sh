@@ -59,11 +59,20 @@ echo "==> starting local simulator on 127.0.0.1:$TCP_PORT"
 # position could ever be correct. Being able to vary the scene is a precondition
 # for telling "the model cannot aim" apart from "the target moved".
 SCENE_ARGS=(--seed "${SEED:-0}" --task-id "${TASK_ID:-0}")
+# Render size. 档 B measured that the MODEL's pointing error in the 256 px
+# third-person view is >12 cm while the can is only ~9 px wide there (the `[aim]`
+# line in the server log reports the gap to the true object per call), so the
+# resolution is a variable of the experiment, not a constant.
+SCENE_ARGS+=(--cam "${CAM:-256}")
 # 档 B: `truth` lets the harness resolve object names through the simulator's own
-# positions; `pixels` removes that path entirely (goto_pixel only) and annotates
+# positions; `pixels` removes that path entirely (aim/target on pixels) and annotates
 # every frame with a coordinate grid + the gripper crosshair. The server ENFORCES
 # it, and the harness mirrors it so the advertised tool surface matches.
 SCENE_ARGS+=(--observation-mode "${OBS_MODE:-truth}" --pixel-grid "${PIXEL_GRID:-32}")
+# Radius of the `aim` ring, in pixels. An experiment variable on purpose: 3 px was
+# the first proposal and is too small to judge a gap against (see
+# pixel_grounding.AIM_MARK_RADIUS_PX for the measurement).
+SCENE_ARGS+=(--aim-mark "${AIM_MARK_PX:-6}")
 SIM_EGL_MODE=${SIM_EGL_MODE:-hardware} \
     bash "$HERE/simenv.sh" -u -m arm_agent.cli sim-server \
     --ipc-dir "$IPC_DIR" --tcp-port "$TCP_PORT" --idle-exit 7200 \

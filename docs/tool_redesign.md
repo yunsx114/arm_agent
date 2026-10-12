@@ -214,10 +214,68 @@ JSON 里，而 pixels 模式的全部意义就是"没有物体身份"。
 * 第三人称的 3.7mm/px 决定了"一次到位"不可行；`goto_pixel` 不做自动再观察，由模型自己分两段。
 * 尚未用真模型跑过（需要 GPU）。预期的新失败形态：模型读网格读不准、或忘了给 clearance。
 
-## 8. 参考
+## 8. 档 B v2：`goto_pixel` → `aim` + `target`（2026-10-12）
+
+### 8.1 为什么改（实测，不是推测）
+
+| 分辨率 | 模型瞄的像素 vs 罐子真实像素 | 离罐子 | 行为 |
+|---|---|---|---|
+| 256 | asked (96,128)/(112,160) vs can (65.5,123.3) | **>121mm** | 37 轮里只调 1 次像素，其余 36 轮是盲 `move` |
+| 512 | asked (96,288) ×4（四次几乎逐像素相同）vs can (131,247) | **101mm** | 5 次像素 + 19 次 `move`，同样转为盲走 |
+
+⇒ 提高分辨率把"瞄错物体"变成"瞄对物体但偏 10cm"，但**偏置是系统性的**，所以"多试几次会收敛"
+不成立；而抓取容差只有 ±2.2cm（实测 2.2cm 仍能夹住、4.6cm 夹空）。差 5 倍。
+
+⇒ 结论：这个模型做**绝对像素命名**就是 ~50px/10cm 级精度。补分辨率补不上。要补的是
+**把绝对估计换成相对判断**——这正是 Jev 分层原则里的"方向由模型定、幅度由代码定"。
+
+### 8.2 设计（两个工具，一静一动）
+
+| 工具 | 动作用 | 相机 | 返回 |
+|---|---|---|---|
+| `aim(camera, u, v)` | **干跑**：把红圈画在指定像素上，不动手、不走物理 tick | agent **或** wrist | 同一张带网格的图 + `marked`/`rejected` + mm/px |
+| `target(camera, u, v, offset_mm, max_steps)` | 移到该像素（反投影 + 模型给的 clearance） | 只能 agent | `arrived`/`short`/`blocked`/`rejected` |
+
+* 红圈画在**模型给的那个像素**上，不画在反投影再投影回来的位置（往返实测 0.000px，
+  画回去只会掩盖接地误差）。同时图上有**青色十字=夹爪真实投影**，所以"我想去哪"和"我在哪"
+  可以在同一张图里比。
+* 标记几何：**6px 空心圆环 + 1px 黑描边 + 中心点**（`AIM_MARK_RADIUS_PX`）。第一版提案的
+  3×3 实心点在 256px 下只有罐子（~16px 宽）的 1/5，看不出差距；而**要看的不是标记本身，
+  是标记与目标的差距**。半径是 CLI/环境变量（`AIM_MARK_PX`），因为它是个实验变量。
+* **短动作块**：`max_steps`（1~8，默认 8）限制一次调用最多几个 xy/z 修正步，对应 Jev 的
+  `max_motor_steps`。旧实现一次调用最多 80 步（~40cm 行程）——两次真实跑各有 36/19 轮盲走。
+  块用尽会回 `truncated`，措辞与 `blocked` 分开（一个是"停下来看看"，一个是"过不去"）。
+* **拒绝分成两类**，一刀切开：**物理上不可用**（越界/深度无效）→ 软拒绝，带理由 + 把画面一起
+  退回（同一轮就能换点）；**工具用错**（`target` 给 wrist）→ 抛错并给替代写法（腕部只能 `aim`）。
+* pixels 模式下**从给模型的那份结果里剥掉世界坐标**（`surface_xyz`/`target_xyz`/`offset_m`/
+  `depth_m`/`mark`），转写里全留。`mm_per_px` 故意留给模型：它需要一把尺子把格子换成厘米。
+
+### 8.3 守卫与实测
+
+`probe_harness_dryrun.py` 像素腿（无 LLM）：**13 项全 PASS**，`success=True source=env turns=17`，
+其中新增的：`aim` 只标注不动手（用 `eef_start==eef_end` 判）、`aim` 可用腕部而 `target` 不行、
+越界像素被拒且有理由、**短动作块有上限（每次 ≤ 8 个修正步）**、不给模型世界坐标键、
+**红圈真的出现在返回的画面上**（按 `AIM_MARK_COLOUR` 像素计数，不是"代码里画了"）。
+
+肉眼复核（`scripts/probe_aim_marker.py`，故意瞄偏 30px）：红圈画在 requested 像素上，
+落点是旁边的瓶子（仪器独立报告离 `alphabet_soup_1` 16mm、离罐子像素 30px），两张图都
+能看出差距——即"仪器计数"与"像素"两处独立证实。
+
+### 8.4 已知粗糙处
+
+* `aim` 的代价是**一个模型回合**（每回合 ~2–6s），所以"调到满意再动手"确实更贵；
+  这是拿回合换精度的交易，而旧路子（盲目移动）已经证明换不到。
+* 尚未测过"模型能不能看出红圈与目标的差距"——这正是下一个岔路口：若 Δ 不收敛，就不该再
+  加像素粒度，而应换成**是非题/候选菜单**（Jev 每轴 `negative|hold|positive`）。
+* `zoom=True`（以该像素为中心放大 4× 的裁剪）没有做，留作下一个实验变量。
+* skill 文件（`skills/scene_tools.md`）已同步改名，但它是**共享**的，truth 模式也会读到
+  `aim`/`target` 的段落（那里这两个工具不存在，靠 tools 列表不广告来兑）。
+
+## 9. 参考
 
 * 计划与教训：[`docs/P0_stripdown.md`](P0_stripdown.md)（该剥/不该剥的边界）
 * 场景与几何实测：[`skills/scene_tools.md`](../skills/scene_tools.md)
 * 放手位姿审计：[`scripts/audit_release_poses.py`](../scripts/audit_release_poses.py)
+* aim 标记/不动手探针：[`scripts/probe_aim_marker.py`](../scripts/probe_aim_marker.py)
 * Jev 出处：`src/embodied_jev/physics.py::contacts`、`libero_policy.py::resolve_plan`/`annotated_image`、
   `hierarchical.py::assemble_motion`、`perception.py::VisualObserver`/`ImageObserver`

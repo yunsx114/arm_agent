@@ -214,31 +214,91 @@ def ground_pixel(
 
 
 # ------------------------------------------------------------------ annotation
-def annotate_frame(
-    image_display: np.ndarray, camera: Camera, eef_world: np.ndarray | None, grid_px: int
-) -> np.ndarray:
-    """Draw a coordinate grid and the gripper's own projected pixel.
+# Marker geometry for `aim` (档 B v2).
+#
+# The first proposal was a 3x3 dot, and it is too small to be a reference the model
+# can judge against: at 256 px the can is ~16 px wide and one pixel is 3.7 mm, while
+# the measured pointing error is 30-50 px -- so the marker is not the measurement,
+# the GAP between marker and object is, and a 3 px dot hides inside a 16 px object.
+# A 6 px ring with a dark halo is the smallest thing that (a) stays visible on a
+# same-coloured object and (b) leaves the target's silhouette readable INSIDE it,
+# which is exactly what the model has to compare.
+AIM_MARK_RADIUS_PX = 6
+AIM_MARK_COLOUR = (255, 48, 48)
 
-    Only two things go on the image: a numbered grid (so the model can NAME a
-    pixel -- measured cost of the grid pitch: 4 px = 2.8 mm, 8 px = 9.5 mm,
-    16 px = 32 mm from the third-person view) and a crosshair where the gripper
-    actually is. No object labels, no boxes: identifying the target is the job.
+
+def annotate_frame(
+    image_display: np.ndarray,
+    camera: Camera,
+    eef_world: np.ndarray | None,
+    grid_px: int,
+    minor_px: int | None = None,
+    mark: tuple[float, float] | None = None,
+    mark_radius: int | None = None,
+) -> np.ndarray:
+    """Draw a coordinate grid, the gripper's own projected pixel, and (only when
+    `aim` asks for it) a ring where the MODEL said it wanted to go.
+
+    Only two things go on the image by default: a numbered grid (so the model can
+    NAME a pixel) and a crosshair where the gripper actually is. No object labels,
+    no boxes -- identifying the target is the job.
+
+    `mark` is the 档 B v2 addition and it changes what the image is FOR. The
+    crosshair answers "where is my hand"; the ring answers "where would I land if I
+    asked now" -- a dry run with no motion. Comparing those two against the object
+    is a RELATIVE judgement ("the ring is left of the can by two cells"), which is
+    the thing a small VLM can do, unlike naming an absolute pixel (measured: 30-50 px
+    systematic bias at both 256 px and 512 px, stable across four calls).
+
+    The ring is drawn at the pixel the caller ASKED for, never at the pixel that
+    the requested point re-projects to: the round trip is 0.000 px (measured in
+    probe_pixel_grounding), so re-projecting would hide exactly the grounding error
+    this tool exists to expose.
+
+    MEASURED grid cost (scripts/probe_pixel_grounding.py, third-person view at the
+    can's depth, 3.72 mm/px): snapping to a 4 px cell costs 2.8 mm, 8 px costs
+    9.5 mm, 16 px costs 32 mm, 32 px costs 185 mm. So the LABELS only have to
+    appear every `grid_px` (32 keeps the numbers readable), while the FINE
+    structure the model counts against must be much closer than that. First
+    version drew only 32 px lines and the model's first real run aimed 30-50 px
+    off the target (11-19 cm) -- the grid it had to count on was 185 mm coarse.
+    Minor lines are therefore drawn at `grid_px // 4` (8 px by default).
     """
     from PIL import Image, ImageDraw
 
     pil = Image.fromarray(np.asarray(image_display)).convert("RGB")
     draw = ImageDraw.Draw(pil)
     width, height = pil.size
-    grid_px = max(int(grid_px), 4)
+    grid_px = max(int(grid_px), 8)
+    minor = max(int(minor_px if minor_px else grid_px // 4), 2)
+    for x in range(minor, width, minor):
+        if x % grid_px:
+            draw.line((x, 0, x, height), fill=(150, 158, 164), width=1)
+    for y in range(minor, height, minor):
+        if y % grid_px:
+            draw.line((0, y, width, y), fill=(150, 158, 164), width=1)
     for x in range(0, width, grid_px):
-        draw.line((x, 0, x, height), fill=(120, 130, 138), width=1)
+        draw.line((x, 0, x, height), fill=(96, 106, 116), width=1)
         draw.text((x + 1, 1), str(x), fill=(255, 255, 255))
     for y in range(grid_px, height, grid_px):
-        draw.line((0, y, width, y), fill=(120, 130, 138), width=1)
+        draw.line((0, y, width, y), fill=(96, 106, 116), width=1)
         draw.text((1, y + 1), str(y), fill=(255, 255, 255))
     if eef_world is not None:
         u, v, _ = camera.project(np.asarray(eef_world, dtype=float))
         if camera.inside(u, v):
             draw.line((u - 8, v, u + 8, v), fill=(0, 255, 255), width=2)
             draw.line((u, v - 8, u, v + 8), fill=(0, 255, 255), width=2)
+    if mark is not None:
+        mu, mv = float(mark[0]), float(mark[1])
+        # An off-frame mark is NOT clamped to the border: the caller rejects the
+        # request with a reason instead, and a dot drawn at the edge would read as
+        # "your point is here", i.e. as a silently different target (Jev's rule).
+        if camera.inside(mu, mv):
+            r = max(int(mark_radius or AIM_MARK_RADIUS_PX), 2)
+            # Halo first, ring on top: the halo keeps it visible on a white object,
+            # the 1 px ring keeps the object's edge readable where it crosses.
+            draw.ellipse((mu - r, mv - r, mu + r, mv + r), outline=(0, 0, 0), width=3)
+            draw.ellipse((mu - r, mv - r, mu + r, mv + r), outline=AIM_MARK_COLOUR, width=1)
+            draw.rectangle((mu - 2, mv - 2, mu + 2, mv + 2), fill=(0, 0, 0))
+            draw.rectangle((mu - 1, mv - 1, mu + 1, mv + 1), fill=AIM_MARK_COLOUR)
     return np.asarray(pil)
