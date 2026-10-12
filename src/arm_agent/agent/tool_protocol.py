@@ -12,39 +12,40 @@ from typing import Any
 CANONICAL_TOOLS = (
     "observe", "aim", "target", "approach", "move", "rotate", "gripper", "grasp", "release", "verify",
 )
-# Tool surfaces that are legal in ONE observation mode only (档 B). The mode is
-# owned by the simulator, so the harness mirrors it here purely to keep the
-# advertised schema honest: in `pixels` mode `approach` would have to read the
-# simulator's own object positions, which is exactly what that mode removes.
+# WHICH TOOLS EACH OBSERVATION MODE ADVERTISES AND ACCEPTS (v2).
 #
-# `aim`/`target` are blocked in `truth` mode for the same class of reason, from the
-# other side: they are the pixel interface, and truth mode still has
-# `approach(<name>)`. The truth surface stays byte-identical to the one the 16-episode
-# A/B baseline ran on, so adding the pixel tools cannot move that baseline.
-MODE_ONLY_TOOLS: dict[str, frozenset[str]] = {
-    "pixels": frozenset({"approach"}),
-    "truth": frozenset({"aim", "target"}),
+# A whitelist, not a blocklist. With a blocklist every new mode silently inherits
+# every tool it forgot to exclude -- which is exactly how `gripper` would have leaked
+# back into `truth` after 档 A replaced it, and how a "no pixel tools" mode would have
+# kept the pixel tools.
+#
+#   truth  -- the simulator owns object positions, so the model aligns by NAME.
+#             Left byte-identical to the surface the 16-episode A/B baseline ran on.
+#   pixels -- no object coordinates anywhere; the model names pixels (档 B).
+#   raw    -- the minimum surface that can still do a pick-and-place: move + open/
+#             close + the env check. No localisation aid of ANY kind, neither by name
+#             nor by pixel -- the model has to convert what it sees into world-axis
+#             motion itself. This is the last rung of the ladder: every tool removed
+#             is a crutch removed.
+MODE_TOOLS: dict[str, frozenset[str]] = {
+    "truth": frozenset({"approach", "move", "rotate", "grasp", "release", "verify"}),
+    "pixels": frozenset({"aim", "target", "move", "rotate", "grasp", "release", "verify"}),
+    "raw": frozenset({"move", "gripper", "verify"}),
 }
-# Registered here but blocked under v2 by UNREGISTERED_TOOLS below.
-# Temporarily UNREGISTERED surfaces: the code path stays (dispatch, aliases,
+DEFAULT_MODE = "truth"
+# Registered in code, advertised in NO mode: the path stays (dispatch, aliases,
 # validation) but the model is neither shown the tool nor allowed to call it.
 #
-# `observe` is off since 2026-10-10 on purpose. Every turn now carries BOTH
-# camera frames, so the question this ablation answers is "can the model work
-# from pixels alone?" -- previously `observe <target>` was the ONLY source of
-# object coordinates, and it was also the only way to refresh a frame.
-# Re-enabling is deleting the entry below.
-#
-# `gripper` (open/close + a finger-width readout) is off since 2026-10-11: it is
-# replaced by `grasp` / `release`, which decide from the CONTACT table and answer
-# in concepts instead of millimetres. Blocking it under v2 means the ablation
-# cannot silently fall back to the old surface -- the same reason `observe` is
-# blocked, and the validator checks this (see UNREGISTERED_TOOLS below).
-#
-# The validator check matters for experimental validity: a model that calls a
-# tool from memory would otherwise still succeed, silently leaking the numbers
-# this ablation is trying to remove.
-UNREGISTERED_TOOLS: frozenset[str] = frozenset({"observe", "gripper"})
+# `observe` has been off since 2026-10-10: every turn now carries BOTH camera frames,
+# so `observe <target>` would only re-add object coordinates, which is the thing the
+# observations modes exist to remove.
+UNREGISTERED_TOOLS: frozenset[str] = frozenset({"observe"})
+
+
+def tools_for_mode(observation_mode: str) -> frozenset[str]:
+    """The v2 surface of one observation mode (unknown mode -> the truth surface)."""
+    return MODE_TOOLS.get(str(observation_mode).strip().lower(), MODE_TOOLS[DEFAULT_MODE])
+
 LEGACY_TOOLS = (
     "look", "locate", "descend_to", "align_xy", "get_state", "move",
     "rotate", "set_gripper", "declare_done", "write_skill", "read_skill",
@@ -117,18 +118,14 @@ def validate_tool_call(
     allowed = LEGACY_TOOLS if legacy else CANONICAL_TOOLS
     if name not in allowed:
         return [f"unknown_tool:{name}"]
-    # Mode-excluded tools are rejected HERE rather than silently dispatched, so a
-    # `pixels` run cannot answer a question it claims not to have the data for.
-    blocked_in_mode = MODE_ONLY_TOOLS.get(str(observation_mode).strip().lower(), frozenset())
-    if not legacy and (canonical_name(name) in blocked_in_mode or name in blocked_in_mode):
-        return [f"mode_blocked_tool:{name}"]
-    # Scoped to the v2 surface on purpose: the legacy surface is the documented
-    # A/B path (and the no-GPU `probe_harness_dryrun.py` regression), which must
-    # keep working while this ablation is on. The ablation itself cannot leak
-    # through legacy names -- `look`/`locate`/`get_state` are not advertised
-    # anywhere in a v2 conversation, so the model has no reason to emit them.
-    if not legacy and (name in UNREGISTERED_TOOLS or canonical_name(name) in UNREGISTERED_TOOLS):
-        return [f"unregistered_tool:{name}"]
+    # The MODE's surface is enforced HERE rather than silently dispatched, so a run
+    # cannot answer a question its mode claims not to have the data for (e.g. a
+    # `pixels` run calling `approach`, or a `raw` run calling `aim`).
+    if not legacy:
+        canonical = canonical_name(name)
+        surface = tools_for_mode(observation_mode)
+        if canonical not in surface:
+            return [f"mode_blocked_tool:{name}"]
     canonical = canonical_name(name)
     normalized_args = dict(args)
     if name in ("locate", "descend_to", "align_xy"):

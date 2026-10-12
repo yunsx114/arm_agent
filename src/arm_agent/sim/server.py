@@ -75,16 +75,19 @@ class SimServer:
         self.adapter = ActionAdapter(self.sim)
         self._images_saved = 0
         self._closing = False
-        # 档 B: which channel answers "where is the object".
-        #   truth  = the simulator's own body positions (what the harness used to
-        #            consume through `approach(<name>)`; kept as the A/B baseline)
-        #   pixels = NO object coordinates anywhere: the model names a pixel in an
-        #            annotated frame and the code grounds it (Camera + depth),
-        #            which is the only variant that could survive on real hardware.
+        # 档 B / raw: which channel answers "where is the object".
+        #   truth  = the simulator's own body positions (the A/B baseline)
+        #   pixels = NO object coordinates anywhere: the model names a pixel and the
+        #            code grounds it with Camera + depth.
+        #   raw    = the same "no coordinates" rule as pixels, but WITHOUT the pixel
+        #            tools: the tool surface is move + gripper + verify, and the model
+        #            has to turn what it sees into world-axis motion itself. The camera
+        #            returns the plain frame plus the crosshair (its own FK), no grid --
+        #            a grid exists to make pixels NAMEABLE, and nothing here names one.
         # The mode is enforced here, at the single place that owns the truth, so a
-        # "pixels" run cannot silently fall back to names.
+        # "raw" run cannot silently fall back to names.
         self.observation_mode = str(observation_mode).strip().lower()
-        if self.observation_mode not in ("truth", "pixels"):
+        if self.observation_mode not in ("truth", "pixels", "raw"):
             raise ValueError(f"unknown observation_mode {observation_mode!r}")
         self.pixel_grid_px = int(pixel_grid_px)
         self.cam_size = int(cam_size)
@@ -173,10 +176,10 @@ class SimServer:
                 # Server-side primitive: servo the EEF x/y onto an object.
                 # See ActionAdapter.align_xy for why the LLM cannot do this.
                 name = str(action["name"])
-                if self.observation_mode == "pixels":
+                if self.observation_mode != "truth":
                     raise ValueError(
-                        "observation_mode=pixels：不能按物体名对准（那需要仿真真值）。"
-                        "请改用 aim 确认像素、再用 target 移动。"
+                        f"observation_mode={self.observation_mode}：不能按物体名对准（那需要仿真真值）。"
+                        + self._localisation_hint()
                     )
                 # NOTE (fixed): "objects" is SYNTHESISED by pack() from the raw
                 # `<name>_pos` keys; it does NOT exist in sim._obs. Reading it
@@ -195,10 +198,10 @@ class SimServer:
                 # tick (align_xy + separate -z was measured to block at can-top
                 # height and close on air).
                 name = str(action["name"])
-                if self.observation_mode == "pixels":
+                if self.observation_mode != "truth":
                     raise ValueError(
-                        "observation_mode=pixels：不能按物体名下降（那需要仿真真值）。"
-                        "请改用 aim 确认像素、再用 target 移动。"
+                        f"observation_mode={self.observation_mode}：不能按物体名下降（那需要仿真真值）。"
+                        + self._localisation_hint()
                     )
                 # Same fix as the align branch: take objects from pack(), not
                 # from the raw _obs (which never has an "objects" key).
@@ -466,6 +469,17 @@ class SimServer:
         outcome.note = f"{kind} {outcome.status}: {outcome.note}"
         return outcome
 
+    def _localisation_hint(self) -> str:
+        """What this mode offers INSTEAD of names (one sentence, per mode).
+
+        The refusal has to teach the alternative, or the model spends a turn guessing
+        which surface it is on: `pixels` still has a way to say "that one", `raw` has
+        none by design and has to be told so.
+        """
+        if self.observation_mode == "pixels":
+            return "请改用 aim 确认像素、再用 target 移动。"
+        return "本模式没有任何定位工具：只能 move + gripper，靠画面自己换算方向与距离。"
+
     def _annotate(
         self,
         cam_key: str,
@@ -480,7 +494,7 @@ class SimServer:
         is `aim`'s dry run: `[camera_key, u, v]`, drawn on that camera only, so
         "where I asked" and "where my hand is" can be compared in one frame.
         """
-        if self.observation_mode != "pixels":
+        if self.observation_mode == "truth":
             return image_display
         try:
             camera = self._camera(cam_key)
@@ -495,6 +509,7 @@ class SimServer:
                 self.pixel_grid_px,
                 mark=ring,
                 mark_radius=self.aim_mark_px,
+                draw_grid=self.observation_mode != "raw",
             )
         except Exception as exc:  # noqa: BLE001 - annotation must never break a step
             print(f"[server] annotate failed: {type(exc).__name__}: {exc}", flush=True)

@@ -13,7 +13,7 @@ conversation is Chinese and the template output is bilingual-tolerant.
 from __future__ import annotations
 
 from typing import Any
-from arm_agent.agent.tool_protocol import CANONICAL_TOOLS, MODE_ONLY_TOOLS, UNREGISTERED_TOOLS
+from arm_agent.agent.tool_protocol import CANONICAL_TOOLS, MODE_TOOLS, tools_for_mode
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -242,13 +242,15 @@ TOOL_SCHEMAS_V2: list[dict[str, Any]] = [
     {"type": "function", "function": {
         "name": "gripper",
         "description": (
-            "（已停用）打开或闭合夹爪，返回实测指宽。grasp / release 取代了它："
-            "指宽不是夹持事实，判定改由接触表给出。"
+            "开/关夹爪（raw 模式使用；truth/pixels 模式由 grasp/release 取代）。"
+            "close = 合上直到碰到东西；open = 张开（空手时就是复位）。**只回报概念**："
+            "grasped（两指都碰到物体）/ empty（指间是空的）/ slipped（只碰到一侧）/"
+            "released（已张开且指间无物）/ still_carrying（张不开，还夹着）。"
+            "判定来自接触表，不是指宽。不会移动机械臂。"
         ),
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["open", "close"]},
-        }, "required": ["action"]}}},
-    {"type": "function", "function": {
+        }, "required": ["action"]}}},    {"type": "function", "function": {
         "name": "grasp",
         "description": (
             "在当前位姿合上夹爪抓取。内部自行处理：先张开（仿真初始是半闭的）、闭合到两指都接触物体、"
@@ -602,25 +604,94 @@ def get_system_prompt(mode: str = "full", observation_mode: str = "truth") -> st
     """
     if str(observation_mode).strip().lower() == "pixels" and str(mode).strip().lower() == "v2":
         return SYSTEM_PROMPT_V2_PIXELS
+    if str(observation_mode).strip().lower() == "raw" and str(mode).strip().lower() == "v2":
+        return SYSTEM_PROMPT_V2_RAW
     return PROMPT_MODES.get(str(mode).strip().lower(), SYSTEM_PROMPT)
 
 
-def pixels_appendix(observation_mode: str) -> str:
-    """Mode-specific appendix (档 B). Empty unless the mode is `pixels`."""
-    return PIXELS_APPENDIX if str(observation_mode).strip().lower() == "pixels" else ""
+# Mode-specific appendix. It exists because the SHARED skill file
+# (`skills/scene_tools.md`) is injected into EVERY mode's system prompt and it
+# describes the other modes' tools; the dedicated prompt states the real surface, and
+# this is the one-line correction for the vocabulary the skill file uses.
+RAWS_APPENDIX = """
+
+## 附：本模式的词汇换算
+- 随附的场景事实里提到的 `approach(<名字>)` / `aim` / `target` **在本模式下不存在**。
+  本模式只有三个工具：`move`（世界轴平移）、`gripper`（开/关）、`verify`（让环境判定）。
+- 提到的「指宽」也不会给你数字：`gripper` 只回报概念（夹住了 / 夹空了 / 接触不稳 / 已张开 / 还夹着）。
+"""
+
+
+def mode_appendix(observation_mode: str) -> str:
+    """The vocabulary correction for this mode's skill-file mismatch (may be empty)."""
+    mode = str(observation_mode).strip().lower()
+    if mode == "pixels":
+        return PIXELS_APPENDIX
+    if mode == "raw":
+        return RAWS_APPENDIX
+    return ""
+
+
+# `raw` mode's own system prompt. It is the LONGEST tool description in the project
+# precisely because the surface is the smallest: with no localisation aid, the only
+# thing the harness can still give the model is the measured relationship between what
+# it sees and how the world moves -- and that relationship is measurement, not a
+# decision about what to do.
+SYSTEM_PROMPT_V2_RAW = """你是机械臂任务决策核心。目标是完成当前任务。
+
+每次只调用一个工具。工具结果是环境测量，不是行动建议；不要假设动作一定完成。
+不要发明工具、参数或并行调用。verify 的成功与否只由环境验证。
+
+**本模式只有三个工具**：`move`（世界轴平移，唯一能改变高度的手段）、`gripper`（open/close，
+只回报概念）、`verify`（问环境任务完成没有）。
+**每轮自动给你两张图**：全局第三人称（agent）与腕部（wrist）。
+没有任何按名字或按像素对准的工具：**从"我看到什么"到"该往哪个世界轴走多少厘米"，
+全靠你自己换算**。
+
+## 怎么把画面换成移动（这是本模式唯一的位置来源）
+- 图上的坐标系：+x = 靠近相机（画面更靠下）；-x = 远离相机（画面更靠上）；
+  +y = 画面更靠右；-y = 画面更靠左；+z = 向上。
+- 尺度：全局画面里物体处约 **1 像素 ≈ 3~4mm**（随远近变），所以 **移动 2cm ≈ 画面移动 5~7 像素**。
+  腕部画面近得多（约 1 像素 ≈ 1mm），适合看细节与对称性，但它离物体越近，同样的像素差对应的实际距离越小。
+- **一次只走一小段（1~5cm），然后重新看**。本模式的实验已经证明：不走一步看一眼而是
+  连续盲走，会把东西推走或夹空。走多了一步看起来"没动"就是碰到东西了，换一个轴试。
+- 你只知道你自己的爪心位置（每轮状态行里的世界坐标，单位米）。物体在哪里必须从画面判断。
+
+输出格式：每次回复严格按下面三段写，三段都要有，标题照抄：
+现状：（画面里的事实：目标在画面的哪个位置、爪心在画面的哪个位置、它们相差几个像素；爪上有没有东西）
+判定：（目标相对爪心偏哪个方向、大约多少像素 ⇒ 换算成哪个世界轴、走多少厘米；或该开/关夹爪）
+动作：（下一步调用哪个工具、参数是多少；必须与上面的判定一致）
+三段写完后，紧接写出完整的工具调用。除这三段外不要写任何其他内容。
+
+任务结构（括号内是这一步用的工具）：
+张开夹爪（gripper open）→ 按外观认出目标（见场景事实）→ **分几次小步 move，把爪心对到目标正上方**
+（每次 move 后重新看图）→ `move -z` 降到刚好碰到它（降不动了就停，不要再压）→ `gripper close`
+→ 看回报是「夹住了」还是「夹空了」：夹空就抬起 5cm、重新对准再试 → `move +z` 抬高到 0.25 以上
+→ 小步 move 到容器上方 → 降到你估计的合适高度 → `gripper open` → 抬高一点 → `verify`
+
+## 事实（都是测量的，不是建议）
+- `gripper close` 只回概念：**「夹住了」= 两指都碰到了物体**；「夹空了」= 指间是空的；
+  「接触不稳」= 只碰到一侧。**夹空时不要原地再关，先抬起再重新对准。**
+- `gripper open` 之后「爪上：空」是预期的（你没让它夹东西时它本来就是空的）。
+- 抬高/降低只能用 `move ±z`；单次上限 15cm。横移前爪心要 ≥0.22，因为手里物体底部在爪心下方约 5cm。
+- 容器口沿约 z=0.151，罐子高约 8.5cm。放手后物体可能先骑在口沿上，`verify` 说没好时
+  可以在容器上方轻轻再压一下（爪心不要低于 0.145），再 verify 一次；一旦通过就**立刻停手**。
+- 结果里写「未到达 / 只走了 X cm / ⚠」都表示那个动作没有完全达成；以实测数字为准。
+
+坐标系：世界坐标中 +z 向上，位置单位米，move 距离单位厘米。
+"""
 
 
 def get_tool_schemas(protocol: str = "v2", observation_mode: str = "truth") -> list[dict[str, Any]]:
     """The tool surface actually advertised to the model.
 
-    Schemas for unregistered tools stay in this file (see UNREGISTERED_TOOLS) so
-    re-enabling one is a one-line change; they are filtered out here. The same
-    filter drops tools that the current observation mode cannot honour (档 B:
-    `approach` needs the simulator's object positions, which `pixels` mode does
-    not have).
+    A WHITELIST per observation mode (`tool_protocol.MODE_TOOLS`). Schemas for every
+    tool stay in this file so re-enabling one is a one-line change in that table;
+    what the model sees is what its mode can actually honour. The `raw` mode keeps
+    exactly `move`, `gripper`, `verify` -- no localisation aid by name or by pixel.
     """
     schemas = TOOL_SCHEMAS_V2 if str(protocol).strip().lower() == "v2" else LEGACY_TOOL_SCHEMAS
-    blocked = set(UNREGISTERED_TOOLS) | set(
-        MODE_ONLY_TOOLS.get(str(observation_mode).strip().lower(), frozenset())
-    )
-    return [s for s in schemas if s["function"]["name"] not in blocked]
+    if str(protocol).strip().lower() != "v2":
+        return schemas
+    surface = tools_for_mode(observation_mode)
+    return [s for s in schemas if s["function"]["name"] in surface]

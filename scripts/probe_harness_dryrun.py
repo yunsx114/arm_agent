@@ -30,6 +30,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+from arm_agent import contracts as C
 from arm_agent.agent.harness import Harness
 from arm_agent.sim.client import SimClient
 from arm_agent.sim.pixel_grounding import (
@@ -566,6 +567,188 @@ def concept_leg(ipc_dir: Path) -> bool:
     return all(checks.values())
 
 
+def raw_next_call(server: SimServer) -> tuple[str, dict[str, Any]]:
+    """The next `move`/`gripper` call a controller would make, from TRUTH.
+
+    Privileged on purpose (same as the other legs): this answers "are two tools enough
+    to do the task at all", which is a plumbing claim. Whether a MODEL can do it with
+    only those two tools is the experiment this leg makes possible, not the thing it
+    measures.
+
+    The shape of the controller is also the recipe the `raw` prompt teaches: one small
+    step, then look again (the state is re-read from the simulator on every turn).
+    """
+    obs = server.sim._obs
+    eef = np.asarray(obs[C.OBS_EEF_POS], dtype=float)
+    objects = server.sim.pack(obs)["objects"]
+    can = np.asarray(objects["alphabet_soup_1"], dtype=float)
+    basket = np.asarray(objects["basket_1"], dtype=float)
+    width = float(np.abs(np.asarray(obs[C.OBS_GRIPPER_QPOS])).mean())
+    carried, _ = server.adapter.held_object()
+
+    def toward(target: np.ndarray, tol: float) -> tuple[str, dict[str, Any]] | None:
+        dx, dy = target[0] - eef[0], target[1] - eef[1]
+        if abs(dx) > tol or abs(dy) > tol:
+            axis, delta = ("x", dx) if abs(dx) >= abs(dy) else ("y", dy)
+            step = min(5.0, max(1.0, abs(delta) * 100.0))
+            return "move", {"direction": f"{'+' if delta > 0 else '-'}{axis}",
+                            "distance_cm": f"{step:.1f}"}
+        return None
+
+    # ORDER MATTERS, and getting it wrong produced a z-oscillation (measured while
+    # building this leg): a blanket "keep z above the travel height" rule checked
+    # BEFORE the descent rule fights the descent forever -- `-z 3cm` down to 0.214,
+    # `+z 5cm` back up to 0.263, repeat. Raise only while travelling, descend only
+    # once aligned.
+    if width < 0.030:  # pads are half closed at reset: open first (the 档 A lesson)
+        return "gripper", {"action": "open"}
+    if not carried:
+        step = toward(can, tol=0.012)
+        if step:
+            if eef[2] < 0.24:  # travel height before moving sideways
+                return "move", {"direction": "+z", "distance_cm": "5"}
+            return step
+        if eef[2] > can[2] + 0.030:
+            return "move", {"direction": "-z", "distance_cm": "3"}
+        return "gripper", {"action": "close"}
+    # carrying: up, across, down, open, and let the ENV judge.
+    step = toward(basket, tol=0.015)
+    if step:
+        if eef[2] < 0.25:
+            return "move", {"direction": "+z", "distance_cm": "10"}
+        return step
+    if eef[2] > 0.20:
+        return "move", {"direction": "-z", "distance_cm": "5"}
+    return "gripper", {"action": "open"}
+
+
+class RawPolicy:
+    """Scripted policy for the `raw` leg: the two-tool task, no localisation aid.
+
+    The first three calls deliberately ASK FOR the tools this mode removed. A refusal
+    that executes nothing costs one protocol retry and is the behavioural proof that
+    the surface is enforced rather than merely unadvertised (the same trick the pixel
+    leg uses on `approach`).
+    """
+
+    PRELUDE = (
+        ("aim", {"u": "64", "v": "128"}),
+        ("target", {"u": "64", "v": "128"}),
+        ("approach", {"target": "alphabet soup"}),
+    )
+
+    def __init__(self, server: SimServer) -> None:
+        self.server = server
+        self.sent: list[str] = []
+        self.calls: list[str] = []
+        self.grid_frames = 0
+        self.frames = 0
+        self.opens = 0
+        self.done = False
+
+    def chat(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+        if sum(1 for m in messages if m.get("role") == "assistant") > 0:
+            for message in messages:
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                for part in content if isinstance(content, list) else [content]:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        self.sent.append(str(part.get("text", "")))
+                    elif isinstance(part, dict) and part.get("type") == "image":
+                        self.frames += 1
+                        arr = np.asarray(part["image"]).reshape(-1, 3).astype(int)
+                        for grey in ((96, 106, 116), (150, 158, 164)):
+                            if int((np.abs(arr - np.array(grey)).sum(axis=1) <= 6).sum()) > 200:
+                                self.grid_frames += 1
+                    elif isinstance(part, str):
+                        self.sent.append(part)
+        done_calls = sum(1 for c in self.calls if c not in ("aim", "target", "approach"))
+        if len(self.calls) < len(self.PRELUDE):
+            name, args = self.PRELUDE[len(self.calls)]
+            self.calls.append(name)
+            return "现状：脚本化步骤。\n判定：试探被禁工具。\n动作：调用工具。\n" + _call(name, args)
+        if done_calls == 0:
+            # The prelude was refused, so no tool has actually run yet; nothing to do
+            # but keep asking for a legal one.
+            pass
+        if self.done:
+            name, args = "verify", {"claim": "placed"}
+        else:
+            name, args = raw_next_call(self.server)
+            if name == "gripper" and args["action"] == "open":
+                self.opens += 1
+                # open(pads) -> carry -> open(over the basket): the third open is the
+                # release, after which asking the ENV is the only sane move left.
+                if self.opens >= 3:
+                    self.done = True
+        self.calls.append(name)
+        return "现状：脚本化步骤。\n判定：按几何驱动。\n动作：调用工具。\n" + _call(name, args)
+
+
+def raw_leg(ipc_dir: Path) -> bool:
+    """Minimum surface: move + gripper + verify, no pixel tools, no grid."""
+    server = SimServer(
+        ipc_dir=ipc_dir,
+        suite_name="libero_object",
+        task_id=0,
+        cam_size=256,
+        observation_mode="raw",
+        pixel_grid_px=32,
+    )
+    thread = threading.Thread(target=server.serve_forever, kwargs={"idle_exit_s": 120}, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    client = SimClient(ipc_dir)
+    policy = RawPolicy(server=server)
+    harness = Harness(
+        client=client,
+        model=policy,
+        workspace=REPO,
+        max_turns=60,
+        tool_protocol="v2",
+        log=False,
+        observation_mode="raw",
+    )
+    advertised = sorted(s["function"]["name"] for s in harness.tool_schemas)
+    result = harness.run_episode(init_state_idx=0, episode_id=995)
+    transcript = json.loads(Path(result.transcript_path).read_text())["transcript"]
+    client.close()
+    time.sleep(0.3)
+    texts = [e["result"] for e in transcript if e.get("result")]
+    grip_results = [t for t in texts if t.startswith("[gripper")]
+    closed = [t for t in grip_results if "close" in t]
+    toolish = [t for t in policy.sent if t.startswith("[") or "爪上：" in t]
+    joined = "\n".join(toolish)
+    checks = {
+        "工具面正好是 move/gripper/verify": advertised == ["gripper", "move", "verify"],
+        "没有像素工具、也没有 approach": all(
+            name not in advertised for name in ("aim", "target", "approach", "grasp", "release")
+        ),
+        "aim/target/approach 被拒（各一次协议重试）": sum(
+            1 for e in transcript if e.get("protocol_retry")
+        ) >= 3,
+        "夹爪只回报概念，不给指宽": bool(closed) and all(
+            "夹住" in t or "夹空" in t or "接触不稳" in t for t in closed
+        ) and "width 0." not in joined,
+        # Two cameras per turn that actually RAN a tool (a refused call produces no
+        # frames at all -- the retry happens before dispatch), so the budget is
+        # turns minus retries, not turns.
+        "每轮都带两张画面": policy.frames >= 2 * (result.turns - result.protocol_retries),
+        "raw 模式的画面不带网格": policy.grid_frames == 0 and policy.frames > 0,
+        "两个工具就能完成任务": bool(result.success),
+    }
+    for label, passed in checks.items():
+        print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
+    print(f"  raw 腿：success={result.success} source={result.success_source} "
+          f"turns={result.turns} retries={result.protocol_retries} error={result.error!r}")
+    print(f"  工具面：{advertised}")
+    print(f"  脚本调用：{policy.calls}")
+    if closed:
+        print(f"  示例：{closed[0]} / {closed[-1]}")
+    return all(checks.values())
+
+
 def main() -> int:
     ipc_dir = REPO / "runtime" / "ipc_dryrun"
     shutil.rmtree(ipc_dir, ignore_errors=True)
@@ -615,6 +798,8 @@ def main() -> int:
     ok = concept_leg(REPO / "runtime" / "ipc_dryrun2") and ok
     print("\n=== 档 B 像素腿（pixels 模式 aim/target，无 LLM）===")
     ok = pixel_leg(REPO / "runtime" / "ipc_dryrun3") and ok
+    print("\n=== raw 腿（唯 move/gripper/verify，无定位工具，无网格，无 LLM）===")
+    ok = raw_leg(REPO / "runtime" / "ipc_dryrun4") and ok
     print("PLUMBING OK" if ok else "PLUMBING PROBLEM")
     return 0 if ok else 1
 

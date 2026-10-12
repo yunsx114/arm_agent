@@ -32,7 +32,7 @@ from arm_agent.agent.parser import (
 from arm_agent.agent.prompts import (
     get_system_prompt,
     get_tool_schemas,
-    pixels_appendix,
+    mode_appendix,
 )
 from arm_agent.agent.tool_protocol import canonical_name, structured_result
 from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
@@ -332,7 +332,7 @@ class Harness:
                 )
 
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": get_system_prompt(self.prompt_mode, self.observation_mode) + self.shared_skill + pixels_appendix(self.observation_mode) + self._skills_index()},
+                {"role": "system", "content": get_system_prompt(self.prompt_mode, self.observation_mode) + self.shared_skill + mode_appendix(self.observation_mode) + self._skills_index()},
                 {
                     "role": "user",
                     "content": [
@@ -612,7 +612,14 @@ class Harness:
                 # (width 0.0207, inside the "holding" band) with ZERO finger
                 # contacts, so the old width test reported a grasp on an empty
                 # hand at the very start of every episode.
-                if _tool in ("grasp", "release") and outcome.get("held") is not None:
+                if _tool in ("grasp", "release", "gripper") and outcome.get("held") is not None:
+                    # ONE rule for all three surfaces: the CONTACT table answers "is
+                    # anything between the pads". The old `gripper` path asked the
+                    # finger WIDTH (`"holding" in note`), which reported an empty hand
+                    # as holding at every reset (pads start half closed at 0.0207 with
+                    # zero contacts) -- MEASURED, and the reason 档 A moved the verdict
+                    # to contact in the first place. `raw` mode exposes the raw action,
+                    # but it does not re-expose the wrong sensor.
                     self._grasped = bool(outcome["held"])
                     self._held_body = _object_key_from_body(
                         (outcome.get("measurement") or {}).get("object_body")
@@ -1006,6 +1013,14 @@ class Harness:
                 "kind": outcome.get("kind"),
                 "note": outcome.get("note", ""),
                 "requested": outcome.get("requested", {}),
+                # `status` / `held` / `measurement` are carried for the SAME reason the
+                # grasp branch carries them: `raw` mode's `gripper` has to be judged
+                # from the contact table (see the episode-loop note), and
+                # `format_outcome` reads the concept this way. For `move`/`rotate` the
+                # adapter leaves them empty, so this is additive.
+                "status": outcome.get("status", ""),
+                "held": outcome.get("held"),
+                "measurement": outcome.get("measurement") or {},
                 # Keep the adapter's own dict so the v2 envelope can carry the
                 # MEASURED numbers. `format_outcome` consumes them to build the
                 # human text, and without this copy the structured `measurement`
@@ -1493,6 +1508,23 @@ def format_outcome(outcome: dict[str, Any]) -> str:
     if kind == "set_gripper":
         note = outcome.get("note", "")
         action = requested.get("action")
+        # CONCEPT FIRST (`raw` mode). The contact-derived verdict is the one that can
+        # be trusted: MEASURED, the width test calls an empty hand "holding" at reset
+        # (pads start at 0.0207 with zero contacts) and cannot tell a can from a rim
+        # (0.0183 vs 0.0197). The width sentence below is only the fallback for a
+        # transcript whose adapter did not carry a verdict.
+        concept = {
+            "grasped": "夹住了（两指都碰到物体）",
+            "empty": "夹空了（指间是空的）",
+            "slipped": "接触不稳（只碰到一侧）",
+            "released": "已张开（指间无物体）",
+            "still_carrying": "张不开（还夹着东西）",
+        }.get(str(outcome.get("status") or ""))
+        if concept:
+            return (
+                f"[gripper {action}] {concept}（{ticks} ticks）；"
+                f"机械爪位于 {_fmt3(end)}"
+            )
         # Turn the raw finger width into the decision the model needs.
         #
         # BUG FIXED (this is what dropped the can twice in the 80-turn run):

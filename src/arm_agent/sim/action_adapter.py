@@ -402,6 +402,26 @@ class ActionAdapter:
         else:
             grip_state = "holding"
         outcome.note = f"gripper finger width {width:.4f} ({grip_state})"
+        # THE CONTACT TABLE DECIDES, NOT THE WIDTH (档 A's rule, applied to the raw
+        # open/close the `raw` mode exposes). MEASURED reason: at reset the pads sit
+        # half closed (width 0.0207) with ZERO finger contacts, so the width check
+        # above calls an empty hand "holding" at the start of every episode -- and a
+        # close that stops on air parks the pads at 0.0007, i.e. `empty`, which is
+        # right, while a close that stops on a rim gives 0.0183, which the width test
+        # ALSO cannot tell from a real grasp (measured 2026-10-10).
+        href, sides = self.held_object()
+        outcome.held = href is not None
+        outcome.measurement.update(
+            {
+                "width_mm": round(width * 1000.0, 1),
+                "contact_sides": sorted(sides),
+                "object_body": href,
+            }
+        )
+        if action_name == "close":
+            outcome.status = "grasped" if href else ("slipped" if sides else "empty")
+        else:
+            outcome.status = "still_carrying" if href else "released"
         return outcome
 
     # --------------------------------------------------------- grasp concept

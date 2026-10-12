@@ -271,6 +271,7 @@ def annotate_frame(
     minor_px: int | None = None,
     mark: tuple[float, float] | None = None,
     mark_radius: int | None = None,
+    draw_grid: bool = True,
 ) -> np.ndarray:
     """Draw a coordinate grid, the gripper's own projected pixel, and (only when
     `aim` asks for it) a ring where the MODEL said it wanted to go.
@@ -307,16 +308,20 @@ def annotate_frame(
     width, height = pil.size
     grid_px = max(int(grid_px), 8)
     minor = max(int(minor_px if minor_px else grid_px // 4), 2)
-    for x in range(minor, width, minor):
+    # `draw_grid=False` is the `raw` mode: a grid exists to make pixels NAMEABLE, and
+    # that mode has no pixel tool to name one with. The crosshair stays (it is the
+    # robot's own forward kinematics drawn on the frame, i.e. proprioception, not
+    # scene truth) -- dropping it is the next rung if this one is not enough.
+    for x in range(minor, width, minor) if draw_grid else ():
         if x % grid_px:
             draw.line((x, 0, x, height), fill=(150, 158, 164), width=1)
-    for y in range(minor, height, minor):
+    for y in range(minor, height, minor) if draw_grid else ():
         if y % grid_px:
             draw.line((0, y, width, y), fill=(150, 158, 164), width=1)
-    for x in range(0, width, grid_px):
+    for x in range(0, width, grid_px) if draw_grid else ():
         draw.line((x, 0, x, height), fill=(96, 106, 116), width=1)
         draw.text((x + 1, 1), str(x), fill=(255, 255, 255))
-    for y in range(grid_px, height, grid_px):
+    for y in range(grid_px, height, grid_px) if draw_grid else ():
         draw.line((0, y, width, y), fill=(96, 106, 116), width=1)
         draw.text((1, y + 1), str(y), fill=(255, 255, 255))
     if eef_world is not None:
