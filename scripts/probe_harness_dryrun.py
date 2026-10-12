@@ -1094,16 +1094,41 @@ def look_leg(ipc_dir: Path) -> bool:
         "任务消息不带任何画面（开局是盲的）": policy.initial_message_images == 0,
         "没 look 之前不会出现画面": policy.frames_before_look == 0,
         "look 之后才有画面（每张 look 都留下）": policy.max_images_seen >= 2 * policy.looks > 0,
-        "历史图片没有被清理（图片数只增不减）": (
-            bool(policy.image_series)
-            and all(b >= a for a, b in zip(policy.image_series, policy.image_series[1:]))
-            and policy.image_series[-1] >= 2 * policy.calls.count("look")
-        ),
         "look 被拒绝前的试探给出协议重试": sum(1 for e in transcript if e.get("protocol_retry")) >= 1,
         "aim 在本模式被拒（拒绝理由回到模型）": "mode_blocked_tool" in joined,
         "画面不带网格": policy.grid_frames == 0 and policy.frames > 0,
         "三工具仍能完成任务": bool(result.success),
     }
+    # THE ONLY THING ALLOWED TO DROP FRAMES IS THE COMPRESSION. With `summary_every=32`
+    # (the default) the summariser replaces the whole history at turn 33 -- that IS what
+    # compression is, and it reclaims the images with it. So the property is not "monotone"
+    # but: within a block the count never decreases, and every decrease lands exactly on 0
+    # (a decrease to anything else would be the piecemeal elision of the legacy
+    # `image_keep=2` budget, which is what this mode exists to remove).
+    series = policy.image_series or [0]
+    drops = [i for i, (a, b) in enumerate(zip(series, series[1:])) if b < a]
+    # Split AT each drop: a segment is [start .. drop], so the drop itself opens the next
+    # one. (First version split on `drops[1:]`, which left the drop inside the only segment
+    # and made the "monotone within a block" check fail on a correct series.)
+    segments: list[list[int]] = []
+    start = 0
+    for d in drops:
+        segments.append(series[start:d + 1])
+        start = d + 1
+    segments.append(series[start:])
+    kept_within_block = all(all(b >= a for a, b in zip(seg, seg[1:])) for seg in segments)
+    drops_are_compressions = all(series[i + 1] == 0 for i in drops)
+    # The frames really do accumulate inside a block (peak = 2 per look: agent + wrist), and
+    # the drop is the compression reclaiming them -- after which a scripted policy that stops
+    # looking reads 0 for the rest of the episode, which is correct, not a leak.
+    peak_before_drop = max(series[: (drops[0] + 1) if drops else len(series)])
+    checks["历史图片只在压缩时被回收（块内只增不减、掉就掉到 0）"] = (
+        kept_within_block
+        and drops_are_compressions
+        and peak_before_drop >= 2 * policy.calls.count("look")
+        and bool(drops)
+    )
+    print(f"  [诊断] 每轮提示里的图片数序列={series}（掉帧位置={drops}，掉前峰值={peak_before_drop}）")
     for label, passed in checks.items():
         print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
     print(f"  look 腿：success={result.success} source={result.success_source} "
