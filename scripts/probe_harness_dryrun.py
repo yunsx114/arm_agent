@@ -890,9 +890,9 @@ def ladder_leg(ipc_dir: Path) -> bool:
             "moved_cm": abs(float(delta[axis])) * 100.0,
             "wobble_cm": max(abs(float(v)) for v in delta) * 100.0,
         })
-    # Calibration = the first three moves that actually RAN (a refused call produces
-    # none), in order: +x far, -x near, -x fine.
-    calibration = moves[:3]
+    # Calibration = the first four moves that actually RAN (a refused call produces none),
+    # in order: +x far, -x near, -x fine, then the gap_px call.
+    calibration = moves[:4]
     by_rung = {m["rung"]: m for m in calibration}
     nominal = {"far": 10.0, "near": 1.0, "fine": 0.1}
     # Tolerance per rung: 25% or 0.5mm, whichever is larger -- a 1mm rung measured
@@ -903,24 +903,31 @@ def ladder_leg(ipc_dir: Path) -> bool:
         rung_ok[rung] = got is not None and abs(got - want) <= max(0.25 * want, 0.05)
     requested_values = {round(m["requested_cm"], 3) for m in moves}
     checks = {
-        "move 的 schema 只有 size（没有 distance_cm）": advertised_props == ["direction", "size"],
-        "档位值写进了参数描述": "far=10厘米" in move_schema["parameters"]["properties"]["size"]["description"],
-        "提示词里有档位升降规则": "降一档" in policy.system and "升一档" in policy.system,
-        # The step rule must be SWAPPED, not appended to: raw's recipe says "一次只走一小段
-        # （1~5cm）", which the ladder cannot express (its steps are 1cm and 10cm), and a
-        # leftover "1~5cm" is what made the model reach for `far` on 4cm errors (MEASURED,
-        # 2.46x overshoot six times in a row).
-        "raw 的 1~5cm 配方被换成了档位换算表": (
+        "move 的 schema 有 gap_px+size、没有 distance_cm": (
+            advertised_props == ["direction", "gap_px", "size"]
+        ),
+        "档位值与像素差都写进了参数描述": (
+            "far=10厘米" in move_schema["parameters"]["properties"]["size"]["description"]
+            and "像素" in move_schema["parameters"]["properties"]["gap_px"]["description"]
+        ),
+        "提示词叫它报像素、别自己换算": (
+            "gap_px" in policy.system and "不要自己换算成厘米" in policy.system
+        ),
+        "raw 的 1~5cm 配方被换成了像素档位表": (
             "一次只走一小段（1~5cm）" not in policy.system
-            and "还差 3~25 像素" in policy.system
-            and "还差 25 像素以上" in policy.system
+            and "≥ 32 像素" in policy.system
+            and "不要自己把像素换算成厘米" in policy.system
         ),
         "仍然传 distance_cm 的调用被拒（不静默换算）": "ladder_rejects" in joined,
         "乱编的档位名被拒": "invalid_enum" in joined and "size=huge" in joined,
-        "被拒的调用没有动机械爪（标定就是头三次 move）": [
-            m["rung"] for m in calibration
+        "被拒的调用没有动机械爪（标定就是头四次 move）": [
+            m["rung"] for m in calibration[:3]
         ] == ["far", "near", "fine"],
         "三个档位实测量≈10cm/1cm/1mm": all(rung_ok.values()),
+        "gap_px=80 被代码换算成 far（约 30cm 的真差）": (
+            len(calibration) > 3 and calibration[3]["rung"] == "far"
+            and abs(calibration[3]["requested_cm"] - 10.0) < 0.01
+        ),
         "所有实际执行的 move 都来自三档之一": requested_values <= {10.0, 1.0, 0.1} and bool(moves),
         "结果里带上了档位名与实测位移": all(m["rung"] in nominal for m in moves),
         "raw 模式画面仍然不带网格": policy.grid_frames == 0 and policy.frames > 0,
@@ -965,6 +972,11 @@ class LadderPolicy(RawPolicy):
         ("move", {"direction": "+x", "size": "far"}),
         ("move", {"direction": "-x", "size": "near"}),
         ("move", {"direction": "-x", "size": "fine"}),
+        # A PIXEL GAP, not a rung: the code must convert it with the camera scale and snap
+        # it. 80px at ~3.7mm/px is ~30cm, i.e. `far`. This is the input the model is
+        # measurably good at producing (its quoted gap runs 1.2-3.2x of truth) and the
+        # conversion is the one it fails at (~11x).
+        ("move", {"direction": "-x", "gap_px": "80"}),
     )
 
 

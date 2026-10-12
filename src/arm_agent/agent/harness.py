@@ -168,6 +168,12 @@ class Harness:
         # side, because the simulator was never the thing that could not do the
         # arithmetic. See contracts.MOVE_LADDER_CM.
         self.move_ladder = bool(move_ladder)
+        # PIXEL-GAP scale, in mm per pixel at the agent view. Starts at the MEASURED
+        # 2.96-4.04 mm/px and SELF-CALIBRATES: every motion result carries the simulator's
+        # own `mm_per_px` at the depth it just reached, so after one step this is exact
+        # instead of nominal. This is the number the model cannot compute (its px->cm
+        # arithmetic slips a factor of ten, measured) and the code can.
+        self.mm_per_px = C.GLOBAL_MM_PER_PX_DEFAULT
         self.tool_schemas = get_tool_schemas(
             tool_protocol, self.observation_mode, move_ladder=self.move_ladder
         )
@@ -1006,10 +1012,19 @@ class Harness:
 
         if name in ("move", "rotate", "set_gripper"):
             if name == "move":
-                # 档 D: translate the rung into centimetres HERE, so the server-side
-                # protocol is byte-identical whether the ladder is on or not. A step
-                # the model could not do arithmetic for becomes a word it can pick.
+                # 档 D: the model reports an AXIS and either a rung or a PIXEL GAP; the
+                # code owns the centimetres. A pixel gap is the input it is actually good
+                # at producing (its quoted gap runs 1.2-3.2x of truth) and the conversion
+                # is the one it demonstrably fails at (~11x, mm-vs-cm). So: measure in
+                # pixels, snap in log space, move in centimetres.
                 ladder_cm = C.move_rung_cm(args.get("size", "")) if self.move_ladder else None
+                gap_rung = None
+                if self.move_ladder and ladder_cm is None:
+                    gap_px = as_float(args.get("gap_px"), None)
+                    if gap_px:
+                        gap_rung, ladder_cm = C.rung_for_gap_cm(
+                            gap_px * self.mm_per_px / 10.0, mm_per_px=self.mm_per_px
+                        )
                 action = {
                     "kind": "move",
                     "direction": args["direction"],
@@ -1018,6 +1033,7 @@ class Harness:
                         else as_float(args.get("distance_cm"))
                     ),
                 }
+                self._pending_gap = (args.get("gap_px"), gap_rung)
             elif name == "rotate":
                 action = {
                     "kind": "rotate",
@@ -1035,7 +1051,15 @@ class Harness:
             # of the ladder in a transcript would be a 10.0 that could also have been
             # typed by hand.
             if name == "move" and self.move_ladder:
-                outcome["ladder_size"] = str(args.get("size", "")).strip().lower()
+                outcome["ladder_size"] = str(args.get("size", "")).strip().lower() or None
+                gap_px, gap_rung = getattr(self, "_pending_gap", (None, None))
+                if gap_rung:
+                    outcome["ladder_size"] = gap_rung
+                    outcome["gap_px"] = as_float(args.get("gap_px"), None)
+            # Self-calibrate the pixel scale from the simulator's own measurement.
+            mm_px = (outcome.get("measurement") or {}).get("mm_per_px")
+            if mm_px:
+                self.mm_per_px = float(mm_px)
             images = resp.images(self.client.ipc_dir)
             return {
                 "obs": resp.obs,
@@ -1133,10 +1157,23 @@ class Harness:
         # picked and as the centimetres code turned it into. An audit that only saw
         # `distance_cm: 10.0` could not tell a ladder step from a hand-typed one, and
         # "did the rung mean what it says" is the question the experiment asks.
-        rung = outcome.get("ladder_size") or call.args.get("size")
+        #
+        # THREE places, and this cost a debugging round: `_dispatch` annotates the
+        # ADAPTER outcome (which is what it hands to `format_outcome`), and ships it here
+        # as `raw`. Reading only the top level silently recorded `move_size: null` for
+        # exactly the calls whose rung was DERIVED from a pixel gap -- the new feature --
+        # while the model-visible text correctly said "size=far".
+        raw_obj = outcome.get("raw")
+        raw_rung = (
+            raw_obj.get("ladder_size") if isinstance(raw_obj, dict)
+            else getattr(raw_obj, "ladder_size", None)
+        )
+        rung = outcome.get("ladder_size") or raw_rung or call.args.get("size")
         if rung and canonical_name(call.name) == "move":
             measurement["move_size"] = str(rung).strip().lower()
             measurement["move_size_cm"] = C.move_rung_cm(str(rung))
+        if canonical_name(call.name) == "move" and call.args.get("gap_px"):
+            measurement["gap_px"] = float(as_float(str(call.args["gap_px"]), 0.0))
         events: list[dict[str, Any]] = []
         # A motion that fell short is an EVENT, and both surfaces must say so with
         # the same vocabulary: `move` reports "只走了 Xcm" and `descend_to`

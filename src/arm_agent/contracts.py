@@ -81,6 +81,45 @@ def move_rung_cm(size: str) -> float | None:
     token = str(size).strip().lower()
     rung = MOVE_LADDER_ALIASES.get(token, token)
     return MOVE_LADDER_CM.get(rung)
+
+
+# PIXEL-GAP MODE (档 D v2). MEASURED (three arms, 24 episodes, transcripts): the model
+# READS pixels acceptably (its quoted gap runs 1.2-3.2x the truth) but its px->cm
+# MULTIPLICATION is off by ~11x -- it writes "75px x 3.8mm = 28.5mm = 2.9cm", i.e. it
+# knows the scale and then drops a factor of ten (mm vs cm). That single slip is ~4/5 of
+# its total distance error, and it makes every arm pick a step that is too small: a 10-19cm
+# gap is believed to be 2-3cm, so it creeps at 1cm and never arrives in 80 turns.
+#
+# So the model reports the thing it can actually see -- a pixel gap along one axis -- and
+# the CODE, which knows the camera exactly, does the arithmetic and snaps the result to a
+# rung. Magnitudes stay code-owned (the ladder), directions and pixel readings stay the
+# model's (the two things it does well). Default scale: the MEASURED 2.96-4.04 mm/px of the
+# agent view; it self-calibrates from every `mm_per_px` the simulator reports back.
+GLOBAL_MM_PER_PX_DEFAULT = 3.7
+# Which rung a pixel gap maps to. Thresholds are the geometric means of the rungs, so the
+# snap is scale-free: 0.32cm..3.2cm -> near, >=3.2cm -> far, <0.32cm -> fine.
+MOVE_LADDER_SNAP_CM = (0.32, 3.2)
+
+
+def rung_for_gap_cm(gap_cm: float, *, mm_per_px: float | None = None) -> tuple[str, float]:
+    """(rung, centimetres) for a measured gap: the CLOSEST rung on a log scale.
+
+    Thresholds are the geometric means of the rungs (sqrt(0.1*1)=0.32, sqrt(1*10)=3.16),
+    which is what makes this converge fastest: the error shrinks by at most 10^0.5 = 3.16x
+    per step, so ~30cm reaches 1cm in three steps and 1mm in six, whatever the starting
+    point. "Largest rung that does not overshoot" was the first instinct and it is wrong
+    here: it turns a 9cm gap into nine 1cm steps, and a turn budget is the one resource
+    the measured runs run out of first (119 turns for a scripted full-knowledge controller).
+    Overshoot is handled the way the prompt already says -- downshift after a reversal --
+    and every step now reports the pixels it actually moved, so an overshoot is visible.
+    """
+    del mm_per_px  # kept in the signature for callers that want to log the scale used
+    fine_hi, near_hi = MOVE_LADDER_SNAP_CM
+    if gap_cm >= near_hi:
+        return "far", MOVE_LADDER_CM["far"]
+    if gap_cm >= fine_hi:
+        return "near", MOVE_LADDER_CM["near"]
+    return "fine", MOVE_LADDER_CM["fine"]
 OBS_EEF_POS = "robot0_eef_pos"
 OBS_EEF_QUAT = "robot0_eef_quat"
 OBS_GRIPPER_QPOS = "robot0_gripper_qpos"

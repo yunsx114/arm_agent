@@ -150,12 +150,22 @@ def validate_tool_call(
     # arithmetic any more, and a silent conversion would hide it still trying to.
     if canonical == "move" and move_ladder:
         if str(normalized_args.get("distance_cm", "")).strip():
-            return ["ladder_rejects:distance_cm(use size=far|near|fine)"]
+            return ["ladder_rejects:distance_cm(use gap_px or size=far|near|fine)"]
         size = str(normalized_args.get("size", "")).strip().lower()
-        if not size:
-            return ["missing:size(far|near|fine)"]
-        if C.move_rung_cm(size) is None:
+        gap = str(normalized_args.get("gap_px", "")).strip()
+        if not size and not gap:
+            return ["missing:gap_px(画面里还差多少像素)"]
+        if size and gap:
+            return ["ambiguous:size_and_gap_px(只给一个)"]
+        if size and C.move_rung_cm(size) is None:
             return [f"invalid_enum:size={size}(far|near|fine)"]
+        if gap:
+            try:
+                gap_px = float(gap)
+            except ValueError:
+                return [f"invalid_number:gap_px={gap}"]
+            if not 0.5 <= gap_px <= 300:
+                return [f"invalid_range:gap_px={gap_px}(0.5~300像素)"]
         # The rung replaces the distance ONLY. `direction` is still the model's call
         # and still has to be one of the six axes -- returning early here without this
         # check would have silently accepted `direction="向着罐子"`.
