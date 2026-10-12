@@ -337,4 +337,22 @@ def annotate_frame(
             draw.ellipse((mu - r, mv - r, mu + r, mv + r), outline=AIM_MARK_COLOUR, width=1)
             draw.rectangle((mu - 2, mv - 2, mu + 2, mv + 2), fill=(0, 0, 0))
             draw.rectangle((mu - 1, mv - 1, mu + 1, mv + 1), fill=AIM_MARK_COLOUR)
+            # The ring carries its OWN coordinates. MEASURED reason (aim v3, episode
+            # 0): the model re-requested the same pixel 76 times while its 现状 line
+            # insisted the ring was somewhere else (it read the number out of its own
+            # earlier TEXT, not off the new frame). A number printed next to the ring
+            # cannot go stale, because it is re-drawn from the request every time.
+            #
+            # It is drawn BELOW the ring and centred on it, not beside it: the
+            # magnifier crops 64 px around this point, so a label sitting 6..32 px to
+            # the right gets sliced in half by the crop (measured on the first frame
+            # that carried one: the model saw "95,12"). Below-and-centred keeps the
+            # whole label inside the crop's +/-32 px window, clamped to the frame for
+            # the edge case.
+            label = f"{round(mu)},{round(mv)}"
+            half = max(len(label) * 3, 4)
+            tx = min(max(mu - half, 1), width - half * 2 - 2)
+            ty = min(max(mv + r + 1, 1), height - 12)
+            draw.rectangle((tx - 1, ty - 1, tx + half * 2 + 1, ty + 11), fill=(0, 0, 0))
+            draw.text((tx, ty), label, fill=AIM_MARK_COLOUR)
     return np.asarray(pil)

@@ -76,25 +76,74 @@ def parse(path: Path) -> list[dict]:
 def summarise(label: str, episodes: list[dict]) -> tuple[str, list[int]]:
     """One line per log: the numbers that decide whether `aim` is usable.
 
-    `within_tol` counts calls whose Δ is inside the measured GRASP TOLERANCE (22 mm:
-    2.2 cm still grasps, 4.6 cm closes on air). That is the only threshold that
-    matters -- a ring 30 mm off looks like a success and behaves like a miss.
+    TWO metrics, because they answer different questions and I conflated them once:
+      * `Δ_nearest` -- distance to the CLOSEST object of any kind: how precisely the
+        model can put the ring on SOMETHING. This is the pointing-precision number.
+      * `Δ_can` -- distance to the task's object: precision AND identification, i.e.
+        it also fails when the model aims carefully at the wrong container. Reading
+        Δ_can alone made a 4-px-precise wrong-object aim look like a pointing failure.
+    `within_tol` counts calls inside the measured GRASP TOLERANCE (22 mm: 2.2 cm still
+    grasps, 4.6 cm closes on air).
     """
     deltas = [a["can"][0] for ep in episodes for a in ep["aims"] if a.get("can")]
-    if not deltas:
-        return f"{label}: no agent-view calls with a can entry", []
-    ordered = sorted(deltas)
-    within = [d for d in deltas if d <= 22]
-    line = (
-        f"{label}: n={len(deltas)} min={ordered[0]}mm "
-        f"p25={ordered[len(ordered) // 4]}mm median={ordered[len(ordered) // 2]}mm "
-        f"| within grasp tol (22mm): {len(within)}/{len(deltas)}"
-    )
-    return line, deltas
+    nearest = [a["nearest"][1][0] for ep in episodes for a in ep["aims"] if a.get("nearest")]
+    if not deltas and not nearest:
+        return f"{label}: no agent-view calls with object entries", []
+    parts = [label]
+    for tag, values in (("Δ_nearest", nearest), ("Δ_can", deltas)):
+        if not values:
+            parts.append(f"{tag}: none")
+            continue
+        ordered = sorted(values)
+        within = [d for d in values if d <= 22]
+        parts.append(
+            f"{tag}: n={len(values)} min={ordered[0]}mm p25={ordered[len(ordered) // 4]}mm "
+            f"median={ordered[len(ordered) // 2]}mm | ≤22mm: {len(within)}/{len(values)}"
+        )
+    return " | ".join(parts), deltas
+
+
+def grasps_from_transcripts(pattern: str) -> dict[str, list[str]]:
+    """Which object each `grasp` actually closed on, per episode file.
+
+    THE SECOND METRIC, and the one that separates two different failures the aim
+    numbers cannot tell apart: a model can be perfectly precise AND pick the wrong
+    container (measured: 6/6 aims within 20 mm of `salad_dressing_1` while reporting
+    it as the soup can). The contact table names the body it closed on
+    (`measurement.object_body`), which is simulator truth and therefore lives ONLY in
+    the transcript -- never in a result the model sees.
+    """
+    import glob
+    import json
+
+    out: dict[str, list[str]] = {}
+    for path in sorted(glob.glob(pattern)):
+        try:
+            data = json.loads(Path(path).read_text())
+        except (OSError, ValueError):
+            continue
+        held: list[str] = []
+        for entry in data.get("transcript") or []:
+            result = entry.get("structured_result") or {}
+            if str(result.get("tool")) != "grasp":
+                continue
+            body = str((result.get("measurement") or {}).get("object_body") or "")
+            held.append(body or "(nothing)")
+        if held:
+            out[Path(path).name] = held
+    return out
+
+
+TARGET_OBJECT = "alphabet_soup_1"
 
 
 def main(argv: list[str]) -> int:
-    paths = [Path(p) for p in (argv[1:] or ["outputs/logs/single_node_server.log"])]
+    args = [a for a in argv[1:] if not a.startswith("--episodes=")]
+    ep_glob = next(
+        (a.split("=", 1)[1] for a in argv[1:] if a.startswith("--episodes=")),
+        "outputs/episodes/episode_[0-9][0-9][0-9]_*.json",
+    )
+    paths = [Path(p) for p in (args or ["outputs/logs/single_node_server.log"])]
     rows: list[tuple[str, list[int]]] = []
     for path in paths:
         if not path.exists():
@@ -125,6 +174,16 @@ def main(argv: list[str]) -> int:
     print("== 汇总")
     for line, _ in rows:
         print("  " + line)
+    # Identification, from the transcripts: a precise aim at the WRONG object is not a
+    # pointing failure, and the two have to be counted separately.
+    grasps = grasps_from_transcripts(ep_glob)
+    if grasps:
+        total = sum(len(v) for v in grasps.values())
+        correct = sum(1 for v in grasps.values() for body in v if body.startswith(TARGET_OBJECT))
+        print(f"\n== 抓取落在哪个物体上（转录 measurement.object_body，真值）")
+        for name, bodies in grasps.items():
+            print(f"  {name}: {bodies}")
+        print(f"  正确物体({TARGET_OBJECT}): {correct}/{total} 次抓取")
     return 0
 
 

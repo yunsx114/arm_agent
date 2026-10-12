@@ -44,6 +44,16 @@ from arm_agent.agent.render import ACCENT, EpisodeRecorder, GREEN, RED, YELLOW
 ZOOM_KEY = C.ZOOM_KEY
 
 SKILLS_DIRNAME = "skills"
+# Consecutive identical tool calls (same name, byte-identical args) after which the
+# episode is ENDED and LABELLED instead of burning the remaining turns.
+#
+# MEASURED (aim v3, episode 0): 76 identical `aim(58,134)` calls -- 95% of the episode,
+# with the model's 现状 text frozen word-for-word. The 3-call hint fired 37 times and was
+# ignored, so a note alone does not break this loop. MAXTURNS is the blunt version of
+# the same guard (it ends the episode after 80 turns and says only "no success"); this
+# one ends it earlier AND names the reason, which is the difference between a silent
+# timeout and a diagnosable failure.
+REPEAT_STALL_LIMIT = 12
 # Kept equal to `action_adapter.DESCEND_Z_TOL_M`: a descent that stops further
 # than this from the commanded z did not arrive, and saying it did is what makes
 # the model close on a rim instead of re-descending.
@@ -187,6 +197,11 @@ class Harness:
         # Used for one thing only: telling it that an identical aim cannot produce
         # new evidence. Cleared by every tool that can move the arm or the scene.
         self._last_aim: tuple[str, int, int] | None = None
+        # Cross-turn duplicate detector (an identical tool call with identical args).
+        # See the note where it is consumed: its only job is to state a fact about
+        # the model's own repeated call, never to block or replace it.
+        self._repeat_key: tuple[str, str] | None = None
+        self._repeat_n = 0
         # Which container the executor last ran `approach` on. Feeds the
         # arithmetic instrument below (log only, never blocks).
         self._last_approach_target = ""
@@ -436,6 +451,45 @@ class Harness:
                     outcome = self._dispatch(call, obs)
                     outcome["result"] = self._structured_outcome(call, outcome)
                     tool_s = time.time() - t_tool0
+                    # A DEGENERATE LOOP IS A FACT ABOUT THE MODEL'S OWN CALLS, and
+                    # saying so is not a decision. MEASURED (aim v2, episode 0): after a
+                    # failed `verify` the model repeated the IDENTICAL call 26 times in
+                    # a row and spent a third of the episode on it -- its 现状/判定 text
+                    # froze word-for-word at turn 56 and never moved again, because a
+                    # failed verdict carries no information the model can act on. The
+                    # harness cannot tell it WHY the task is not done (that would be
+                    # scene truth), but it can tell it that this call has already been
+                    # made N times with nothing changing in between.
+                    rep_key = (
+                        canonical_name(str(call.name)),
+                        json.dumps(sorted((str(k), str(v)) for k, v in (call.args or {}).items()),
+                                   ensure_ascii=False),
+                    )
+                    if rep_key == self._repeat_key:
+                        self._repeat_n += 1
+                    else:
+                        self._repeat_key, self._repeat_n = rep_key, 1
+                    if self._repeat_n >= 3:
+                        # The ARGS are echoed on purpose. MEASURED (aim v3, episode 0):
+                        # the model repeated `aim(58,134)` 76 times while its own 现状
+                        # line said the ring was at (60,138) -- it was reading its
+                        # earlier TEXT instead of the new frame, so "this call is a
+                        # repeat" was not a fact it could check. Restating the exact
+                        # arguments restates what it actually asked for.
+                        args_txt = ", ".join(f"{k}={v}" for k, v in sorted((call.args or {}).items()))
+                        outcome["text"] += (
+                            f"（提示：这是第 {self._repeat_n} 次完全相同的 {call.name!s} 调用，"
+                            f"参数 {args_txt} 与上一轮逐字相同；这期间没有任何动作，测量不会变化。）"
+                        )
+                    if self._repeat_n >= REPEAT_STALL_LIMIT:
+                        result.error = (
+                            f"stalled_repeat: 连续 {self._repeat_n} 次完全相同的 "
+                            f"{call.name!s} 调用（参数 {sorted((call.args or {}).items())}）"
+                        )
+                        self._say(
+                            f"[episode] 卡死退出：连续 {self._repeat_n} 次相同的 {call.name!s} 调用"
+                        )
+                        break
                     # Remember which container the executor last tried to align
                     # with: the release instrument needs that container's
                     # MEASURED centre, and the executor's most recent `approach`
