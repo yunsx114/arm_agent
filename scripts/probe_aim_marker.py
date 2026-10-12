@@ -45,6 +45,14 @@ def main() -> int:
     frames = server._images_b64(mark, mark)
     for cam, data in frames.items():
         (Path("/tmp") / f"aim_{cam}.png").write_bytes(base64.b64decode(data))
+    # The `target` path centres the magnifier on the GRIPPER instead of the ring (it is
+    # answering "where did my hand end up"), and it is the only code path the aim probe
+    # above does not exercise. Same call, different centre -- no motion involved here.
+    eef_world = np.asarray(server.sim._obs["robot0_eef_pos"], dtype=float)
+    eef_u, eef_v, _ = camera.project(eef_world)
+    eef_zoom = server._images_b64(None, ["agent", float(eef_u), float(eef_v)])
+    if "zoom" in eef_zoom:
+        (Path("/tmp") / "aim_zoom_eef.png").write_bytes(base64.b64decode(eef_zoom["zoom"]))
     # The arm must not have moved: aim is a dry run, and this is the same assertion the
     # probe makes, checked here against the adapter's own numbers.
     print(f"status={outcome.status!r} note={outcome.note!r}")

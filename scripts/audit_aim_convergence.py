@@ -73,37 +73,58 @@ def parse(path: Path) -> list[dict]:
     return episodes
 
 
+def summarise(label: str, episodes: list[dict]) -> tuple[str, list[int]]:
+    """One line per log: the numbers that decide whether `aim` is usable.
+
+    `within_tol` counts calls whose Δ is inside the measured GRASP TOLERANCE (22 mm:
+    2.2 cm still grasps, 4.6 cm closes on air). That is the only threshold that
+    matters -- a ring 30 mm off looks like a success and behaves like a miss.
+    """
+    deltas = [a["can"][0] for ep in episodes for a in ep["aims"] if a.get("can")]
+    if not deltas:
+        return f"{label}: no agent-view calls with a can entry", []
+    ordered = sorted(deltas)
+    within = [d for d in deltas if d <= 22]
+    line = (
+        f"{label}: n={len(deltas)} min={ordered[0]}mm "
+        f"p25={ordered[len(ordered) // 4]}mm median={ordered[len(ordered) // 2]}mm "
+        f"| within grasp tol (22mm): {len(within)}/{len(deltas)}"
+    )
+    return line, deltas
+
+
 def main(argv: list[str]) -> int:
-    path = Path(argv[1] if len(argv) > 1 else "outputs/logs/single_node_server.log")
-    if not path.exists():
-        print(f"no such log: {path}")
-        return 2
-    episodes = parse(path)
-    print(f"{path}: {len(episodes)} episode(s) with pixel calls\n")
-    for i, ep in enumerate(episodes):
-        aims = ep["aims"]
-        if not aims:
+    paths = [Path(p) for p in (argv[1:] or ["outputs/logs/single_node_server.log"])]
+    rows: list[tuple[str, list[int]]] = []
+    for path in paths:
+        if not path.exists():
+            print(f"no such log: {path}")
             continue
-        can_deltas = [a["can"][0] for a in aims if a.get("can")]
-        near_deltas = [a["nearest"][1][0] for a in aims if a.get("nearest")]
-        targets = [a for a in aims if a["tool"] == "target"]
-        print(f"== episode {i}: {len(aims)} pixel calls ({len(targets)} target)")
-        print("   agent-view Δ_can (mm), in order: " + ", ".join(str(d) for d in can_deltas))
-        print("   Δ_nearest (mm), in order:        " + ", ".join(str(d) for d in near_deltas))
-        if can_deltas:
-            print(f"   first {can_deltas[0]} mm -> last {can_deltas[-1]} mm "
-                  f"(min {min(can_deltas)})")
-        for a in targets:
-            can = a.get("can")
-            print(
-                f"   target cam={a['cam']} asked={a['asked']}"
-                + (f" Δ_can={can[0]}mm can_px={can[1]}" if can else " (no can entry)")
-            )
+        episodes = parse(path)
+        with_calls = [ep for ep in episodes if ep["aims"]]
+        print(f"=== {path}: {len(episodes)} episode(s), {len(with_calls)} with pixel calls")
+        for i, ep in enumerate(episodes):
+            aims = ep["aims"]
+            if not aims:
+                continue
+            can_deltas = [a["can"][0] for a in aims if a.get("can")]
+            nearest_names = [
+                a["nearest"][0] for a in aims if a.get("nearest") and a["tool"] == "aim"
+            ]
+            targets = [a for a in aims if a["tool"] == "target"]
+            print(f"  episode {i}: {len(aims)} pixel calls ({len(targets)} target)")
+            if nearest_names:
+                counts = {n: nearest_names.count(n) for n in dict.fromkeys(nearest_names)}
+                print(f"    nearest object per aim: {counts}")
+            if can_deltas:
+                print("    Δ_can (mm): " + ", ".join(str(d) for d in can_deltas))
+                print(f"    first {can_deltas[0]} -> last {can_deltas[-1]} "
+                      f"(min {min(can_deltas)})")
+        rows.append(summarise(str(path), episodes))
         print()
-    all_can = [a["can"][0] for ep in episodes for a in ep["aims"] if a.get("can")]
-    if all_can:
-        print(f"ALL agent-view pixel calls: n={len(all_can)} min={min(all_can)}mm "
-              f"median={sorted(all_can)[len(all_can) // 2]}mm")
+    print("== 汇总")
+    for line, _ in rows:
+        print("  " + line)
     return 0
 
 

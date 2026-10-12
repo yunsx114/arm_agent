@@ -296,9 +296,15 @@ class SimServer:
                  (target[2] - gt[2]) * 1000.0)
             )
         rows.sort()
+        # ALL objects, not just the two nearest. MEASURED reason: with `rows[:2]` the
+        # audit could not say whether the model was aiming at the task's object at all
+        # -- a call near three objects logged two of them and the third (the one the
+        # run actually cares about) was simply absent, which reads as "no data" instead
+        # of "aimed 15 mm from the WRONG object". Six short entries per line is cheap;
+        # the alternative is a 50-minute run whose metric cannot be computed.
         near = " | ".join(
             f"{name} px={px} xy={xy * 1000:.0f}mm dz={dz:+.0f}mm"
-            for xy, name, px, dz in rows[:2]
+            for xy, name, px, dz in rows
         )
         print(
             f"[aim] tool={tool} asked={pixel} cam={cam_key} "
