@@ -378,11 +378,102 @@ raw 模式 8 回合实测：**0/8**，共 491 次 move + 19 次 gripper，**"夹
 | `pixels` | aim/target + move + grasp/release + verify | **代码**（标定+深度接地） | 0/14；墙=相邻物体分割 |
 | `raw` | **move + gripper + verify** | **模型自己看图估世界坐标** | **0/8**；墙=px→世界换算（14cm） |
 
-## 10. 参考
+## 10. 档 D：把「距离」从模型手里拿走——move 只有三种粒度（2026-10-12）
 
+### 10.1 为什么是这一步
+
+§9 的结论是：`raw` 模式下模型失败在「视觉→世界距离」的换算上（把 y≈-0.10 说成目标位置，
+真值 -0.240，偏 14cm）。那就把这个换算**整条拿走**：模型只选**方向**和**一档大小**，
+厘米数由代码填。这正是 Jev 在 `embodied_jev/hierarchical.py::assemble_motion` 里的做法
+（`scale magnitudes, never replace a model-selected direction`，他的菜单是 2/10/40mm）。
+
+```
+move(direction="+y", size="near")      # 模型说的
+move(direction="+y", distance_cm=1.0)  # 代码翻的（sim server 根本不知道有阶梯）
+```
+
+三档：`far = 10cm`、`near = 1cm`、`fine = 1mm`（字面量 `10cm`/`1cm`/`1mm` 也认）。
+仍然传 `distance_cm` 的调用会被**拒绝**并说明原因——否则它可能偷偷退回那个已证明会错的算术。
+
+### 10.2 机械上三档都真的走得出来（干跑实测，非特权脚本做不到）
+
+| 档 | 名义 | 实测（指令轴） | 说明 |
+|---|---|---|---|
+| `far` | 10cm | **10.02cm** | 跨台面用；单 tick 上限 5cm，12 ticks 走完 |
+| `near` | 1cm | **0.92cm** | 主力档 |
+| `fine` | 1mm | **0.10cm** | 每次实际只走 0.6–0.8mm（到达窗口 0.5mm 内就停） |
+
+- **1mm 档可执行**是因为 `action_adapter.move` 的 `arrive_tol = min(MOVE_ARRIVE_TOL_M, 请求/2)`：
+  当初 1mm 被 2mm 固定窗口吞掉、跑 0 tick、位移 (0,0,0) 像 "blocked" 那次修的就是这里。
+- 量档位要**按指令轴量**：`+x far` 的实测位移是 `(0.1002, 0.0006, -0.0118)`——OSC 会往水平
+  动作里耦合约 1.2cm 的 z 漂移，取三分量最大会把 1cm 档量成 1.31cm。
+- 下降档位必须**不对称**：上升可以 `far`，下降最多 `near`。实测 `far` 下降一次冲了 9.7cm，
+  直接穿过「到罐心 +3cm 才 close」的安全余量。
+- 阶梯腿（`probe_harness_dryrun.py::ladder_leg`，12 项断言全 PASS）证明**两工具仍能完成任务**：
+  `success=True source=env`，但 **119 回合 vs raw 腿的 37 回合**——1cm 档跨 25cm 要 25 步，
+  80 回合预算对阶梯是紧的。
+
+### 10.3 这一轮修掉的两个「仪器撒谎」
+
+1. **停滞守卫误杀前进中的动作**。`REPEAT_STALL_LIMIT=12` 只看参数逐字相同，于是连续 12 次
+   `+z near`（每次实测走 8.3–9.3mm，12 次共前进约 10cm）被判定卡死并结束 episode；它同时
+   打印的「这期间没有任何动作，测量不会变化」**本身是假的**。现在只在 `moved_m(outcome) < 0.3mm`
+   时计数。取数必须同时看 `outcome["raw"]`（adapter 对象）与 `measurement`：`_dispatch` 拷的是
+   adapter 的 `measurement`，而普通 `move` 根本不用它，只看那里会永远当成没动。
+2. 非阶梯路径的下降请求被格式化成 `"0.0"`（move 只接受 0.1~15）→ 协议拒绝 → 同一非法调用
+   重试到回合用尽（实测 27 次重试、整回合报废）。**阶梯下结构上不可能发生**：模型选词、代码填数。
+
+### 10.4 提示词也必须一起换，不能只加附录
+
+`raw` 的配方里写着「**一次只走一小段（1~5cm）**」，而阶梯**表达不了** 1~5cm（只有 1cm 与 10cm）。
+留着这句话，模型就用 `far` 去满足「至少覆盖我需要的 4cm」——**实测**：自称「还差 4cm」却发 `far`，
+一步过冲 2.46 倍，连续 6 次来回摆（`audit_move_ladder.py` 的「过冲倍数」列）。
+所以 `get_system_prompt(..., move_ladder=True)` 走 `raw_prompt()`，把那句话**替换**成
+「你自己的像素估计 → 档位」的换算表（25px 以上 `far`；3~25px 用 `near` 连走几步；3px 以下 `fine`），
+并写明降档/升档规则。
+
+### 10.5 审计工具（都是新增的）
+
+| 工具 | 回答什么 |
+|---|---|
+| `scripts/audit_move_ladder.py` | 档位分布、**反转后降档/同档/升档**、**档位 ÷ 它自己声称的像素误差 = 过冲倍数**、最长乒乓、夹爪概念 |
+| `scripts/audit_ladder_distance.py` | 每回合**离罐心最近距离**（容差 22mm）——两臂唯一可比的指标 |
+| `scripts/probe_init_positions.py` | 各 init_state 的物体真值（转写里只有爪心自己的坐标，物体真值必须探针取） |
+
+### 10.6 模型实测：阶梯把「换算」拿掉了，但「大小判断」没有跟着变好（v1，8 回合）
+
+同一任务、同一 SEED/INIT_STATE、同样 `MAXTURNS=80`、同样的 `raw` 工具面，只差距离参数形态：
+
+| 指标（都是转写实测） | `raw` 基线（自由填 cm） | 阶梯 v1（三档） |
+|---|---|---|
+| 成功 | 0/8 | 0/8 |
+| `move` 次数 | 487 | 619 |
+| 档位分布 | far 86 / near 399 / fine 2 | far 215 / near 385 / fine 19 |
+| 方向反转次数 | 108 | 169 |
+| **反转后降档 / 同档 / 升档** | 4 / 99 / 5（92% 同档） | **14 / 146 / 9（86% 同档）** |
+| **档位 ÷ 它自称的像素误差（中位）** | 0.05×（严重走小） | **0.49×** |
+| 档位 ≥ 自身误差 2 倍 | 1% | 1% |
+| 离罐心最近 XY（中位 / 最小） | 238 / **38mm** | 214 / **21mm** |
+| 进入 22mm 抓取窗口 | 0/8 | **1/8** |
+
+读数：
+
+* **成功了 0/8 对 0/8，但唯一与抓取相关的量动了一格**：XY 最近从 38mm 到 21mm、首次有
+  1 个回合进入 22mm 窗口。**1/8 是单回合，只能算"没有变差"，不能算"变好了"。**
+* **反转后仍然不降档**（86% 同档），而提示词明写「走过头就降一档」——**用户当初的假设
+  （过度偏离后会用更低一档）在这份数据里不成立**。升/降档不是被阶梯"启发"出来的。
+* 一个反例说明它**会**说对、只是不稳定：ep7 t76 自己的话是"目标在 +x 方向约 4~5cm，
+  `far` 会越过，用 `near` 逐步"——同一回合的 t68–t74 却是在 +y/-y 之间连续 7 次乒乓。
+* 结论：阶梯把**单位换算**从模型手里拿走了（过冲中位从 0.05× 变成 0.49×，即它的步子终于
+  和它自己说的误差同量级），但**"这一步该多大"仍然是它在猜**。剩下的墙是**停止/收敛规则**，
+  不是算术。
+## 11. 参考
 * 计划与教训：[`docs/P0_stripdown.md`](P0_stripdown.md)（该剥/不该剥的边界）
 * 场景与几何实测：[`skills/scene_tools.md`](../skills/scene_tools.md)
 * 放手位姿审计：[`scripts/audit_release_poses.py`](../scripts/audit_release_poses.py)
 * aim 标记/不动手探针：[`scripts/probe_aim_marker.py`](../scripts/probe_aim_marker.py)
+* 档 D 审计：[`scripts/audit_move_ladder.py`](../scripts/audit_move_ladder.py)（升降档 + 过冲倍数）、
+  [`scripts/audit_ladder_distance.py`](../scripts/audit_ladder_distance.py)（离罐心 XY/3D 最近）、
+  [`scripts/probe_init_positions.py`](../scripts/probe_init_positions.py)（各 init_state 真值）
 * Jev 出处：`src/embodied_jev/physics.py::contacts`、`libero_policy.py::resolve_plan`/`annotated_image`、
   `hierarchical.py::assemble_motion`、`perception.py::VisualObserver`/`ImageObserver`
