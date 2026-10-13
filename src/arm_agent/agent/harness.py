@@ -464,6 +464,10 @@ class Harness:
                 # 档 E: continue in the CURRENT world (the executor of a dispatch).
                 # Everything else about the episode loop is shared, but a reset here
                 # would teleport the arm back to the start between every phase.
+                # The harness's cross-turn state is equally LIVE here: `_grasped`
+                # was inherited from the planner precisely so the opening line
+                # below prints what the hand-over actually holds (see the Bug-B
+                # note at the opening text).
                 resp = self.client.state()
                 obs = resp.obs
                 images: dict[str, Any] = {}
@@ -471,6 +475,26 @@ class Harness:
                 resp = self.client.reset(init_state_idx=init_state_idx)
                 obs = resp.obs
                 images = resp.images(self.client.ipc_dir)
+                # A WORLD RESET also resets every piece of cross-turn state: the
+                # layout is the reset one, the pads hold nothing, and the depth the
+                # mm/px calibration last measured is no longer the current depth.
+                # MEASURED how this bit before (cli.py reuses ONE harness object
+                # across the whole run): an episode that ended holding the can
+                # left `_grasped=True`, so the NEXT episode's opening said
+                # 爪上：空 while its first `observe`/`get_state` line said
+                # 爪上：有物体（两指接触） -- contradictory facts about a freshly
+                # reset world, and if the model believed the second it could fly
+                # straight to the basket to release a can that is on the table.
+                # Same for `_held_body`, `_repeat_*`, `_last_aim`, `mm_per_px` and
+                # the approach ledger.
+                self._grasped = False
+                self._held_body = None
+                self.mm_per_px = C.GLOBAL_MM_PER_PX_DEFAULT
+                self._repeat_key, self._repeat_n = None, 0
+                self._last_aim = None
+                self._approach_order = []
+                self._approached = {}
+                self._last_approach_target = ""
             last_images = images
             result.task = obs.get("task", "")
             result.language = obs.get("language", "")
@@ -479,7 +503,7 @@ class Harness:
                 recorder.record(
                     0,
                     tool_call="(episode start)",
-                    result=f"任务: {result.language}\n初始状态: {format_state(obs)}",
+                    result=f"任务: {result.language}\n初始状态: {format_state(obs, self._grasped)}",
                     status="开始",
                     status_color=ACCENT,
                     images=last_images,
@@ -512,10 +536,17 @@ class Harness:
                 if task_text
                 else ""
             )
+            # `self._grasped`, not format_state's default: at a true reset the
+            # hygiene above has just cleared it (so the line reads 爪上：空 的
+            # fresh world), and at a SUB hand-over it is the INHERITED state -- a
+            # phase delegated as "你已夹住罐子，去放" must not open with 爪上：空.
+            # That mismatch (task says holding, opening line says empty) is the
+            # same writer/reader split as the task_text 162-void fixed yesterday:
+            # the state was maintained carefully and then not printed.
             opening_text = (
                 f"{task_line}{sub_note}\n"
                 f"{initial_note}"
-                f"{format_state(obs)}\n"
+                f"{format_state(obs, self._grasped)}\n"
                 "请开始。记住：每次只调用一个工具。"
             )
             messages: list[dict[str, Any]] = [
@@ -1789,8 +1820,19 @@ def model_view(result: dict[str, Any], observation_mode: str) -> dict[str, Any]:
     put the contact-derived body name in it (`measurement.object_body =
     "alphabet_soup_1_main"`). In `pixels` mode that hands the model the simulator's
     object identity on a path whose whole point is that it has none.
+
+    FIXED AGAIN 2026-10-13: the filter ran ONLY for `pixels`, so `raw`/`look`/
+    `planner` -- every surface added later -- shipped `object_body` (the sim's own
+    body name, e.g. "alphabet_soup_1_main") and `contact_sides` in the JSON line
+    of EVERY `gripper` call: the look-mode executor could read WHICH can it had
+    closed on out of ground truth while the mode's whole premise is that identity
+    comes from pixels (same leak class as `look(target=...)`, which was fixed
+    behind a validator + `_locate` guard). The rule is now INVERTED: only `truth`
+    (the A/B baseline that is supposed to see scene names) passes the result
+    through untouched; every other mode gets the same strip. The keys stay in the
+    transcript's `structured_result` so the offline audits are unaffected.
     """
-    if str(observation_mode).strip().lower() != "pixels":
+    if str(observation_mode).strip().lower() == "truth":
         return result
     view = dict(result)
     measurement = dict(view.get("measurement") or {})

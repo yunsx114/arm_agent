@@ -605,6 +605,22 @@ M2/planner）都跑在 `reasoning_effort=none`（strata 客户端默认）。阶
 无效（238mm 中位），说明主因不是步长菜单而是每步决策质量。开启方式：
 `REASONING_EFFORT=high`（约 2 倍每轮 wall time）。
 
+### 13.3 卸载窗口期全库复审（2026-10-13，GPU 让人）
+
+| # | bug | 机制 | 修法 |
+|---|---|---|---|
+| A | 跨回合状态污染 | `cli.py` 全程复用**同一个** Harness，`run_episode` 从不清 `_grasped`/`_held_body`/`mm_per_px`/`_repeat_*`/`_last_aim`/approach 账本 → 上回合夹着罐子耗尽回合，下回合开局行说“爪上：空”、第一条 observe 却说“爪上：有物体” | 真 reset 分支加全套状态复位（子路径 `init_state_idx=None` 不动，保住交棒继承） |
+| B | 交棒状态没接到开场 | 开场行 `format_state(obs)` 用默认 `grasped=False` → dispatch 转交“你已夹住罐子去放”时，执行者开场状态行与 task 文本**直接矛盾**（与 task_text 162 次空写同款：状态维护得很仔细、却没印到模型读的那行） | 开场/记录器都改 `format_state(obs, self._grasped)` |
+| C | 身份键泄漏 | `model_view` 只在 `pixels` 剥 `MODEL_HIDDEN_KEYS` → raw/look/planner 每次 gripper 结果的 JSON 里带 `object_body`（如 `alphabet_soup_1_main`）+ `contact_sides`——执行者可以从**真值**读到"我夹到的是哪个物体”，而 look 模式的前提是身份来自像素（与 `look(target=...)` 定位泄漏同类） | 反转规则：只有 `truth` 原样通过，其余四个模式一律剥（transcript 里保留全分辨率给审计） |
+| — | dry-run 卫生 | 各腿独立 ipc 目录但从不清理 → 上轮崩溃残留的 `cmd_1.json` 被新 server 先处理，打出一条耸动的 `cmd 1 FAILED: NoneType`（leftover 的 state 在未 reset 的服务器上必然炸）——是仪表的垃圾行，不是机制的失败 | main 里 glob 清掉全部 `ipc_dryrun*`；白盒交棒守卫移到 `client.close()` 之前 |
+
+新增回归守卫：dry-run planner 腿「交棒时开场状态行=爪上：有物体」「子路径不清交棒状态、真 reset 清状态」
+（白盒：0 轮子回合不调模型即可断言）；`probe_tool_wiring.py` 增加四模式 `model_view` 运行时断言
+（21 PASS / 0 FAIL）。六腿 dry-run PLUMBING OK（planner 腿 15 项全绿）。
+
+顺带记录（未修的边缘）：server 在**从未 reset** 时收到 `state` 会以 `AttributeError（'NoneType' has no
+attribute 'items'）` 报错（pack(None)）——生产路径永远先 reset，故无影响；真要暴露给外部调用才值得加守卫。
+
 ## 14. 参考
 * 计划与教训：[`docs/P0_stripdown.md`](P0_stripdown.md)（该剥/不该剥的边界）
 * 场景与几何实测：[`skills/scene_tools.md`](../skills/scene_tools.md)

@@ -31,7 +31,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from arm_agent import contracts as C
-from arm_agent.agent.harness import Harness, _count_sub_tools
+from arm_agent.agent.harness import Harness, SubTaskHarness, _count_sub_tools
 from arm_agent.sim.client import SimClient
 from arm_agent.sim.pixel_grounding import (
     AIM_MARK_COLOUR,
@@ -1216,6 +1216,32 @@ def planner_leg(ipc_dir: Path) -> bool:
     advertised = sorted(s["function"]["name"] for s in harness.tool_schemas)
     result = harness.run_episode(init_state_idx=0, episode_id=993)
     transcript = json.loads(Path(result.transcript_path).read_text())["transcript"]
+
+    # WHITE-BOX hand-over regression (Bug A/B, 2026-10-13). The planner's executor
+    # runs `run_episode(init_state_idx=None)` after the planner INHERITED grasp
+    # state into it; a 0-turn sub-episode builds the opening message without ever
+    # calling the model, so this asserts the state plumbing directly:
+    #   * a hand-over holding something must OPEN with 爪上：有物体 (the task text
+    #     "你已夹住罐子" and the state line must not contradict each other);
+    #   * a true `reset` clears the same state (the opposite regression: an episode
+    #     that ended holding the can must not poison the next episode's state line).
+    # Must run on the SAME client and BEFORE it closes: the planner episode above
+    # has already reset this world, so `sim._obs` exists. A client opened after
+    # `close` faces a stopped server, and one opened before any reset hits the
+    # server's "state before reset is AttributeError" edge -- both failures of
+    # the CHECK, not of the mechanism (cost one debugging round with
+    # probe_handover_debug.py, 2026-10-13).
+    handover_sub = SubTaskHarness(
+        client=client, model=stub, workspace=REPO,
+        max_turns=0, tool_protocol="v2", log=False, observation_mode="look",
+        summary_every=0,
+    )
+    handover_sub._grasped = True
+    handover_sub.run_episode(init_state_idx=None, task_text="测试交棒：你已夹住罐子，去放。")
+    handover_opening = str(next((e.get("opening_user", "") for e in handover_sub.captured), ""))
+    inherited_after_sub = handover_sub._grasped  # sub path must NOT clear it
+    handover_sub.run_episode(init_state_idx=0, task_text=None)  # true reset
+    fresh_reset = handover_sub._grasped
     client.close()
     time.sleep(0.3)
 
@@ -1255,6 +1281,12 @@ def planner_leg(ipc_dir: Path) -> bool:
             st.get("sub_tools") == _count_sub_tools(sub_entries)
             and _count_sub_tools([{"structured_result": {"tool": "observe"}}]) == {"look": 1}
         ),
+        "交棒时开场状态行=爪上：有物体（与任务文本一致）": (
+            "爪上：有物体" in handover_opening and "你已夹住罐子" in handover_opening
+        ),
+        "子路径不清交棒状态、真 reset 清状态": (
+            inherited_after_sub is True and fresh_reset is False
+        ),
         "爪上状态只出现一次标签": "爪上：爪上" not in report,
         # The executor never returns early, so an under-sized budget is a lost phase:
         # the floor is enforced by validation (see contracts.DISPATCH_BUDGET_RANGE).
@@ -1275,6 +1307,13 @@ def planner_leg(ipc_dir: Path) -> bool:
 def main() -> int:
     ipc_dir = REPO / "runtime" / "ipc_dryrun"
     shutil.rmtree(ipc_dir, ignore_errors=True)
+    # Every leg gets its OWN ipc dir but none of them cleaned it, so a crashed
+    # run left `cmd_*.json` files that the NEXT run's fresh server globs first
+    # (observed 2026-10-13: a leftover state command printed "cmd 1 FAILED:
+    # 'NoneType'..." before the leg's own reset, because the server had not
+    # reset the world yet -- a garbage line, not a leg failure). Wipe them all.
+    for stale in sorted((REPO / "runtime").glob("ipc_dryrun*")):
+        shutil.rmtree(stale, ignore_errors=True)
 
     server = SimServer(ipc_dir=ipc_dir, suite_name="libero_object", task_id=0, cam_size=256)
     thread = threading.Thread(target=server.serve_forever, kwargs={"idle_exit_s": 180}, daemon=True)

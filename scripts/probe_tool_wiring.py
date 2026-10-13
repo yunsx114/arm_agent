@@ -25,6 +25,11 @@ WHAT IT CHECKS
    A typo here is exactly the bug above.
 3. Every `"name"` in `TOOL_SCHEMAS` is handled by `_dispatch`'s if-chain, so a
    new tool cannot be added and silently fall through to the generic branch.
+4. `model_view` hides the identity keys for every mode except `truth`. Until
+   2026-10-13 the filter ran only for `pixels`, so raw/look/planner shipped
+   `measurement.object_body` (the sim's own body name) in every gripper result
+   -- a ground-truth identity leak behind the mode's back. The grep guard plus
+   a runtime call to `model_view` keep the inversion from regressing.
 
 No GPU, no sim, no network: pure source analysis, so it runs anywhere and fast.
 """
@@ -156,10 +161,46 @@ def main() -> int:
     else:
         ok(f"every v2 tool resolves to a `_dispatch` branch ({len(v2_tools)} tools)")
 
+    check_model_view()
     check_context_summary()
 
     print(f"\n{len(failures)} failure(s)")
     return 1 if failures else 0
+
+
+def check_model_view() -> None:
+    """`model_view` must strip the identity keys for every mode except `truth`.
+
+    Until 2026-10-13 the filter ran only for `pixels`, so raw/look/planner shipped
+    `measurement.object_body` (the sim's own body name, e.g. "alphabet_soup_1_main")
+    and `contact_sides` in the JSON line of every gripper result: the look-mode
+    executor could read WHICH object it had closed on out of ground truth while
+    the mode's premise is that identity comes from pixels. Same class as the
+    `look(target=...)` locator leak. Runtime check (no sim, no GPU).
+    """
+    print("\n-- model_view（非 truth 模式一律剥身份键）--")
+    sys.path.insert(0, str(REPO / "src"))
+    from arm_agent.agent.harness import MODEL_HIDDEN_KEYS, model_view  # noqa: PLC0415
+
+    leaky = {"tool": "gripper", "status": "grasped", "requested": {"action": "close"},
+             "measurement": {**{k: "alphabet_soup_1_main" for k in MODEL_HIDDEN_KEYS},
+                             "width_mm": 12.3, "contact_sides": ["left", "right"]},
+             "events": []}
+    truth = model_view(leaky, "truth")
+    if truth.get("measurement", {}).get("object_body"):
+        ok("truth 模式原样通过（A/B 基线本来就该看到物体名）")
+    else:
+        bad("truth 模式把身份键也剥了——基线被削弱")
+    bad_modes = [m for m in ("pixels", "raw", "look", "planner")
+                 if model_view(leaky, m).get("measurement", {}).get("object_body")]
+    if not bad_modes:
+        ok("pixels/raw/look/planner 四个模式都剥掉了 object_body（width_mm 留下：爪自己的传感器）")
+    else:
+        bad(f"这些模式仍在泄漏 object_body：{bad_modes}")
+    if any(model_view(leaky, m).get("measurement", {}).get("surface_xyz") for m in ("raw", "look", "planner")):
+        bad("坐标键 surface_xyz 在非 truth 模式泄漏")
+    else:
+        ok("坐标键（surface_xyz/target_xyz/offset_m/depth_m）同样剥掉")
 
 
 def check_context_summary() -> None:
