@@ -440,7 +440,19 @@ class Harness:
         init_state_idx: int | None = 0,
         episode_id: int = 0,
         recorder: EpisodeRecorder | None = None,
+        task_text: str | None = None,
     ) -> EpisodeResult:
+        # `task_text` (档 E): the phase task the planner wrote for a SUB-EPISODE. The
+        # executor must see exactly this text -- the whole point of dispatch is that
+        # the planner's rewrites (failure reasons, do/don't lists) reach the executor.
+        # MEASURED (2026-10-12, audit of the first planner run): `task` was logged,
+        # reported and audited but NEVER passed here, so 162 dispatches of re-written
+        # instructions landed in a void -- the executor opened on `obs["language"]`
+        # (the standing sim task) 162/162 times; its turn-1 line "找到蓝色矮罐和
+        # 篮子的位置" is verbatim from that standing task while the dispatch task said
+        # e.g. "禁止 +z" / "你已夹住罐子" -- which it then ignored, obviously. The
+        # executor has no other channel: no other message ever mentions the phase.
+        # This parameter is that channel.
         result = EpisodeResult()
         t_start = time.time()
         transcript: list[dict[str, Any]] = []
@@ -486,7 +498,25 @@ class Harness:
             initial_note = (
                 "[上图：全局相机 + 腕部相机（从上往下看夹爪下方，用来判断自己在哪）]\n"
                 if self.auto_frames
-                else "[本模式不附画面：想看图就调用 look。]\n"
+                else "[本模式不附画面：想看就调用 look。]\n"
+            )
+            # The opening task line: the phase text when a sub-episode was handed
+            # one, the standing sim task otherwise. One task string, one source of
+            # truth, and it goes into the transcript below so an offline audit can
+            # see WHAT the executor was actually told (the missing channel is how
+            # the 162-void above stayed invisible).
+            task_line = task_text if task_text else f"任务：{result.language}"
+            sub_note = (
+                "\n（这是规划者交给你的**阶段任务**：完成了它、或确认无法推进，就停止动作；"
+                "预算用完控制权也会自动交回。）"
+                if task_text
+                else ""
+            )
+            opening_text = (
+                f"{task_line}{sub_note}\n"
+                f"{initial_note}"
+                f"{format_state(obs)}\n"
+                "请开始。记住：每次只调用一个工具。"
             )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": get_system_prompt(self.prompt_mode, self.observation_mode, self.move_ladder) + self.shared_skill + mode_appendix(self.observation_mode) + ladder_appendix(self.move_ladder) + self._skills_index()},
@@ -496,16 +526,12 @@ class Harness:
                         *initial_images,
                         {
                             "type": "text",
-                            "text": (
-                                f"任务：{result.language}\n"
-                                f"{initial_note}"
-                                f"{format_state(obs)}\n"
-                                "请开始。记住：每次只调用一个工具。"
-                            ),
+                            "text": opening_text,
                         },
                     ],
                 },
             ]
+            transcript.append({"turn": 0, "opening_user": opening_text})
 
             for turn in range(1, self.max_turns + 1):
                 result.turns = turn
@@ -1037,7 +1063,7 @@ class Harness:
         )
         sub._grasped = bool(self._grasped)
         sub.mm_per_px = self.mm_per_px
-        sub_result = sub.run_episode(init_state_idx=None, episode_id=900 + self._sub_count)
+        sub_result = sub.run_episode(init_state_idx=None, episode_id=900 + self._sub_count, task_text=task)
         self._grasped = bool(sub._grasped)
         self._held_body = sub._held_body
 

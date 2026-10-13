@@ -1235,6 +1235,14 @@ def planner_leg(ipc_dir: Path) -> bool:
         "子回合确实在跑（move+gripper 都在子层）": bool(moves) and bool(grips),
         "子回合已折叠进同一份转写（带 sub 深度标记）": bool(sub_entries)
         and all(e.get("outer_turn") for e in sub_entries),
+        # Regression guard for the 162-void (2026-10-12): the planner's task text
+        # was logged/reported/audited but never delivered -- the executor opened on
+        # the standing sim task every time. The anchor string is unique to the task
+        # the stub planner writes above, so its presence in the sub's OPENING message
+        # is end-to-end proof the channel now exists.
+        "阶段任务确实送达执行者（开场含 dispatch task 锚点）": any(
+            "eef z 要 <0.08" in str(e.get("opening_user", "")) for e in sub_entries
+        ),
         "执行者没有重置世界（子层首步爪心 = reset 位置之后）": (
             moves and abs((moves[0].get("structured_result") or {}).get("measurement", {}).get("eef_start", [9])[0] - (-0.152)) < 0.03
         ),

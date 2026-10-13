@@ -576,7 +576,36 @@ v3 给模型加了「尺」（每步回显爪心实际移动多少像素 + 此�
 （执行者是已证明的 look 腿控制器；74 个子条目全在同一份转写里；世界未被 reset；
 **外层只用了 2 轮**）。六条腿 PLUMBING OK。
 
-## 13. 参考
+## 13. 档 E 首跑复盘与能力地板（2026-10-12/13）
+
+### 13.1 报告层与管线的四个坑（首跑 0/8 的直接原因）
+
+| 坑 | 现象 | 修法 |
+|---|---|---|
+| task 从未送达 | 执行者开局读 `obs["language"]`（常驻任务）**162/162 次**；planner 的 149 次改写全部落空；子层 turn-1 自述「找到蓝色矮罐和篮子」即常驻任务原文 | `run_episode(task_text=...)` 新参；开场消息写进 transcript（`opening_user`），离线可审计 |
+| look 计数恒 0 | 子层工具记录名是 canonical `observe`，报告只数 `look` → 每份报告都撒谎「没看图」 | `_count_sub_tools()` 统一映射 |
+| 环境判定误导 | 报告印「环境判定：未完成」——那是**整任务** sim 判定，成功阶段也印未完成 | 只印 True |
+| 预算太小时切在手半空 | 139/162 用满预算、**0 次提前返回**（有 verify 却从未用过），8/10 轮的「搬」阶段必丢罐 | `DISPATCH_BUDGET_RANGE=(20,80)`、默认 45；提示词写明按整段估 |
+
+### 13.2 能力地板分腿（`scripts/probe_capability_floor.py`）
+
+把链路切成两半各自交棒：align 腿（reset 起只对准）与 descend 腿（真值摆到罐正上方
+~2mm 再交棒下降合爪）。真值只用于摆位/评分，模型只见 look 面。
+
+| 配置 | XY 最近 mm（states 0/1/2） | 窗口内 | 夹住 |
+|---|---|---|---|
+| align  effort=none | 96.7 / 246.9 / 135.0 | 0/3 | — |
+| align  none + ladder | 80.3 / 238.4 / 250.1 | 0/3 | — |
+| align  **effort=high** | **0.3 / 3.3 / 1.1** | **3/3** | — |
+| descend none | — | — | 2/3（close<顶 4/4） |
+| descend **high** | — | — | **3/3**（z 0.067/0.068/0.069） |
+
+结论：**能力不是墙——墙是 reasoning budget**。此前所有实验（raw/ladder/look/
+M2/planner）都跑在 `reasoning_effort=none`（strata 客户端默认）。阶梯只在 none 下
+无效（238mm 中位），说明主因不是步长菜单而是每步决策质量。开启方式：
+`REASONING_EFFORT=high`（约 2 倍每轮 wall time）。
+
+## 14. 参考
 * 计划与教训：[`docs/P0_stripdown.md`](P0_stripdown.md)（该剥/不该剥的边界）
 * 场景与几何实测：[`skills/scene_tools.md`](../skills/scene_tools.md)
 * 放手位姿审计：[`scripts/audit_release_poses.py`](../scripts/audit_release_poses.py)
