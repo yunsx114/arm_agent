@@ -57,6 +57,18 @@ CAMERA_NAMES = {"agent": "agentview", "wrist": "robot0_eye_in_hand"}
 # unfinishable phase is rejected at validation time instead of at the arm.
 DISPATCH_BUDGET_RANGE = (20, 80)
 DISPATCH_BUDGET_DEFAULT = 45
+# 档 F: cap on a SINGLE downward move when the model (not the ladder) names the
+# centimetres. MEASURED (planner+high, 2026-10-15): the one surviving failure mode of
+# all three lost episodes was a -z request of 6~15 cm in one shot -- the arm sailed
+# past the "stop at z~0.07" instruction to z=0.0367 (table), closed on air and knocked
+# the can over, and every episode then spent itself chasing the lying-down can. The
+# winning episode descended in ≤3 cm steps. Upward moves stay uncapped (17 cm lifts
+# were used all run without incident); horizontal is untouched (visual closed loop).
+
+# The direction is the MODEL's decision and is preserved (same philosophy as the
+# ladder: scale the magnitude, never replace the direction); the clamp is announced
+# in the tool text so the executor knows the step was shortened and can continue.
+DESCENT_CAP_CM = 3.0
 # Key of the magnified crop in an image payload (档 B v2 `aim`/`target`). It lives
 # here because BOTH sides need it and neither may import the other: the agent process
 # has no robosuite, and the sim process has no model client. It is not a camera, so it

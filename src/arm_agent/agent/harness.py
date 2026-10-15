@@ -564,8 +564,20 @@ class Harness:
             ]
             transcript.append({"turn": 0, "opening_user": opening_text})
 
-            for turn in range(1, self.max_turns + 1):
-                result.turns = turn
+            turn = 0
+            productive = 0
+            # A PROTOCOL RETRY MUST NOT EAT THE TURN BUDGET. MEASURED (2026-10-15,
+            # planner+high, 4 episodes): 295 `finish=length` truncations burned ~29%
+            # of all sub-turn slots as no-op turns -- the model never emitted a tool
+            # call, yet the ledger charged a turn, so a "75-turn" dispatch was really
+            # ~54 usable ones (and the executor almost never returning early wasted
+            # them permanently). `turn` still numbers EVERY LLM call (transcript ids,
+            # summary_due and recorder rows depend on staying sequential);
+            # `productive` counts only turns that EXECUTED a tool, and it alone
+            # bounds the budget. Hard cap stays: turn < max_turns*3+8, so a model
+            # that never produces a valid call still terminates.
+            while productive < self.max_turns and turn < self.max_turns * 3 + 8:
+                turn += 1
                 t_turn0 = time.time()
                 # CONTEXT COMPRESSION, once per N-turn block: the model writes the brief and
                 # the block is replaced by it (see SUMMARY_EVERY_TURNS). Turn 33 is the end
@@ -662,6 +674,8 @@ class Harness:
 
                 call = calls[0]
                 result.tool_calls += 1
+                productive += 1
+                result.turns = productive
                 self._say(f"[turn {turn}] {call.name} {call.args}")
 
                 # DELETED 2026-10-11: the release-gate interception (see the
@@ -1405,6 +1419,9 @@ class Harness:
             return {"obs": obs, "text": f"[get_state] {format_state(obs, self._grasped)}", "image": None, "done": False}
 
         if name in ("move", "rotate", "set_gripper"):
+            # 档 F (declared here so the rotate/gripper paths below, which share the
+            # return block, never see an unbound name):
+            descent_clamped_from = None
             if name == "move":
                 # 档 D: the model reports an AXIS and either a rung or a PIXEL GAP; the
                 # code owns the centimetres. A pixel gap is the input it is actually good
@@ -1419,6 +1436,26 @@ class Harness:
                         gap_rung, ladder_cm = C.rung_for_gap_cm(
                             gap_px * self.mm_per_px / 10.0, mm_per_px=self.mm_per_px
                         )
+                # 档 F: a model-named DOWNWARD distance is capped at one safe step.
+                # The direction stays the model's (contracts.DESCENT_CAP_CM has the
+                # measurement); only the magnitude is scaled, and the behave text says
+                # so, so the executor knows the step was shortened and continues.
+                # ORDER MATTERS: this runs BEFORE the action dict is built -- the
+                # first version of this gate edited `args` after `action` had already
+                # captured the unclamped number, so the arm moved 10 cm while the
+                # text said "已只执行第一小段" (a lying instrument; caught by
+                # probe_ffix_whitebox: delta_z=-0.0987 with the 档 F note attached).
+                descent_clamped_from = None
+                direction_norm = str(args.get("direction", "")).strip().lower().replace("−", "-")
+                if (
+                    ladder_cm is None
+                    and self.observation_mode != "truth"
+                    and direction_norm == "-z"
+                ):
+                    distance_raw = as_float(args.get("distance_cm"), None)
+                    if distance_raw is not None and distance_raw > C.DESCENT_CAP_CM:
+                        descent_clamped_from = round(float(distance_raw), 1)
+                        args["distance_cm"] = C.DESCENT_CAP_CM
                 action = {
                     "kind": "move",
                     "direction": args["direction"],
@@ -1438,6 +1475,17 @@ class Harness:
                 action = {"kind": "gripper", "action": args["action"]}
             resp = self.client.act(action)
             outcome = resp.outcome
+            # 档 F trace: the clamp is a FACT the executor must see (its step was
+            # shortened) and the audits must see (requested vs executed descent).
+            if descent_clamped_from is not None:
+                outcome["descent_clamped_from_cm"] = descent_clamped_from
+                outcome["descent_cap_cm"] = C.DESCENT_CAP_CM
+                merged = dict(outcome.get("measurement") or {})
+                merged.update(
+                    descent_clamped_from_cm=descent_clamped_from,
+                    descent_cap_cm=C.DESCENT_CAP_CM,
+                )
+                outcome["measurement"] = merged
             # 档 D instrument: label the step with the rung the model chose. The server
             # never sees this field -- it is the agent's own note on its own action, so
             # an audit can answer "which rung did it take, and did the rung do what it
@@ -1455,9 +1503,15 @@ class Harness:
             if mm_px:
                 self.mm_per_px = float(mm_px)
             images = resp.images(self.client.ipc_dir)
+            move_text = format_outcome(outcome)
+            if descent_clamped_from is not None:
+                move_text += (
+                    f"（档 F：下降单发上限 {C.DESCENT_CAP_CM:.0f}cm——你要求 {descent_clamped_from}cm，"
+                    "已只执行第一小段。继续下降请先看一眼当前高度再走下一段，别一口气走到桌面。）"
+                )
             return {
                 "obs": resp.obs,
-                "text": format_outcome(outcome),
+                "text": move_text,
                 "image": images.get("agent"),
                 "images": images,
                 "done": False,
