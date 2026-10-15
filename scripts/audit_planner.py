@@ -111,9 +111,15 @@ def main(argv: list[str]) -> int:
                 verdicts[str(sr.get("status"))] += 1
         # A close CAN grasp only if it happened below the can's top.
         graspable = sum(1 for z in closes_z if z < CAN_TOP_Z)
+        # `verify` entries in outer transcripts carry an empty structured_result
+        # (the declare_done branch bypasses the envelope), so .get("tool") is None
+        # there -- phrase it as "?" instead of letting sorted() crash on a None key
+        # (ep3 of the first high-effort run, 2026-10-15).
         tools = collections.Counter(
-            (e.get("structured_result") or {}).get("tool") for e in planner_entries if e.get("result")
+            (e.get("structured_result") or {}).get("tool") or "?"
+            for e in planner_entries if e.get("result")
         )
+        tools.pop("?", None)
         planner_tools = ",".join(f"{k}{v}" for k, v in sorted(tools.items()) if k)
         bud = sum(budgets) or 0
         grip_txt = ",".join(f"{k}×{v}" for k, v in sorted(verdicts.items()))

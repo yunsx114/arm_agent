@@ -619,7 +619,39 @@ M2/planner）都跑在 `reasoning_effort=none`（strata 客户端默认）。阶
 （21 PASS / 0 FAIL）。六腿 dry-run PLUMBING OK（planner 腿 15 项全绿）。
 
 顺带记录（未修的边缘）：server 在**从未 reset** 时收到 `state` 会以 `AttributeError（'NoneType' has no
-attribute 'items'）` 报错（pack(None)）——生产路径永远先 reset，故无影响；真要暴露给外部调用才值得加守卫。
+attribute 'items'）` 报错（pack(None)）——生产路径永远先 reset，故无影响；真要暴 露给外部调用才值得加守卫。
+
+### 13.4 档 E + high 首跑：**1/4，第一个非真值模式成功**（2026-10-15）
+
+`OBS_MODE=planner REASONING_EFFORT=high MAX_NEW_TOKENS=1536 SUMMARY_EVERY=0`，4 回合
+（states 0–3），总耗时 ~2.7h，27 次 dispatch。
+
+| round | 结果 | 用时 | 外层轮 | 结构 | XY最近 | 合手<罐顶 |
+|---|---|---|---|---|---|---|
+| ep0 | ✗ | 48min | 30 | 9 dispatch（阶段式） | 1mm | 22/24 |
+| **ep1** | **✓ env** | **4min** | **5** | **1×75 轮整链** | 3mm | 1/1 |
+| ep2 | ✗ | 58min | 30 | 9 dispatch（阶段式） | 0mm | 18/20 |
+| ep3 | ✗ | 43min | 30 | 8 dispatch（阶段式） | 4mm | 12/12 |
+
+- **ep1 = 全项目第一个非 truth 模式成功**（pixels/raw/ladder/look/M2/planner 全 0
+  之后）。双重确认：环境官方 `check_success` 翻 True（source=env）；释放位姿
+  (0.001, 0.212) 距 state1 篮心 Δx=-1.4cm Δy=-4.5cm（开口 16×17cm 之内）、
+  z=0.226 高于口沿 0.1513。结构：planner 两张 look 后**一次 75 轮整链 dispatch**
+  （"抓起放进右边的篮子"），执行者 28 轮完成对准 3mm → 夹住 → 搬运中 look×2 →
+  篮口释放 → 主动 verify——**首次提前返回**（预算 75 只用 28）。
+- 账面质量全面好于 none 跑：**0 同文重发**（旧 5/161）、相邻 task 相似度中位
+  **0.22**（旧 0.44）、对准 1~4mm（4/4 进 22mm 窗）、**合手高度 53/57 低于罐顶**
+  （look 单臂当年的主要死因，被 planner 任务文本纪律直接治住）。
+- 阶段式回合（ep0/2/3）死因与能力地板预言一致：**下降单发过冲**（-z 一发
+  6~15cm 落到 z≈0.037 顶桌面）→ 合爪夹空（empty×39、slipped×14）并把罐子碰倒
+  （3 回合全倒），此后整回合追侧躺罐。"**整链单 dispatch 优于阶段切分**"得到
+  ep1 vs ep0/2/3 直接对照。
+- 固定损耗：thinking 截断（`finish=length`→协议重试 295 次，≈29% 子轮位）。
+- 待办（按优先级）：① -z 下降分段/档位化；② 协议重试不消耗子预算；③ planner
+  提示词写明"首选整链大预算 dispatch，阶段切分只用于失败重试"；④
+  `skills/scene_tools.md` 第 23 行含真值罐心 (−0.119,−0.240)、注入所有模式的系统
+  提示——planner 把它转写进了任务文本（A/B 内部仍成立，但"无真值模式"的
+  前提被削弱，应剥除）。
 
 ## 14. 参考
 * 计划与教训：[`docs/P0_stripdown.md`](P0_stripdown.md)（该剥/不该剥的边界）
